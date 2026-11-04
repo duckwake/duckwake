@@ -1,0 +1,38 @@
+# SQL functions
+
+The same functions exist in the server (`duckwaked`, also over Quack) and in the extension. A view is named by the
+DuckLake table it maintains (`analytics.clicks_per_min`); functions take that name or the bare table name, which
+is the view's job id. Actions return `(view, result)` rows.
+
+| Function | Does |
+| --- | --- |
+| `duckwake_create_source(name, kind, options_json)` | register a Kafka source |
+| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=)` | create the table `name` and its job |
+| `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` defaults to the server's worker |
+| `duckwake_reset(view, to_epoch)` / `duckwake_drop(view, keep_table :=)` | rewind and replay / remove |
+| `duckwake_jobs()` / `duckwake_checkpoints(view, n :=)` / `duckwake_sources()` | status, history, sources |
+| `duckwake_verify(view)` | the differential exactly-once check |
+| `duckwake_wait(view, timeout_s :=)` | block until the view has committed what its topic holds now |
+| `duckwake_metrics()` | the worker's numbers as rows: `(metric, worker, view, value)` |
+| `duckwake_worker_status()` | the worker: running, restarts, last error and when |
+
+Only in the extension:
+
+| Extension-only function | Does |
+| --- | --- |
+| `duckwake_connect(catalog, data_path :=)` | pick the lake |
+| `duckwake_worker_start(worker :=, stage_threads :=, pipeline :=, shared_readers :=, lean_commit :=, metrics :=)` | run a supervised worker in this process; `metrics` also serves `GET /metrics` |
+| `duckwake_worker_stop()` | stop it after its current epoch |
+
+`TUMBLE(src, col, size)` and `HOP(src, col, size, slide)` are used inside the view SQL.
+
+## The same in the CLI
+
+| SQL function (server, extension) | CLI |
+| --- | --- |
+| `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
+| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows]` |
+| `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME --worker W` / `stop` / `pause` |
+| `duckwake_jobs()` / `duckwake_checkpoints(view)` | `jobs` / `checkpoints NAME` |
+| `duckwake_reset(view, to_epoch)` | `reset NAME --to-epoch N` |
+| `TUMBLE(src, col, size)` / `HOP(src, col, size, slide)` | same, inside the view SQL |
