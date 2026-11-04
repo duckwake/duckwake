@@ -377,7 +377,7 @@ async fn state(State(app): State<Shared>) -> ApiResult {
                 v.insert("source".into(), json!(def.plan.source));
                 v.insert("epoch_interval".into(), json!(def.epoch_interval));
                 v.insert("kind".into(), json!(def.plan.kind_name()));
-                v.insert("delta_sql".into(), json!(def.plan.delta_sql));
+                v.insert("explain".into(), json!(duckwake_core::api::explain(conn, &def.job_id).unwrap_or_else(|e| format!("{e:#}"))));
                 v.insert("sink_columns".into(), json!(def.plan.sink_columns));
                 views.push(Value::Object(v));
             }
@@ -693,7 +693,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
         if r.start.unwrap_or(true) {
             catalog::set_status(conn, &job_id, JobStatus::Running, Some(&app.worker_id))?;
         }
-        Ok(json!({ "ok": true, "job_id": job_id, "kind": def.plan.kind_name(), "delta_sql": def.plan.delta_sql }))
+        Ok(json!({ "ok": true, "job_id": job_id, "kind": def.plan.kind_name(), "explain": duckwake_core::api::explain(conn, &job_id).unwrap_or_else(|e| format!("{e:#}")) }))
     })
     .await
 }

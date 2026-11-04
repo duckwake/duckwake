@@ -405,15 +405,12 @@ impl Worker {
     fn start_job(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
         let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
-        let (def, _) = catalog::load_job(conn, id)?;
+        let (def, sources) = catalog::load_compiled(conn, id)?;
         catalog::set_sink_inlining(conn, &def)?;
-        let sources = catalog::load_sources(conn)?;
         let source = Arc::new(sources.get(&def.plan.source).context("source of job is gone")?.clone());
         let ckpt = catalog::latest_checkpoint(conn, id, &source.name)?.unwrap_or_default();
         let decoder = source.options.arrow_decoder()?.map(Arc::new);
         let (reader, offsets) = Reader::start(&self.rt, &source.options, &ckpt.offsets, def.max_rows, decoder)?;
-        // Recreate the staging table the compiled SQL reads.
-        crate::plan::compile(conn, id, &def.sql, &sources)?;
         let joined = self
             .groups
             .iter()

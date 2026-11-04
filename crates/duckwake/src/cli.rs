@@ -301,7 +301,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             };
             let (def, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
             println!("{msg} {:?}", def.plan.sink_columns);
-            println!("  per-epoch SQL: {}", def.plan.delta_sql);
+            println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
         }
         Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, &worker)?),
         Cmd::Pause { name } => println!("{}", api::pause(&open()?, &name)?),

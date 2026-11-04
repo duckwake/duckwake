@@ -78,6 +78,13 @@ impl Circuit {
                 break;
             }
         }
+        // Dead code, like Feldera's DeadCode pass: an integrator nobody reads, such as one on a port with no
+        // reader (the late rows of a view without a late-data table).
+        for n in 0..self.nodes.len() {
+            if !dead[n] && self.nodes[n].op == Op::Integrate(Integrate) && self.readers(Port { node: n, port: 0 }, &dead).is_empty() {
+                dead[n] = true;
+            }
+        }
         // Like Feldera's NoIntegralVisitor: anything left needs an operator the rules do not know.
         if let Some(n) = (0..self.nodes.len()).find(|n| !dead[*n] && self.nodes[*n].op.class() == Class::Rewrite) {
             trace.push(format!("left over: {} at n{n}", self.nodes[n].op.name()));

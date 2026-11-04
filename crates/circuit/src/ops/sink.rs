@@ -1,5 +1,5 @@
 use super::{Class, Operator};
-use crate::codegen::{staging, Cost, Counter, Cx, Step};
+use crate::codegen::{staging, Cost, Counter, Cx, Rel, Step};
 use crate::ir::Props;
 use crate::plan::Plan;
 use crate::sql::ident;
@@ -47,13 +47,23 @@ impl Operator for Sink {
         Ok(())
     }
 
-    fn stage(&self, cx: &mut Cx, _inputs: &[String]) -> Result<Vec<String>> {
-        if self.kind == SinkKind::Upsert {
-            let t = cx.x.global_tables()?;
-            for (k, s) in cx.plan.global.as_ref().unwrap().upsert_stmts(&t).into_iter().enumerate() {
-                let step = Step::stage(s);
-                cx.steps.push(if k == 0 { step.counting(Counter::Changed, &t.changed) } else { step });
+    fn stage(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>> {
+        match self.kind {
+            SinkKind::Upsert => {
+                let t = cx.x.global_tables()?;
+                let stmts = cx.plan.global.as_ref().unwrap().upsert_stmts(&t, &inputs[0].sql());
+                let last = stmts.len() - 1;
+                for (k, s) in stmts.into_iter().enumerate() {
+                    let step = Step::stage(s);
+                    cx.steps.push(if k == last { step.counting(Counter::Changed, &t.changed) } else { step });
+                }
             }
+            // The epoch's rows, written at commit. A windowed aggregate writes closed windows itself.
+            SinkKind::Append if !cx.emits_final => {
+                let out = staging("out", &cx.set);
+                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {out} AS {}", inputs[0].query())).counting(Counter::Staged, &out));
+            }
+            SinkKind::Append | SinkKind::Late => {}
         }
         Ok(vec![])
     }

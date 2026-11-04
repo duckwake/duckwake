@@ -1,7 +1,7 @@
 //! The circuit: operators, ports, nodes and their properties.
 mod display;
 
-pub use crate::ops::{Aggregate, Fragment, Grouping, Op, Operator, Sink, SinkKind, Source};
+pub use crate::ops::{Aggregate, Grouping, Op, Operator, Sink, SinkKind, Source};
 use crate::plan::Plan;
 
 /// A view as the circuit needs it.

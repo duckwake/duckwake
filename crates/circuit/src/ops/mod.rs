@@ -7,21 +7,25 @@ mod aggregate;
 mod differentiate;
 mod integrate;
 mod late_split;
+mod filter;
+mod from;
+mod map;
 mod sink;
 mod source;
-mod sql_fragment;
 mod window;
 
 pub use aggregate::{Aggregate, Grouping};
 pub use differentiate::Differentiate;
+pub use filter::Filter;
+pub use from::From;
 pub use integrate::Integrate;
 pub use late_split::LateSplit;
+pub use map::Map;
 pub use sink::{Sink, SinkKind};
 pub use source::Source;
-pub use sql_fragment::{Fragment, SqlFragment};
 pub use window::Window;
 
-use crate::codegen::{Cx, Step};
+use crate::codegen::{Cx, Rel, Step};
 use crate::ir::Props;
 use crate::plan::Plan;
 use anyhow::{bail, Result};
@@ -58,7 +62,7 @@ pub trait Operator {
     }
     /// Staging: pushes its statements onto `cx` and returns the relation each output port reads as (a subquery
     /// when it fuses into its reader, else a table).
-    fn stage(&self, cx: &mut Cx, inputs: &[String]) -> Result<Vec<String>>;
+    fn stage(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>>;
     /// Its writes in the epoch transaction.
     fn commit(&self, _cx: &Cx) -> Result<Vec<Step>> {
         Ok(vec![])
@@ -71,7 +75,7 @@ pub trait Operator {
 
 /// The incremental form SΔ = D ∘ S ∘ I of a non-linear operator, with its state in a DuckLake table.
 pub trait Stateful {
-    fn stage_delta(&self, cx: &mut Cx, inputs: &[String]) -> Result<Vec<String>>;
+    fn stage_delta(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>>;
     fn commit_delta(&self, cx: &Cx) -> Result<Vec<Step>>;
 }
 
@@ -80,7 +84,9 @@ pub enum Op {
     Source(Source),
     Window(Window),
     LateSplit(LateSplit),
-    SqlFragment(SqlFragment),
+    From(From),
+    Filter(Filter),
+    Map(Map),
     Aggregate(Aggregate),
     Sink(Sink),
     Integrate(Integrate),
@@ -96,7 +102,9 @@ macro_rules! dispatch {
             Op::Source($o) => $e,
             Op::Window($o) => $e,
             Op::LateSplit($o) => $e,
-            Op::SqlFragment($o) => $e,
+            Op::From($o) => $e,
+            Op::Filter($o) => $e,
+            Op::Map($o) => $e,
             Op::Aggregate($o) => $e,
             Op::Sink($o) => $e,
             Op::Integrate($o) => $e,
@@ -157,7 +165,7 @@ impl Operator for Op {
         }
     }
 
-    fn stage(&self, cx: &mut Cx, inputs: &[String]) -> Result<Vec<String>> {
+    fn stage(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>> {
         match self {
             Op::Delta(_) => self.delta()?.stage_delta(cx, inputs),
             _ => dispatch!(self, o => o.stage(cx, inputs)),

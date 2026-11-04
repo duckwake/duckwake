@@ -9,9 +9,9 @@ impl Circuit {
     pub fn stage_steps(&self, x: &EpochCtx) -> Result<Vec<Step>> {
         let mut cx = Cx::new(x, self.emits_final());
         // The relation each node's output port reads as (a subquery when fused, else a table).
-        let mut rel: Vec<Vec<String>> = vec![Vec::new(); self.nodes.len()];
+        let mut rel: Vec<Vec<Rel>> = vec![Vec::new(); self.nodes.len()];
         for (n, node) in self.nodes.iter().enumerate() {
-            let inputs: Vec<String> = node.inputs.iter().map(|p| rel[p.node][p.port].clone()).collect();
+            let inputs: Vec<Rel> = node.inputs.iter().map(|p| rel[p.node][p.port].clone()).collect();
             rel[n] = node.op.stage(&mut cx, &inputs)?;
         }
         Ok(cx.steps)
@@ -103,11 +103,50 @@ impl EpochCtx<'_> {
     }
 }
 
-/// A relation as a query: a fused subquery unwrapped, a table read whole.
-pub(crate) fn query(rel: &str) -> String {
-    match rel.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
-        Some(q) => q.to_string(),
-        None => format!("SELECT * FROM {rel}"),
+/// What an operator's output port is read as.
+#[derive(Debug, Clone)]
+pub enum Rel {
+    /// A table, or a parenthesized subquery.
+    Sql(String),
+    /// A SELECT still open: linear operators add to it instead of wrapping it, so a chain of them is one
+    /// statement. `from` keeps the view's aliases, which its WHERE and select list refer to.
+    Block { from: String, filter: Vec<String>, select: Option<String> },
+}
+
+impl Rel {
+    /// As an item of a FROM clause.
+    pub fn sql(&self) -> String {
+        match self {
+            Rel::Sql(s) => s.clone(),
+            Rel::Block { .. } => format!("({})", self.query()),
+        }
+    }
+
+    /// As a query.
+    pub fn query(&self) -> String {
+        match self {
+            Rel::Sql(s) => match s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                Some(q) => q.to_string(),
+                None => format!("SELECT * FROM {s}"),
+            },
+            Rel::Block { from, filter, select } => {
+                let mut q = format!("SELECT {} FROM {from}", select.as_deref().unwrap_or("*"));
+                if !filter.is_empty() {
+                    q.push_str(" WHERE ");
+                    q.push_str(&filter.join(" AND "));
+                }
+                q
+            }
+        }
+    }
+
+    /// The open block to add a filter or a select list to: this one while its select list is not set, else a
+    /// new one over this relation.
+    pub fn open(self) -> (String, Vec<String>) {
+        match self {
+            Rel::Block { from, filter, select: None } => (from, filter),
+            r => (format!("{} AS __in", r.sql()), Vec::new()),
+        }
     }
 }
 

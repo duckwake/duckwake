@@ -1,5 +1,5 @@
 use super::{Class, Operator};
-use crate::codegen::Cx;
+use crate::codegen::{Cx, Rel};
 use crate::ir::Props;
 use anyhow::Result;
 
@@ -25,9 +25,9 @@ impl Operator for Source {
         Props { append_only: self.append_only }
     }
 
-    fn stage(&self, cx: &mut Cx, _inputs: &[String]) -> Result<Vec<String>> {
+    fn stage(&self, cx: &mut Cx, _inputs: &[Rel]) -> Result<Vec<Rel>> {
         // Kafka rows are inserts: weight +1.
         let (cols, typed) = (&cx.cols, &cx.x.typed);
-        Ok(vec![format!("(SELECT _partition, _offset, {cols}, 1::INTEGER AS __w FROM {typed} WHERE _err IS NULL)")])
+        Ok(vec![Rel::Sql(format!("(SELECT _partition, _offset, {cols}, 1::INTEGER AS __w FROM {typed} WHERE _err IS NULL)"))])
     }
 }

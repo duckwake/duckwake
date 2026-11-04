@@ -1,5 +1,5 @@
 use super::{Class, Operator};
-use crate::codegen::{staging, Cx, Step};
+use crate::codegen::{staging, Cx, Rel, Step};
 use crate::plan::{WindowKind, WindowSpec};
 use anyhow::Result;
 
@@ -21,10 +21,10 @@ impl Operator for Window {
         Class::Linear
     }
 
-    fn stage(&self, cx: &mut Cx, inputs: &[String]) -> Result<Vec<String>> {
+    fn stage(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>> {
         // Read twice by the late split, so materialized.
         let win = staging("win", cx.x.job);
-        cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {win} AS {}", cx.plan.window_sql(&inputs[0]))));
-        Ok(vec![win])
+        cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {win} AS {}", cx.plan.window_sql(&inputs[0].sql()))));
+        Ok(vec![Rel::Sql(win)])
     }
 }

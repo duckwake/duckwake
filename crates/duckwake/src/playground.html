@@ -416,7 +416,7 @@ function viewHTML() {
   else if (S.viewTab === "late") h += gridHTML(d.late, { empty: "No late rows." });
   else if (S.viewTab === "dead") h += gridHTML(d.dead, { empty: "No dead letters." });
   else if (S.viewTab === "sql") h += `<div style="padding:14px 16px"><label>View SQL</label><pre class="code">${esc(v.sql)}</pre>
-      <label style="margin-top:12px">Per-epoch SQL (compiled)</label><pre class="code">${esc(v.delta_sql)}</pre>
+      <label style="margin-top:12px">Circuit and per-epoch SQL (duckwake explain)</label><pre class="code">${esc(v.explain)}</pre>
       <label style="margin-top:12px">Table columns</label><div class="chips">${(v.sink_columns || []).map(([c, t]) => `<span class="chip"><b>${esc(c)}</b> ${esc(t)}</span>`).join("")}<span class="chip"><b>_duckwake_epoch</b> BIGINT</span></div></div>`;
   h += `</div>`;
   return h;

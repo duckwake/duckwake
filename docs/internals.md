@@ -32,7 +32,9 @@ COMMIT;
 
 Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model Feldera is built on
 (the `duckwake_circuit` crate). The compiled view becomes an operator graph Q over whole collections: `Source` (each row with weight
-`__w`, +1 for Kafka), `Window`, `LateSplit`, `Map` (the stateless SQL fragments), `Aggregate`, `Sink`. An analysis
+`__w`, +1 for Kafka), `Window`, `LateSplit`, `From` (the stream under the view's alias, joined with its lookup
+tables), `Filter` (`WHERE`, `HAVING`), `Map` (a select list), `Aggregate`, `Sink`. The frontend cuts the view
+into these pieces from DuckDB's parse tree, each kept as SQL text in the view's own names. An analysis
 marks which edges are append-only; a view whose operators assume append-only input (windowed partials, `MIN`/`MAX`,
 append sinks) is refused when that input can retract. `incrementalize`
 wraps it as D ∘ Q ∘ I and pushes every integrator (I) forward until it meets a differentiator (D), the way
@@ -44,9 +46,15 @@ Feldera's `OptimizeIncrementalVisitor` does:
 - D ∘ I = id.
 
 What remains runs on changes, and every operator generates its own SQL: `stage_steps` (in-memory, before the
-epoch's transaction) and `commit_steps` (inside it). Linear operators fuse into their consumer's statement as
-subqueries; an operator's output is a table only where a fragment reads it by name or two operators read it.
-The engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+epoch's transaction) and `commit_steps` (inside it). Linear operators fuse: a chain of `From`, `Filter` and
+`Map` is one `SELECT`, and an operator's output is a table only where a stateful operator or a sink needs it.
+A global aggregate's output is its change as a Z-set, the touched groups' old rows with weight −1 and their
+new rows with +1; the upsert sink consolidates it, so a group whose row did not change cancels out. The
+engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+
+The tests in `crates/circuit/src/tests/` run each view kind epoch by epoch through its circuit's own SQL,
+against an in-memory lake, and compare the view's table with the batch query after every epoch, with epochs
+staged in order and pipelined.
 
 Each operator is a file in `crates/circuit/src/ops/` implementing `Operator`: its class (source, sink, linear,
 non-linear), output properties, input checks, and its stage and commit SQL; a non-linear one also implements
@@ -119,7 +127,8 @@ operator's semantics and a test oracle, not a dependency.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
   across workers. Without `--shared-readers` each job has its own readers: two jobs on one source read it
   twice.
-- **Operators.** Filter, project and lookup joins (any lake table in `FROM`). TUMBLE/HOP windows and
+- **Operators.** Filter, project and lookup joins (any lake table in `FROM`; a lookup table is read whole each
+  epoch, so a change to it reaches only rows that arrive later). TUMBLE/HOP windows and
   global `GROUP BY` (with `HAVING` and expressions over aggregates) with `count`, `sum`, `min`, `max`
   and `avg`. `HAVING` in windowed views, `DISTINCT`, `approx_count_distinct` and stream-stream joins
   are rejected at create time. `min`/`max` in global aggregates assume append-only input, which holds

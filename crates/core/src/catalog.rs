@@ -17,6 +17,22 @@ pub fn lease_table(job: &str) -> String {
 
 pub use duckwake_circuit::sql::state_table;
 
+/// A view with its plan compiled again by this version's compiler, and the sources. Its state and output tables
+/// were created from the stored plan, so their columns must be what this compiler would create.
+pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<String, SourceDef>)> {
+    let (mut def, _) = load_job(conn, job)?;
+    let sources = load_sources(conn)?;
+    let plan = plan::compile(conn, job, &def.sql, &sources)?;
+    if plan.state_columns != def.plan.state_columns || plan.sink_columns != def.plan.sink_columns {
+        bail!(
+            "view {job} was created by a DuckWake version whose state or table layout differs from this one's; \
+             drop and create it again"
+        );
+    }
+    def.plan = plan;
+    Ok((def, sources))
+}
+
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_json::Value) -> Result<SourceDef> {
     crate::lake::check_name("source", name)?;
     if kind != "kafka" {

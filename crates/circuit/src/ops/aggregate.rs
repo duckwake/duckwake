@@ -1,7 +1,7 @@
 use super::{not_incremental, Class, Operator, Stateful};
-use crate::codegen::{query, staging, Cost, Counter, Cx, Step};
+use crate::codegen::{staging, Cost, Counter, Cx, Rel, Step};
 use crate::ir::Props;
-use crate::plan::{AggKind, GlobalTables, Plan};
+use crate::plan::{windowed_partials_sql, AggKind, GlobalTables, Plan};
 use crate::sql::state_table;
 use anyhow::{bail, Result};
 
@@ -52,7 +52,7 @@ impl Operator for Aggregate {
         bail!("{} reads a stream that can retract rows, but {why}: not supported yet", self.name())
     }
 
-    fn stage(&self, _cx: &mut Cx, _inputs: &[String]) -> Result<Vec<String>> {
+    fn stage(&self, _cx: &mut Cx, _inputs: &[Rel]) -> Result<Vec<Rel>> {
         Err(not_incremental(&self.name()))
     }
 
@@ -62,19 +62,20 @@ impl Operator for Aggregate {
 }
 
 impl Stateful for Aggregate {
-    fn stage_delta(&self, cx: &mut Cx, inputs: &[String]) -> Result<Vec<String>> {
+    fn stage_delta(&self, cx: &mut Cx, inputs: &[Rel]) -> Result<Vec<Rel>> {
         let (plan, x) = (cx.plan, cx.x);
         match self.grouping {
             Grouping::Windowed => {
-                // The epoch's partials per window and group; reads the on-time rows as the view's input.
-                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {} AS {}", plan.input_table, query(&inputs[0]))));
+                // The epoch's partials per window and key, merged into the state at commit.
                 let out = staging("out", &cx.set);
-                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {out} AS {}", plan.delta_sql)).counting(Counter::Staged, &out));
-                Ok(vec![out])
+                let sql = format!("CREATE OR REPLACE TABLE {out} AS {}", windowed_partials_sql(plan, &inputs[0].sql()));
+                cx.steps.push(Step::stage(sql).counting(Counter::Staged, &out));
+                Ok(vec![Rel::Sql(out)])
             }
             Grouping::Global => {
                 let g = plan.global.as_ref().unwrap();
                 let mut t = x.global_tables()?;
+                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {} AS {}", t.pre, inputs[0].query())));
                 if let Some(prev) = x.overlay {
                     // The previous epoch may still be committing: read its new state for the groups it touched.
                     let prev_new = GlobalTables::new(x.job, state_table(x.job), String::new(), plan, prev).new_state;
@@ -84,7 +85,8 @@ impl Stateful for Aggregate {
                     let step = Step::stage(s);
                     cx.steps.push(if k == 0 { step.counting(Counter::Staged, &t.delta) } else { step });
                 }
-                Ok(vec![t.new_state.clone()])
+                // The output change: the touched groups' old rows retracted, their new rows inserted.
+                Ok(vec![Rel::Sql(g.change_sql(&t))])
             }
         }
     }

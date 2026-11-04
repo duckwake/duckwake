@@ -43,10 +43,8 @@ pub enum MergeOp {
 pub struct Plan {
     pub source: String,
     pub window: Option<WindowSpec>,
-    /// Staging table the rewritten SQL reads (`memory.main.in_<job>`).
+    /// Staging table the view's SQL binds against (`memory.main.in_<job>`), and that `verify` fills.
     pub input_table: String,
-    /// Stateless: the sink rows for one epoch. Windowed: partial aggregates for one epoch.
-    pub delta_sql: String,
     /// The view as a batch query over `input_table`; used for the sink schema and differential checks.
     pub batch_sql: String,
     pub sink_columns: Vec<(String, String)>,
@@ -56,9 +54,50 @@ pub struct Plan {
     pub merge_ops: Vec<(String, MergeOp)>,
     /// Windowed only: projection from state rows to sink columns.
     pub final_select: String,
+    /// Windowed only: the partial aggregates over the aggregate's input, named like `merge_ops`.
+    #[serde(default)]
+    pub partials: Vec<String>,
+    /// The view in pieces, which the operator graph is built from.
+    #[serde(default)]
+    pub query: Query,
     /// Global (non-windowed) aggregate: the operator chain pre-aggregate -> aggregate -> post.
     #[serde(default)]
     pub global: Option<GlobalPlan>,
+}
+
+/// The view in pieces, each SQL text in the view's own names.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Query {
+    /// The stream's alias in the view.
+    pub alias: String,
+    /// The columns the stream exposes under that alias, quoted: the source's, the window's, and `__w` when
+    /// the view aggregates.
+    pub columns: Vec<String>,
+    /// The FROM clause, with `{input}` where the stream's rows go.
+    pub from: String,
+    /// Lake tables the FROM joins, read whole every epoch.
+    pub lookups: Vec<String>,
+    /// WHERE.
+    pub filter: Option<String>,
+    /// The select list over the FROM: the view's rows, or the aggregate's input (keys, arguments, `__w`).
+    pub project: Vec<String>,
+    /// Global aggregates: HAVING, and the select list cast to the sink's types, both over the aggregate's
+    /// output `__g<j>`, `__a<i>`.
+    pub having: Option<String>,
+    pub finish: Vec<String>,
+}
+
+impl Query {
+    /// The FROM clause over a relation holding the stream's rows.
+    pub fn from_over(&self, input: &str) -> String {
+        self.from.replace("{input}", &format!("(SELECT {} FROM {input})", self.columns.join(", ")))
+    }
+
+    /// The select list over the FROM and WHERE, as one query over `input`.
+    pub fn project_over(&self, input: &str) -> String {
+        let filter = self.filter.as_ref().map(|f| format!(" WHERE {f}")).unwrap_or_default();
+        format!("SELECT {} FROM {}{filter}", self.project.join(", "), self.from_over(input))
+    }
 }
 
 /// How a view's sink is maintained.
@@ -103,13 +142,8 @@ pub struct AggSpec {
 /// correct while sources are append-only; retracting inputs will need value counts (milestone 3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalPlan {
-    pub pre_sql: String,
     pub keys: usize,
     pub aggs: Vec<AggSpec>,
-    /// Table the post SQL reads (`memory.main.agg_<job>`): columns `__g<j>`, `__a<i>`.
-    pub agg_table: String,
-    /// HAVING + select list, cast to the sink's types.
-    pub post_sql: String,
     /// Sink column holding group key j.
     pub sink_keys: Vec<String>,
 }
@@ -263,11 +297,6 @@ impl GlobalPlan {
         format!("SELECT {} FROM {delta} d LEFT JOIN {old} o ON {}", cols.join(", "), self.keys_match("d", "o"))
     }
 
-    /// The pre-aggregate: the view's FROM/WHERE over the epoch's weighted rows (`input_table`).
-    pub fn pre_stmt(&self, t: &GlobalTables) -> String {
-        format!("CREATE OR REPLACE TABLE {} AS {}", t.pre, self.pre_sql)
-    }
-
     /// The incremental aggregate: the epoch's partials per group, the touched groups' stored state (read
     /// from `t.state`) and their new state.
     pub fn aggregate_stmts(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
@@ -278,45 +307,30 @@ impl GlobalPlan {
         ]
     }
 
-    /// The post-aggregate (HAVING and the select list) over the touched groups' old and new values: the
-    /// aggregate's change as a retraction of the old rows and an insertion of the new ones.
-    pub fn post_stmts(&self, t: &GlobalTables) -> Vec<String> {
-        vec![
-            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.old)),
-            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.old_out, self.post_sql),
-            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.new_state)),
-            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.new_out, self.post_sql),
-        ]
+    /// The aggregate's output change: the touched groups' old finalized rows retracted (weight −1) and their
+    /// new ones inserted (+1). Groups at a count of 0 have no row.
+    pub fn change_sql(&self, t: &GlobalTables) -> String {
+        let cols = self.finalize_cols().join(", ");
+        format!(
+            "(SELECT {cols}, (-1)::INTEGER AS __w FROM {} WHERE __cnt > 0 UNION ALL SELECT {cols}, 1::INTEGER AS __w FROM {} WHERE __cnt > 0)",
+            t.old, t.new_state
+        )
     }
 
-    /// The upsert sink's staging: the groups whose sink row changes, and their new rows.
-    pub fn upsert_stmts(&self, t: &GlobalTables) -> Vec<String> {
+    /// The upsert sink's staging: its input change consolidated, so a group whose row did not change cancels
+    /// out, and the keys of the groups whose row did.
+    pub fn upsert_stmts(&self, t: &GlobalTables, input: &str) -> Vec<String> {
         let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
-        let row = |a: &str| format!("({})", sink_cols.iter().map(|c| format!("{a}.{c}")).collect::<Vec<_>>().join(", "));
-        let keys: Vec<String> = self.sink_keys.iter().map(|k| format!("coalesce(o.{k}, n.{k}) AS {k}", k = ident(k))).collect();
+        let keys: Vec<String> = self.sink_keys.iter().map(|k| ident(k)).collect();
         let keys = if keys.is_empty() { "1 AS __one".to_string() } else { keys.join(", ") };
-        let changed_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("n", "c") };
         vec![
-            // A group's sink row changes when it appears, disappears (HAVING, or emptied) or differs.
             format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT {keys} FROM {} o FULL OUTER JOIN {} n ON {}
-                 WHERE o.__p IS DISTINCT FROM n.__p OR {} IS DISTINCT FROM {}",
-                t.changed, t.old_out, t.new_out, self.sink_keys_match("o", "n"), row("o"), row("n")
+                "CREATE OR REPLACE TABLE {} AS SELECT {}, CAST(sum(__w) AS INTEGER) AS __w FROM {input} GROUP BY ALL HAVING sum(__w) <> 0",
+                t.changes,
+                sink_cols.join(", ")
             ),
-            format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT {} FROM {} n WHERE EXISTS (SELECT 1 FROM {} c WHERE {changed_match})",
-                t.upserts, sink_cols.iter().map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", "), t.new_out, t.changed
-            ),
+            format!("CREATE OR REPLACE TABLE {} AS SELECT DISTINCT {keys} FROM {}", t.changed, t.changes),
         ]
-    }
-
-    /// One epoch's staging statements (in-memory tables only), in order. `t` names the tables; `state` is read.
-    pub fn stage_sql(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
-        let mut out = vec![self.pre_stmt(t)];
-        out.extend(self.aggregate_stmts(t, state_columns));
-        out.extend(self.post_stmts(t));
-        out.extend(self.upsert_stmts(t));
-        out
     }
 
     /// The aggregate's writes at commit: replace the touched groups' state.
@@ -328,24 +342,17 @@ impl GlobalPlan {
         ]
     }
 
-    /// The upsert sink's writes at commit: replace the changed groups' rows.
+    /// The upsert sink's writes at commit: replace the changed groups' rows by their new ones, if any.
     pub fn commit_sink_sql(&self, t: &GlobalTables, epoch: &str) -> Vec<String> {
         let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
         let sink_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("s", "c") };
         vec![
             format!("DELETE FROM {} s WHERE EXISTS (SELECT 1 FROM {} c WHERE {sink_match})", t.sink, t.changed),
             format!(
-                "INSERT INTO {} ({c}, _duckwake_epoch) SELECT {c}, {epoch} FROM {}",
-                t.sink, t.upserts, c = sink_cols.join(", ")
+                "INSERT INTO {} ({c}, _duckwake_epoch) SELECT {c}, {epoch} FROM {} WHERE __w > 0",
+                t.sink, t.changes, c = sink_cols.join(", ")
             ),
         ]
-    }
-
-    /// The epoch's writes to the lake: replace touched groups' state and changed groups' sink rows.
-    pub fn commit_sql(&self, t: &GlobalTables, state_columns: &[(String, String)], epoch: i64) -> Vec<String> {
-        let mut out = self.commit_state_sql(t, state_columns);
-        out.extend(self.commit_sink_sql(t, &epoch.to_string()));
-        out
     }
 
     /// The state as of the previous epoch while that epoch may still be committing: its new state for the
@@ -364,8 +371,8 @@ impl GlobalPlan {
         )
     }
 
-    /// Finalized values (`__g<j>`, `__a<i>`) of the live groups in a state-shaped table.
-    pub fn finalize_sql(&self, state: &str) -> String {
+    /// Finalized values (`__g<j>`, `__a<i>`) of a state-shaped table's columns.
+    fn finalize_cols(&self) -> Vec<String> {
         let mut cols = self.key_cols();
         for (i, a) in self.aggs.iter().enumerate() {
             cols.push(match a.kind {
@@ -374,12 +381,12 @@ impl GlobalPlan {
                 AggKind::Avg => format!("CASE WHEN __a{i}_n = 0 THEN NULL ELSE CAST(__a{i}_s AS DOUBLE) / __a{i}_n END AS __a{i}"),
             });
         }
-        format!("SELECT {} FROM {state} WHERE __cnt > 0", cols.join(", "))
+        cols
     }
 }
 
 /// Table names one epoch of a global aggregate uses. Staging tables live in `memory.main`; the ones the commit
-/// reads (`delta`, `new_state`, `changed`, `upserts`) come in two sets, by epoch parity, so the next epoch can
+/// reads (`delta`, `new_state`, `changes`, `changed`) come in two sets, by epoch parity, so the next epoch can
 /// be staged while this one commits.
 #[derive(Debug, Clone)]
 pub struct GlobalTables {
@@ -387,10 +394,9 @@ pub struct GlobalTables {
     pub delta: String,
     pub old: String,
     pub new_state: String,
-    pub old_out: String,
-    pub new_out: String,
+    /// The sink's input change, consolidated, and the keys of the groups it changes.
+    pub changes: String,
     pub changed: String,
-    pub upserts: String,
     /// The DuckLake state table, written at commit. While staging it is what `old` reads: the table itself, or
     /// `GlobalPlan::overlay_sql` over it when the previous epoch may not have committed yet.
     pub state: String,
@@ -408,10 +414,8 @@ impl GlobalTables {
             delta: set("gdelta"),
             old: mem("gold"),
             new_state: set("gnew"),
-            old_out: mem("oldout"),
-            new_out: mem("newout"),
+            changes: set("changes"),
             changed: set("changed"),
-            upserts: set("upserts"),
             state,
             sink,
             sink_columns: plan.sink_columns.iter().map(|(c, _)| c.clone()).collect(),
@@ -463,7 +467,21 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         }
     };
     let table_ref = base_table_template(conn, &input_table, &stream.alias)?;
-    *stream_slot(&mut node["from_table"]).ok_or_else(|| anyhow!("lost stream reference"))? = table_ref;
+    *stream_slot(&mut node["from_table"]).ok_or_else(|| anyhow!("lost stream reference"))? = table_ref.clone();
+
+    // The view in pieces: the FROM with a placeholder where the stream goes, the WHERE, the stream's columns.
+    let mut columns: Vec<String> = src.columns().iter().map(|(c, _)| ident(c)).collect();
+    if window.is_some() {
+        columns.extend(["window_start".into(), "window_end".into()]);
+    }
+    let query = Query {
+        alias: stream.alias.clone(),
+        columns,
+        from: from_template(conn, &node["from_table"], &table_ref)?,
+        lookups: lookup_tables(&node["from_table"], &input_table),
+        filter: (!node["where_clause"].is_null()).then(|| expr_sql(conn, &node["where_clause"])).transpose()?,
+        ..Query::default()
+    };
 
     // Staging table with the source columns (+ window columns) so the rewritten SQL binds.
     let mut cols: Vec<String> = src.columns().iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
@@ -479,13 +497,14 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         source: stream.source.clone(),
         window,
         input_table,
-        delta_sql: String::new(),
         batch_sql,
         sink_columns,
         state_columns: vec![],
         key_columns: vec![],
         merge_ops: vec![],
         final_select: String::new(),
+        partials: vec![],
+        query,
         global: None,
     };
 
@@ -498,7 +517,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
             compile_global(conn, job, &mut stmt, &stream.alias, &aggs, &mut plan)?;
             return Ok(plan);
         }
-        plan.delta_sql = plan.batch_sql.clone();
+        plan.query.project = vec![list_sql(conn, &node["select_list"])?];
         return Ok(plan);
     }
     if !node["having"].is_null() {
@@ -518,7 +537,7 @@ fn compile_windowed(
     aggs: &HashSet<String>,
     plan: &mut Plan,
 ) -> Result<()> {
-    let node = &mut stmt["node"];
+    let node = &stmt["node"];
     let group_all = node["aggregate_handling"] == "FORCE_AGGREGATES";
     let groups_by_window = if group_all {
         node["select_list"].as_array().unwrap().iter().any(is_window_col)
@@ -536,10 +555,10 @@ fn compile_windowed(
     if plan.sink_columns.len() != items.len() {
         bail!("SELECT * is not supported in windowed views; list the columns");
     }
-    let (ws_ref, we_ref) = window_refs(conn, alias)?;
-    let mut partial_items = Vec::new();
+    // The aggregate's input: the keys `__k<j>`, the aggregates' arguments `__x<k>`, the window, the weight.
+    let mut project = Vec::new();
+    let mut args: Vec<Value> = Vec::new();
     let mut finals = Vec::new();
-    let mut nkeys = 0;
     for (i, item) in items.iter().enumerate() {
         let (sink_name, sink_type) = &plan.sink_columns[i];
         let is_agg = item["class"] == "FUNCTION" && aggs.contains(item["function_name"].as_str().unwrap_or(""));
@@ -547,11 +566,10 @@ fn compile_windowed(
             if contains_fn(item, aggs) {
                 bail!("aggregates must be top-level select items (column {sink_name:?}); nested expressions over aggregates are not supported");
             }
-            let k = format!("__k{nkeys}");
-            nkeys += 1;
+            let k = format!("__k{}", plan.key_columns.len());
             let mut e = item.clone();
             e["alias"] = json!(k);
-            partial_items.push(e);
+            project.push(e);
             plan.key_columns.push(k.clone());
             finals.push(format!("CAST({} AS {sink_type}) AS {}", ident(&k), ident(sink_name)));
             continue;
@@ -566,65 +584,82 @@ fn compile_windowed(
         {
             bail!("DISTINCT, FILTER and ORDER BY inside aggregates are not supported ({fname})");
         }
-        if item["arguments"].as_array().unwrap().iter().any(|a| contains_fn(a, aggs)) {
+        let fn_args: Vec<Value> = item["arguments"].as_array().cloned().unwrap_or_default().iter()
+            .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
+        if fn_args.iter().any(|a| contains_fn(a, aggs)) {
             bail!("nested aggregates are not supported ({fname})");
         }
+        let x = match fname.as_str() {
+            "count_star" => String::new(),
+            _ => {
+                let [a] = fn_args.as_slice() else { bail!("{fname}() takes exactly one argument here") };
+                let key = norm(a);
+                let k = args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
+                    args.push(a.clone());
+                    args.len() - 1
+                });
+                format!("__x{k}")
+            }
+        };
         let p = format!("__p{i}");
-        let mut e = item.clone();
-        e["alias"] = json!(p);
+        let mut partial = |name: &str, sql: String, op: MergeOp| {
+            plan.partials.push(format!("{sql} AS {name}"));
+            plan.merge_ops.push((name.to_string(), op));
+        };
         let finalize = match fname.as_str() {
-            "count" | "count_star" => {
-                plan.merge_ops.push((p.clone(), MergeOp::Add));
+            "count_star" => {
+                partial(&p, "count(*)".into(), MergeOp::Add);
+                ident(&p)
+            }
+            "count" => {
+                partial(&p, format!("count({x})"), MergeOp::Add);
                 ident(&p)
             }
             "sum" => {
-                plan.merge_ops.push((p.clone(), MergeOp::AddNullable));
+                partial(&p, format!("sum({x})"), MergeOp::AddNullable);
                 ident(&p)
             }
             "min" => {
-                plan.merge_ops.push((p.clone(), MergeOp::Min));
+                partial(&p, format!("min({x})"), MergeOp::Min);
                 ident(&p)
             }
             "max" => {
-                plan.merge_ops.push((p.clone(), MergeOp::Max));
+                partial(&p, format!("max({x})"), MergeOp::Max);
                 ident(&p)
             }
             "avg" => {
                 let (s, c) = (format!("{p}s"), format!("{p}c"));
-                let mut es = item.clone();
-                set_fn_name(&mut es, "sum", &s);
-                let mut ec = item.clone();
-                set_fn_name(&mut ec, "count", &c);
-                partial_items.push(es);
-                plan.merge_ops.push((s.clone(), MergeOp::AddNullable));
-                e = ec;
-                plan.merge_ops.push((c.clone(), MergeOp::Add));
+                partial(&s, format!("sum({x})"), MergeOp::AddNullable);
+                partial(&c, format!("count({x})"), MergeOp::Add);
                 format!("CAST({} AS DOUBLE) / NULLIF({}, 0)", ident(&s), ident(&c))
             }
             _ => unreachable!(),
         };
-        partial_items.push(e);
         finals.push(format!("CAST({finalize} AS {sink_type}) AS {}", ident(sink_name)));
     }
-    partial_items.push(ws_ref.clone());
-    partial_items.push(we_ref.clone());
-    node["select_list"] = Value::Array(partial_items);
+    // A GROUP BY key left out of the select list would merge its groups into one state row.
     if !group_all {
-        let groups = node["group_expressions"].as_array_mut().unwrap();
-        let base = groups.len();
-        for r in [&ws_ref, &we_ref] {
-            let mut g = r.clone();
-            g["alias"] = json!("");
-            groups.push(g);
-        }
-        if let Some(set) = node["group_sets"].get_mut(0).and_then(|s| s.as_array_mut()) {
-            set.push(json!(base));
-            set.push(json!(base + 1));
+        for g in node["group_expressions"].as_array().into_iter().flatten().filter(|g| !is_window_col(g)) {
+            let g = resolve_group(g, &items);
+            if !items.iter().any(|e| norm(&stripped(e)) == norm(&g)) {
+                bail!("select every GROUP BY key so each group keeps its own window state");
+            }
         }
     }
-    plan.delta_sql = deserialize(conn, stmt)?;
-    let partial_cols = describe(conn, &plan.delta_sql).context("binding the partial aggregate")?;
+    for (k, a) in args.iter().enumerate() {
+        let mut a = a.clone();
+        a["alias"] = json!(format!("__x{k}"));
+        project.push(a);
+    }
+    let (ws_ref, we_ref) = window_refs(conn, alias)?;
+    project.extend([ws_ref, we_ref, weight_ref(conn, alias)?]);
+    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN __w INTEGER", plan.input_table))?;
+    plan.query.columns.push("__w".into());
+    plan.query.project = vec![list_sql(conn, &Value::Array(project))?];
+
     // State column order: window, keys, partials.
+    let partial_cols = describe(conn, &format!("SELECT * FROM ({})", windowed_partials_sql(plan, &format!("({})", plan.query.project_over(&plan.input_table)))))
+        .context("binding the partial aggregate")?;
     let mut state = vec![];
     for name in ["__ws", "__we"].iter().map(|s| s.to_string()).chain(plan.key_columns.clone()) {
         state.push(partial_cols.iter().find(|(c, _)| *c == name).cloned().unwrap());
@@ -635,6 +670,13 @@ fn compile_windowed(
     plan.state_columns = state;
     plan.final_select = finals.join(", ");
     Ok(())
+}
+
+/// A windowed aggregate's partials per window and key over `input`, a relation of its input rows.
+pub fn windowed_partials_sql(plan: &Plan, input: &str) -> String {
+    let keys: Vec<String> = ["__ws".to_string(), "__we".to_string()].into_iter().chain(plan.key_columns.iter().map(|k| ident(k))).collect();
+    let keys = keys.join(", ");
+    format!("SELECT {keys}, {} FROM {input} GROUP BY {keys}", plan.partials.join(", "))
 }
 
 fn compile_global(
@@ -653,30 +695,13 @@ fn compile_global(
     if plan.sink_columns.len() != items.len() {
         bail!("SELECT * is not supported in aggregate views; list the columns");
     }
-    let stripped = |e: &Value| {
-        let mut e = e.clone();
-        e["alias"] = json!("");
-        e
-    };
-
-    // Group keys: GROUP BY ALL = the select items without aggregates; explicit keys may name a select
-    // alias or position, which DuckDB allows, so resolve those to the item's expression.
+    // Group keys: GROUP BY ALL = the select items without aggregates.
     let group_all = node["aggregate_handling"] == "FORCE_AGGREGATES";
     let mut groups: Vec<Value> = Vec::new();
     if group_all {
         groups.extend(items.iter().filter(|e| !contains_fn(e, aggs)).map(stripped));
     } else {
-        for g in node["group_expressions"].as_array().into_iter().flatten() {
-            let by_alias = (g["class"] == "COLUMN_REF" && g["column_names"].as_array().is_some_and(|n| n.len() == 1))
-                .then(|| g["column_names"][0].as_str().unwrap_or(""))
-                .and_then(|name| items.iter().find(|e| e["alias"] == name));
-            let by_position = (g["class"] == "CONSTANT")
-                .then(|| g["literal"]["text"].as_str().and_then(|t| t.parse::<usize>().ok()))
-                .flatten()
-                .and_then(|i| i.checked_sub(1))
-                .and_then(|i| items.get(i));
-            groups.push(stripped(by_alias.or(by_position).unwrap_or(g)));
-        }
+        groups.extend(node["group_expressions"].as_array().into_iter().flatten().map(|g| resolve_group(g, &items)));
     }
     if groups.iter().any(|g| contains_fn(g, aggs)) {
         bail!("aggregates cannot be used as GROUP BY keys");
@@ -711,10 +736,8 @@ fn compile_global(
         sink_keys.push(plan.sink_columns[pos].0.clone());
     }
 
-    // Operator 1, pre-aggregate: the view's FROM/WHERE producing keys, arguments and the weight.
+    // Operator 1, the aggregate's input: the view's FROM/WHERE producing keys, arguments and the weight.
     conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN __w INTEGER", plan.input_table))?;
-    let weight = serialize(conn, &format!("SELECT {}.__w AS __w", ident(alias)))?["statements"][0]["node"]["select_list"][0].clone();
-    let mut pre = stmt.clone();
     let mut list: Vec<Value> = Vec::new();
     for (j, g) in groups.iter().enumerate() {
         let mut g = g.clone();
@@ -726,18 +749,14 @@ fn compile_global(
         a["alias"] = json!(format!("__x{k}"));
         list.push(a);
     }
-    list.push(weight);
-    let pn = &mut pre["node"];
-    pn["select_list"] = Value::Array(list);
-    pn["group_expressions"] = json!([]);
-    pn["group_sets"] = json!([]);
-    pn["aggregate_handling"] = json!("STANDARD_HANDLING");
-    pn["having"] = Value::Null;
-    let pre_sql = deserialize(conn, &pre)?;
+    list.push(weight_ref(conn, alias)?);
+    plan.query.columns.push("__w".into());
+    plan.query.project = vec![list_sql(conn, &Value::Array(list))?];
+    let pre_sql = plan.query.project_over(&plan.input_table);
     let pre_cols = describe(conn, &pre_sql).context("binding the pre-aggregate")?;
     let col_type = |name: &str| pre_cols.iter().find(|(c, _)| c == name).map(|(_, t)| t.clone()).unwrap();
 
-    // Operator 2, aggregate: state columns and the finalized-value table the post step reads.
+    // Operator 2, aggregate: state columns, and the finalized values its output carries.
     let sum_type = |k: usize| -> Result<String> {
         Ok(describe(conn, &format!("SELECT sum(__x{k}) FROM ({pre_sql})"))?.remove(0).1)
     };
@@ -764,31 +783,23 @@ fn compile_global(
         };
         agg_cols.push(format!("__a{i} {out_type}"));
     }
+
+    // Operator 3, post: HAVING and the select list over the finalized values, cast to the sink's types.
+    if !having.is_null() {
+        plan.query.having = Some(expr_sql(conn, &having)?);
+    }
+    for (e, (name, ty)) in post_items.iter().zip(&plan.sink_columns) {
+        plan.query.finish.push(format!("CAST(({}) AS {ty}) AS {}", expr_sql(conn, e)?, ident(name)));
+    }
+    // Bind it against a table of the aggregate's output: a column that is not a key fails here.
     let agg_table = format!("memory.main.{}", ident(&format!("agg_{job}")));
     conn.execute_batch(&format!("CREATE OR REPLACE TABLE {agg_table} ({})", agg_cols.join(", ")))?;
-
-    // Operator 3, post: HAVING and the select list over the finalized values, named like the sink.
-    let mut post = serialize(conn, &format!("SELECT 1 FROM {agg_table}"))?["statements"][0].clone();
-    for (e, (name, _)) in post_items.iter_mut().zip(&plan.sink_columns) {
-        e["alias"] = json!(name);
-    }
-    post["node"]["select_list"] = Value::Array(post_items);
-    post["node"]["where_clause"] = having;
-    let post_raw = deserialize(conn, &post)?;
-    let casts: Vec<String> = plan.sink_columns.iter().map(|(c, t)| format!("CAST({} AS {t}) AS {}", ident(c), ident(c))).collect();
-    let post_sql = format!("SELECT {} FROM ({post_raw})", casts.join(", "));
-    describe(conn, &post_sql).context("binding the select list over the aggregates (every non-aggregate column must be a GROUP BY key)")?;
+    let having_sql = plan.query.having.as_ref().map(|h| format!(" WHERE {h}")).unwrap_or_default();
+    describe(conn, &format!("SELECT {} FROM {agg_table}{having_sql}", plan.query.finish.join(", ")))
+        .context("binding the select list over the aggregates (every non-aggregate column must be a GROUP BY key)")?;
 
     plan.state_columns = state;
-    plan.delta_sql = pre_sql.clone();
-    plan.global = Some(GlobalPlan {
-        pre_sql,
-        keys: groups.len(),
-        aggs: specs.into_iter().map(|(_, a)| a).collect(),
-        agg_table,
-        post_sql,
-        sink_keys,
-    });
+    plan.global = Some(GlobalPlan { keys: groups.len(), aggs: specs.into_iter().map(|(_, a)| a).collect(), sink_keys });
     Ok(())
 }
 
@@ -996,12 +1007,6 @@ fn is_window_col(e: &Value) -> bool {
             .is_some_and(|n| n.eq_ignore_ascii_case("window_start") || n.eq_ignore_ascii_case("window_end"))
 }
 
-fn set_fn_name(e: &mut Value, name: &str, alias: &str) {
-    e["function_name"] = json!(name);
-    e["qualified_name"] = json!({ "path": [name] });
-    e["alias"] = json!(alias);
-}
-
 fn walk(v: &Value, f: &mut dyn FnMut(&Value)) {
     f(v);
     match v {
@@ -1040,6 +1045,74 @@ fn deserialize(conn: &Connection, stmt: &Value) -> Result<String> {
     let doc = json!({ "error": false, "statements": [stmt] });
     let sql: String = conn.query_row("SELECT json_deserialize_sql(?::JSON)", [doc.to_string()], |r| r.get(0))?;
     Ok(sql)
+}
+
+/// A select list of the view's parse tree as SQL text, aliases included.
+fn list_sql(conn: &Connection, list: &Value) -> Result<String> {
+    let mut stmt = serialize(conn, "SELECT 1")?["statements"][0].clone();
+    stmt["node"]["select_list"] = list.clone();
+    let sql = deserialize(conn, &stmt)?;
+    Ok(sql.strip_prefix("SELECT ").ok_or_else(|| anyhow!("unexpected SQL {sql:?}"))?.to_string())
+}
+
+/// An expression of the view's parse tree as SQL text.
+fn expr_sql(conn: &Connection, e: &Value) -> Result<String> {
+    list_sql(conn, &Value::Array(vec![stripped(e)]))
+}
+
+/// The view's FROM clause as SQL text, with `{input}` where `stream`, the stream's table reference in it, is.
+fn from_template(conn: &Connection, from: &Value, stream: &Value) -> Result<String> {
+    let text = |t: &Value| -> Result<String> {
+        let mut stmt = serialize(conn, "SELECT 1 FROM t")?["statements"][0].clone();
+        stmt["node"]["from_table"] = t.clone();
+        let sql = deserialize(conn, &stmt)?;
+        Ok(sql.strip_prefix("SELECT 1 FROM ").ok_or_else(|| anyhow!("unexpected SQL {sql:?}"))?.to_string())
+    };
+    let (whole, stream) = (text(from)?, text(stream)?);
+    let name = stream.rsplit_once(" AS ").map_or(stream.as_str(), |(n, _)| n);
+    if !whole.contains(name) {
+        bail!("could not find the stream {name} in the FROM clause {whole}");
+    }
+    Ok(whole.replacen(name, "{input}", 1))
+}
+
+/// The lake tables a FROM clause reads besides the stream (`input_table`).
+fn lookup_tables(from: &Value, input_table: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(from, &mut |v| {
+        if v["type"] == "BASE_TABLE" {
+            let parts: Vec<&str> = ["catalog_name", "schema_name", "table_name"].iter().filter_map(|k| v[*k].as_str()).filter(|p| !p.is_empty()).collect();
+            let name = parts.join(".");
+            if !input_table.replace('"', "").ends_with(&name) {
+                out.push(name);
+            }
+        }
+    });
+    out
+}
+
+/// `<alias>.__w AS __w`: the stream's weight, as a select item.
+fn weight_ref(conn: &Connection, alias: &str) -> Result<Value> {
+    Ok(serialize(conn, &format!("SELECT {}.__w AS __w", ident(alias)))?["statements"][0]["node"]["select_list"][0].clone())
+}
+
+fn stripped(e: &Value) -> Value {
+    let mut e = e.clone();
+    e["alias"] = json!("");
+    e
+}
+
+/// A GROUP BY key as the expression it groups by: DuckDB lets it name a select item by alias or position.
+fn resolve_group(g: &Value, items: &[Value]) -> Value {
+    let by_alias = (g["class"] == "COLUMN_REF" && g["column_names"].as_array().is_some_and(|n| n.len() == 1))
+        .then(|| g["column_names"][0].as_str().unwrap_or(""))
+        .and_then(|name| items.iter().find(|e| e["alias"] == name));
+    let by_position = (g["class"] == "CONSTANT")
+        .then(|| g["literal"]["text"].as_str().and_then(|t| t.parse::<usize>().ok()))
+        .flatten()
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| items.get(i));
+    stripped(by_alias.or(by_position).unwrap_or(g))
 }
 
 fn base_table_template(conn: &Connection, table: &str, alias: &str) -> Result<Value> {
@@ -1095,9 +1168,10 @@ mod tests {
         assert_eq!(names, ["window_start", "game_id", "n", "revenue", "a", "last_ts"]);
         let state: Vec<_> = p.state_columns.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(state, ["__ws", "__we", "__k0", "__k1", "__p2", "__p3", "__p4s", "__p4c", "__p5"]);
-        assert!(p.delta_sql.contains("in_j"), "{}", p.delta_sql);
+        assert!(p.query.from.contains("{input}"), "{}", p.query.from);
         // The partial query must run.
-        c.execute_batch(&format!("CREATE TABLE part AS {}", p.delta_sql)).unwrap();
+        let input = format!("({})", p.query.project_over(&p.input_table));
+        c.execute_batch(&format!("CREATE TABLE part AS {}", windowed_partials_sql(&p, &input))).unwrap();
     }
 
     #[test]
@@ -1115,173 +1189,6 @@ mod tests {
         let p = compile(&c, "j", "SELECT ts, upper(game_id) AS g, amount * 2 AS a2 FROM clicks WHERE amount > 10", &s).unwrap();
         assert!(p.window.is_none());
         assert_eq!(p.sink_columns.len(), 3);
-    }
-
-    /// Runs a global aggregate epoch by epoch with the engine's own statements and checks the upsert
-    /// sink against the view run as one batch query after every epoch.
-    fn incremental_equals_batch(sql: &str, epochs: &[(i64, i64)]) {
-        let (c, s) = setup();
-        c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
-        let p = compile(&c, "g", sql, &s).unwrap();
-        let g = p.global.as_ref().expect("global plan");
-        let cols: Vec<String> = p.state_columns.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect();
-        let sink: Vec<String> = p.sink_columns.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect();
-        c.execute_batch(&format!(
-            "CREATE TABLE memory.main.st ({}); CREATE TABLE memory.main.sink ({}, _duckwake_epoch BIGINT);
-             CREATE TABLE memory.main.seen (ts TIMESTAMP, game_id VARCHAR, user_id VARCHAR, amount DECIMAL(18,2));",
-            cols.join(", "), sink.join(", ")
-        )).unwrap();
-        let t = GlobalTables::new("g", "memory.main.st".into(), "memory.main.sink".into(), &p, 0);
-        let names: Vec<String> = p.sink_columns.iter().map(|(n, _)| ident(n)).collect();
-        let names = names.join(", ");
-        for (epoch, (from, to)) in epochs.iter().enumerate() {
-            let rows = format!(
-                "SELECT TIMESTAMP '2026-01-01' + to_seconds(i) AS ts,
-                        CASE WHEN i % 17 = 0 THEN NULL ELSE 'g' || (i * 7 % 5) END AS game_id, 'u' || (i % 9) AS user_id,
-                        CASE WHEN i % 11 = 0 THEN NULL ELSE ((i * 37) % 13)::DECIMAL(18,2) END AS amount
-                 FROM range({from}, {to}) t(i)"
-            );
-            c.execute_batch(&format!(
-                "INSERT INTO memory.main.seen {rows};
-                 CREATE OR REPLACE TABLE {} AS SELECT *, 1::INTEGER AS __w FROM ({rows});",
-                p.input_table
-            )).unwrap();
-            for stmt in g.stage_sql(&t, &p.state_columns).into_iter().chain(g.commit_sql(&t, &p.state_columns, epoch as i64 + 1)) {
-                c.execute_batch(&stmt).unwrap_or_else(|e| panic!("{e}\n{stmt}"));
-            }
-            c.execute_batch(&format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT *, 1::INTEGER AS __w FROM memory.main.seen;
-                 CREATE OR REPLACE TABLE memory.main.expected AS {};",
-                p.input_table, p.batch_sql
-            )).unwrap();
-            let diff: i64 = c.query_row(&format!(
-                "SELECT (SELECT count(*) FROM (SELECT * FROM memory.main.expected EXCEPT ALL SELECT {names} FROM memory.main.sink))
-                      + (SELECT count(*) FROM (SELECT {names} FROM memory.main.sink EXCEPT ALL SELECT * FROM memory.main.expected))"
-            ), [], |r| r.get(0)).unwrap();
-            assert_eq!(diff, 0, "epoch {} of {sql}", epoch + 1);
-        }
-        let n: i64 = c.query_row("SELECT count(*) FROM memory.main.sink", [], |r| r.get(0)).unwrap();
-        assert!(n > 0, "sink empty for {sql}");
-    }
-
-    /// The same with each epoch staged before the previous one commits, reading that epoch's new state through
-    /// `overlay_sql` as a pipelined worker does. The previous commit lands before the staging on even epochs
-    /// and after it on odd ones; either way the result must equal the batch query.
-    fn pipelined_equals_batch(sql: &str, epochs: &[(i64, i64)]) {
-        let (c, s) = setup();
-        c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
-        let p = compile(&c, "g", sql, &s).unwrap();
-        let g = p.global.as_ref().expect("global plan");
-        let cols: Vec<String> = p.state_columns.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect();
-        let sink: Vec<String> = p.sink_columns.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect();
-        c.execute_batch(&format!(
-            "CREATE TABLE memory.main.st ({}); CREATE TABLE memory.main.sink ({}, _duckwake_epoch BIGINT);
-             CREATE TABLE memory.main.seen (ts TIMESTAMP, game_id VARCHAR, user_id VARCHAR, amount DECIMAL(18,2));",
-            cols.join(", "), sink.join(", ")
-        )).unwrap();
-        let tables = |e: usize| GlobalTables::new("g", "memory.main.st".into(), "memory.main.sink".into(), &p, e as u64 % 2);
-        let rows = |e: usize| {
-            let (from, to) = epochs[e];
-            format!(
-                "SELECT TIMESTAMP '2026-01-01' + to_seconds(i) AS ts,
-                        CASE WHEN i % 17 = 0 THEN NULL ELSE 'g' || (i * 7 % 5) END AS game_id, 'u' || (i % 9) AS user_id,
-                        CASE WHEN i % 11 = 0 THEN NULL ELSE ((i * 37) % 13)::DECIMAL(18,2) END AS amount
-                 FROM range({from}, {to}) t(i)"
-            )
-        };
-        let names: Vec<String> = p.sink_columns.iter().map(|(n, _)| ident(n)).collect();
-        let names = names.join(", ");
-        let commit = |e: usize| {
-            for stmt in g.commit_sql(&tables(e), &p.state_columns, e as i64 + 1) {
-                c.execute_batch(&stmt).unwrap_or_else(|err| panic!("{err}\n{stmt}"));
-            }
-            c.execute_batch(&format!("INSERT INTO memory.main.seen {}", rows(e))).unwrap();
-        };
-        let check = |committed: usize| {
-            c.execute_batch(&format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT *, 1::INTEGER AS __w FROM memory.main.seen;
-                 CREATE OR REPLACE TABLE memory.main.expected AS {};",
-                p.input_table, p.batch_sql
-            )).unwrap();
-            let diff: i64 = c.query_row(&format!(
-                "SELECT (SELECT count(*) FROM (SELECT * FROM memory.main.expected EXCEPT ALL SELECT {names} FROM memory.main.sink))
-                      + (SELECT count(*) FROM (SELECT {names} FROM memory.main.sink EXCEPT ALL SELECT * FROM memory.main.expected))"
-            ), [], |r| r.get(0)).unwrap();
-            assert_eq!(diff, 0, "after committing {committed} epochs of {sql}");
-        };
-        for e in 0..epochs.len() {
-            if e > 0 && e % 2 == 0 {
-                commit(e - 1);
-            }
-            let mut t = tables(e);
-            if e > 0 {
-                t.state = g.overlay_sql(&t.state, &tables(e - 1).new_state, &p.state_columns);
-            }
-            c.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT *, 1::INTEGER AS __w FROM ({})", p.input_table, rows(e))).unwrap();
-            for stmt in g.stage_sql(&t, &p.state_columns) {
-                c.execute_batch(&stmt).unwrap_or_else(|err| panic!("{err}\n{stmt}"));
-            }
-            if e > 0 && e % 2 == 1 {
-                commit(e - 1);
-            }
-            if e > 0 {
-                check(e);
-            }
-        }
-        commit(epochs.len() - 1);
-        check(epochs.len());
-    }
-
-    const EPOCHS: [(i64, i64); 5] = [(0, 7), (7, 40), (40, 41), (41, 200), (200, 260)];
-
-    #[test]
-    fn global_pipelined_through_the_overlay() {
-        pipelined_equals_batch(
-            "SELECT game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS total, avg(amount) AS mean,
-                    min(amount) AS lo, max(amount) AS hi
-             FROM clicks GROUP BY ALL HAVING avg(amount) > 5.5",
-            &EPOCHS,
-        );
-        // Without GROUP BY the single group is touched by every epoch; with a lookup join and HAVING groups
-        // leave and re-enter the sink.
-        pipelined_equals_batch("SELECT count(*) AS n, sum(amount) AS s, avg(amount) AS a FROM clicks WHERE amount > 5", &EPOCHS);
-        pipelined_equals_batch(
-            "SELECT g.studio, count(*) AS n, max(c.amount) AS top FROM clicks c JOIN games g ON g.game_id = c.game_id
-             GROUP BY 1 HAVING count(*) % 2 = 0",
-            &EPOCHS,
-        );
-    }
-
-    #[test]
-    fn global_group_by_all_with_having() {
-        incremental_equals_batch(
-            "SELECT game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS total, avg(amount) AS mean,
-                    min(amount) AS lo, max(amount) AS hi
-             FROM clicks GROUP BY ALL HAVING avg(amount) > 5.5",
-            &EPOCHS,
-        );
-    }
-
-    #[test]
-    fn global_alias_key_and_expressions_over_aggregates() {
-        incremental_equals_batch(
-            "SELECT upper(game_id) AS g, sum(amount) / count(*) AS per_click, count(*) + 1 AS n1
-             FROM clicks WHERE user_id <> 'u3' GROUP BY g HAVING sum(amount) > 50",
-            &EPOCHS,
-        );
-    }
-
-    #[test]
-    fn global_positional_key_with_lookup_join() {
-        incremental_equals_batch(
-            "SELECT g.studio, count(*) AS n, max(c.amount) AS top FROM clicks c JOIN games g ON g.game_id = c.game_id GROUP BY 1",
-            &EPOCHS,
-        );
-    }
-
-    #[test]
-    fn global_without_group_by() {
-        incremental_equals_batch("SELECT count(*) AS n, sum(amount) AS s, avg(amount) AS a FROM clicks WHERE amount > 5", &EPOCHS);
     }
 
     #[test]
