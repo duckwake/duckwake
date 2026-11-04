@@ -105,6 +105,7 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     action::<DropView>(conn, api)?;
     action::<Verify>(conn, api)?;
     action::<Wait>(conn, api)?;
+    query::<Explain>(conn, api)?;
     query::<Jobs>(conn, api)?;
     query::<Checkpoints>(conn, api)?;
     query::<Sources>(conn, api)?;
@@ -430,6 +431,21 @@ impl Spec for Verify {
             format!("VERIFY FAILED: {r:?}")
         };
         one(&r.job, msg)
+    }
+}
+
+/// `duckwake_explain(view)`: the view's circuit, how it was made incremental, and one epoch's SQL, a row per line.
+struct Explain;
+impl Spec for Explain {
+    const NAME: &'static str = "duckwake_explain";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        let text = api.with(|c| api::explain(c, a.arg(0)))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let schema = Schema::new(vec![Field::new("explain", DataType::Utf8, false)]);
+        Ok(Out::Batch(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(lines))])?))
     }
 }
 

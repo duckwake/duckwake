@@ -20,6 +20,7 @@ $B produce --rate 2000 --late-every 500 --bad-every 700
 $B jobs                                # status, epoch, watermark, freshness, lag, totals
 $B sql "FROM lake.analytics.clicks_per_min ORDER BY window_start DESC LIMIT 5"
 $B verify clicks_per_min               # differential exactly-once check
+$B explain clicks_per_min              # the view's circuit and one epoch's SQL
 ```
 
 ## Views and sources

@@ -17,11 +17,12 @@
 //! and the epoch staged ahead is thrown away with it. Staging tables the commit reads come in two sets, by
 //! epoch parity, so staging the next epoch never overwrites them.
 use crate::catalog::{self, lease_table, state_table, Checkpoint};
+use crate::circuit::{Circuit, Cost, Counter, EpochCtx};
 use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
 use crate::model::{parse_duration, JobDef, SourceDef};
-use crate::plan::{decode_sql, GlobalTables, IS_JSON_OBJECT};
+use crate::plan::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde_json::json;
@@ -56,6 +57,8 @@ pub struct WorkerConfig {
 
 struct JobRuntime {
     def: Arc<JobDef>,
+    /// The view as an incremental circuit; its steps are the SQL each epoch runs.
+    circuit: Arc<Circuit>,
     source: Arc<SourceDef>,
     lease: i64,
     /// The last epoch handed to the commit (with `pipeline`, possibly still committing) and the position
@@ -141,11 +144,9 @@ struct CommitJob {
     def: Arc<JobDef>,
     source: Arc<SourceDef>,
     staged: Staged,
-    /// This epoch's staging tables: the view's sink rows or partials, late rows, global-aggregate tables,
-    /// and its group's dead letters.
-    out: String,
-    late: String,
-    global: Option<GlobalTables>,
+    circuit: Arc<Circuit>,
+    /// The table set this epoch staged into, and its group's dead letters.
+    parity: u64,
     dead: String,
     lag: i64,
 }
@@ -440,7 +441,8 @@ impl Worker {
                 gid
             }
         };
-        let open_ends = if self.cfg.lean_commit && def.plan.is_windowed() {
+        let circuit = Arc::new(Circuit::compile(&def.plan, &def));
+        let open_ends = if self.cfg.lean_commit && circuit.emits_final() {
             let mut stmt = self.conns[0].prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", state_table(id)))?;
             let ends = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<duckdb::Result<BTreeSet<_>>>()?;
             Some(ends)
@@ -458,6 +460,7 @@ impl Worker {
             part_max_ts: HashMap::new(),
             offsets,
             def: Arc::new(def),
+            circuit,
             source,
             lease,
             epoch,
@@ -627,20 +630,14 @@ impl Worker {
             j.max_event_time_us = s.max_event_time_us;
             j.last_round = Some(round);
             j.open_ends = s.open_ends.clone();
-            let set = format!("{id}_{parity}");
-            let global = match &j.def.plan.global {
-                Some(_) => Some(GlobalTables::new(id, state_table(id), quote_table(&j.def.sink)?, &j.def.plan, parity)),
-                None => None,
-            };
             batch.push(CommitJob {
                 id: id.clone(),
                 lease: j.lease,
                 epoch: j.epoch,
                 def: j.def.clone(),
                 source: j.source.clone(),
-                out: mem("out", &set),
-                late: mem("late", &set),
-                global,
+                circuit: j.circuit.clone(),
+                parity,
                 dead: sources[&j.group].dead.clone(),
                 lag: groups[&j.group].reader.lag(&s.offsets),
                 staged: s,
@@ -800,8 +797,6 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, src: &SourceStage
     let t = Instant::now();
     let def = j.def.clone();
     let plan = &def.plan;
-    let set = format!("{id}_{parity}");
-    let (typed, win, late, input, out) = (&src.typed, mem("win", id), mem("late", &set), &plan.input_table, mem("out", &set));
 
     // Watermark: min over active partitions of their max event time, minus the delay. Partitions idle for
     // longer than idle_timeout are excluded; one that is active but has not reported yet holds it back.
@@ -831,60 +826,44 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, src: &SourceStage
     // Monotone across restarts (part_max_ts starts empty), so it bounds every event time read so far.
     let max_event_time_us = j.part_max_ts.values().copied().chain(j.max_event_time_us).max();
 
-    let cols: Vec<String> = j.source.options.columns.iter().map(|(c, _)| ident(c)).collect();
-    let cols = cols.join(", ");
-    let count = |table: &str| -> Result<i64> { Ok(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?) };
-    let (mut rows_late, mut rows_changed, mut closes, mut open_ends) = (0, 0, true, None);
-    let rows_staged;
-    if plan.is_windowed() {
+    let x = EpochCtx {
+        job: id,
+        plan,
+        sink: quote_table(&def.sink)?,
+        late_table: def.late_data.as_deref().map(quote_table).transpose()?,
+        source_columns: &j.source.options.columns,
+        typed: src.typed.clone(),
+        parity,
+        overlay,
         // Late = assigned to a window that an earlier epoch already closed (window_end <= previous watermark).
-        let prev = j.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
-        conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {win} AS {w};
-             CREATE OR REPLACE TABLE {late} AS SELECT * FROM {win} WHERE window_end <= {prev};
-             CREATE OR REPLACE TABLE {input} AS
-               SELECT {cols}, window_start, window_end FROM {win} WHERE {prev} IS NULL OR window_end > {prev};
-             CREATE OR REPLACE TABLE {out} AS {delta};",
-            w = plan.window_sql(&format!("(SELECT _partition, _offset, {cols} FROM {typed} WHERE _err IS NULL)")),
-            delta = plan.delta_sql
-        ))?;
-        rows_late = count(&late)?;
-        rows_staged = count(&out)?;
-        if let Some(prev_ends) = &j.open_ends {
-            // The state's window ends after this epoch's MERGE; the emit closes those at or below the watermark.
-            let mut ends = prev_ends.clone();
-            let mut stmt = conn.prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {out}"))?;
-            for e in stmt.query_map([], |r| r.get::<_, i64>(0))? {
-                ends.insert(e?);
-            }
-            closes = watermark_us.is_some_and(|wm| ends.first().is_some_and(|e| *e <= wm));
-            if let Some(wm) = watermark_us {
-                ends.retain(|e| *e > wm);
-            }
-            open_ends = Some(ends);
+        prev_watermark: j.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into()),
+        watermark: watermark_us.map(|w| format!("make_timestamp({w})")),
+        epoch: (j.epoch + 1).to_string(),
+    };
+    let (mut rows_late, mut rows_staged, mut rows_changed, mut closes, mut open_ends) = (0, 0, 0, true, None);
+    for step in j.circuit.stage_steps(&x)? {
+        conn.execute_batch(&step.sql)?;
+        if let Some((counter, table)) = &step.count {
+            let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+            *match counter {
+                Counter::Late => &mut rows_late,
+                Counter::Staged => &mut rows_staged,
+                Counter::Changed => &mut rows_changed,
+            } = n;
         }
-    } else if let Some(g) = &plan.global {
-        // Source rows enter the operator chain with weight +1 (sources are append-only).
-        conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {input} AS SELECT {cols}, 1::INTEGER AS __w FROM {typed} WHERE _err IS NULL"
-        ))?;
-        let mut t = GlobalTables::new(id, state_table(id), quote_table(&def.sink)?, plan, parity);
-        if let Some(prev) = overlay {
-            let prev_new = GlobalTables::new(id, state_table(id), String::new(), plan, prev).new_state;
-            t.state = g.overlay_sql(&t.state, &prev_new, &plan.state_columns);
+    }
+    if let (Some(prev_ends), true) = (&j.open_ends, j.circuit.emits_final()) {
+        // The state's window ends after this epoch's MERGE; the emit closes those at or below the watermark.
+        let mut ends = prev_ends.clone();
+        let mut stmt = conn.prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", mem("out", &format!("{id}_{parity}"))))?;
+        for e in stmt.query_map([], |r| r.get::<_, i64>(0))? {
+            ends.insert(e?);
         }
-        for stmt in g.stage_sql(&t, &plan.state_columns) {
-            conn.execute_batch(&stmt)?;
+        closes = watermark_us.is_some_and(|wm| ends.first().is_some_and(|e| *e <= wm));
+        if let Some(wm) = watermark_us {
+            ends.retain(|e| *e > wm);
         }
-        rows_staged = count(&t.delta)?;
-        rows_changed = count(&t.changed)?;
-    } else {
-        conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {input} AS SELECT {cols} FROM {typed} WHERE _err IS NULL;
-             CREATE OR REPLACE TABLE {out} AS {delta};",
-            delta = plan.delta_sql
-        ))?;
-        rows_staged = count(&out)?;
+        open_ends = Some(ends);
     }
     Ok(Staged {
         offsets: src.offsets.clone(),
@@ -1118,58 +1097,43 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 continue;
             }
             let s = &mut c.staged;
-            let plan = &c.def.plan;
-            let sink = quote_table(&c.def.sink)?;
-            let sink_cols: Vec<String> = plan.sink_columns.iter().map(|(c, _)| ident(c)).chain(["_duckwake_epoch".into()]).collect();
-            let sink_cols = sink_cols.join(", ");
-            if plan.is_windowed() {
-                let st = state_table(id);
-                if !lean || s.rows_staged > 0 {
-                    timed(&mut tm.state, || conn.execute_batch(&plan.merge_sql(&st, &c.out)))?;
-                }
-                crash_point("commit_mid");
-                if let Some(wm) = s.watermark_us.filter(|_| !lean || s.closes) {
-                    let wm = format!("make_timestamp({wm})");
-                    s.rows_out = timed(&mut tm.sink, || {
-                        conn.execute(
-                            &format!("INSERT INTO {sink} ({sink_cols}) SELECT {}, {epoch} FROM {st} WHERE __we <= {wm}", plan.final_select),
-                            [],
-                        )
-                    })? as i64;
-                    timed(&mut tm.state, || conn.execute_batch(&format!("DELETE FROM {st} WHERE __we <= {wm}")))?;
-                }
-                if let Some(late) = c.def.late_data.as_ref().filter(|_| !lean || s.rows_late > 0) {
-                    let cols: Vec<String> = c.source.options.columns.iter().map(|(c, _)| ident(c)).collect();
-                    let cols = cols.join(", ");
-                    let sql = format!(
-                        "INSERT INTO {} ({cols}, window_start, window_end, _source_partition, _source_offset, _duckwake_epoch)
-                         SELECT {cols}, window_start, window_end, _partition, _offset, {epoch} FROM {}",
-                        quote_table(late)?,
-                        c.late
-                    );
-                    timed(&mut tm.late, || conn.execute_batch(&sql))?;
-                }
-            } else if let Some(g) = &plan.global {
-                // Upsert sink: replace the touched groups' state and the changed groups' rows.
-                let t = c.global.as_ref().context("global aggregate without its tables")?;
-                // State replace (statements 0, 1), then sink upsert (2, 3).
-                for (i, stmt) in g.commit_sql(t, &plan.state_columns, epoch).iter().enumerate() {
-                    let nothing = if i < 2 { s.rows_staged == 0 } else { s.rows_changed == 0 };
-                    if !lean || !nothing {
-                        timed(if i < 2 { &mut tm.state } else { &mut tm.sink }, || conn.execute_batch(stmt))?;
-                    }
-                    if i == 1 {
-                        crash_point("commit_mid");
+            let x = EpochCtx {
+                job: id,
+                plan: &c.def.plan,
+                sink: quote_table(&c.def.sink)?,
+                late_table: c.def.late_data.as_deref().map(quote_table).transpose()?,
+                source_columns: &c.source.options.columns,
+                typed: String::new(),
+                parity: c.parity,
+                overlay: None,
+                prev_watermark: String::new(),
+                watermark: s.watermark_us.map(|w| format!("make_timestamp({w})")),
+                epoch: epoch.to_string(),
+            };
+            let upserts = c.circuit.upserts();
+            for step in c.circuit.commit_steps(&x)? {
+                let none = step.skip_if_none.is_some_and(|k| match k {
+                    Counter::Late => s.rows_late == 0,
+                    Counter::Staged => s.rows_staged == 0,
+                    Counter::Changed => s.rows_changed == 0,
+                });
+                if !lean || (!none && (!step.needs_close || s.closes)) {
+                    let acc = match step.cost {
+                        Cost::Stage | Cost::State => &mut tm.state,
+                        Cost::Sink => &mut tm.sink,
+                        Cost::Late => &mut tm.late,
+                    };
+                    let n = timed(acc, || conn.execute(&step.sql, []))?;
+                    if step.output_rows {
+                        s.rows_out = n as i64;
                     }
                 }
+                if step.crash_after {
+                    crash_point("commit_mid");
+                }
+            }
+            if upserts {
                 s.rows_out = s.rows_changed;
-            } else {
-                if !lean || s.rows_staged > 0 {
-                    s.rows_out = timed(&mut tm.sink, || {
-                        conn.execute(&format!("INSERT INTO {sink} ({sink_cols}) SELECT *, {epoch} FROM {}", c.out), [])
-                    })? as i64;
-                }
-                crash_point("commit_mid");
             }
             let offsets = json!({ &c.source.name: s.offsets.iter().map(|(p, o)| (p.to_string(), json!(o))).collect::<serde_json::Map<_, _>>() });
             let ts = |us: Option<i64>| us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());

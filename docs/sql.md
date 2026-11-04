@@ -12,6 +12,7 @@ is the view's job id. Actions return `(view, result)` rows.
 | `duckwake_reset(view, to_epoch)` / `duckwake_drop(view, keep_table :=)` | rewind and replay / remove |
 | `duckwake_jobs()` / `duckwake_checkpoints(view, n :=)` / `duckwake_sources()` | status, history, sources |
 | `duckwake_verify(view)` | the differential exactly-once check |
+| `duckwake_explain(view)` | the view's operator circuit, how it was made incremental, and one epoch's SQL ([internals](internals.md#views-as-dbsp-circuits)) |
 | `duckwake_wait(view, timeout_s :=)` | block until the view has committed what its topic holds now |
 | `duckwake_metrics()` | the worker's numbers as rows: `(metric, worker, view, value)` |
 | `duckwake_worker_status()` | the worker: running, restarts, last error and when |
@@ -35,4 +36,5 @@ Only in the extension:
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME --worker W` / `stop` / `pause` |
 | `duckwake_jobs()` / `duckwake_checkpoints(view)` | `jobs` / `checkpoints NAME` |
 | `duckwake_reset(view, to_epoch)` | `reset NAME --to-epoch N` |
+| `duckwake_verify(view)` / `duckwake_explain(view)` | `verify NAME` / `explain NAME` |
 | `TUMBLE(src, col, size)` / `HOP(src, col, size, slide)` | same, inside the view SQL |

@@ -3,6 +3,7 @@
 pub mod adhoc;
 pub mod api;
 pub mod catalog;
+pub mod circuit;
 pub mod decode;
 pub mod engine;
 pub mod kafka;

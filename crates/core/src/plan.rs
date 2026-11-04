@@ -20,7 +20,7 @@ pub enum WindowKind {
     Hop,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowSpec {
     pub kind: WindowKind,
     pub time_col: String,
@@ -263,22 +263,40 @@ impl GlobalPlan {
         format!("SELECT {} FROM {delta} d LEFT JOIN {old} o ON {}", cols.join(", "), self.keys_match("d", "o"))
     }
 
-    /// One epoch's staging statements (in-memory tables only). `t` names the tables; `state` is read.
-    pub fn stage_sql(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
+    /// The pre-aggregate: the view's FROM/WHERE over the epoch's weighted rows (`input_table`).
+    pub fn pre_stmt(&self, t: &GlobalTables) -> String {
+        format!("CREATE OR REPLACE TABLE {} AS {}", t.pre, self.pre_sql)
+    }
+
+    /// The incremental aggregate: the epoch's partials per group, the touched groups' stored state (read
+    /// from `t.state`) and their new state.
+    pub fn aggregate_stmts(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
+        vec![
+            format!("CREATE OR REPLACE TABLE {} AS {}", t.delta, self.delta_sql(&t.pre)),
+            format!("CREATE OR REPLACE TABLE {} AS {}", t.old, self.old_sql(&t.state, &t.delta)),
+            format!("CREATE OR REPLACE TABLE {} AS {}", t.new_state, self.merge_sql(&t.delta, &t.old, state_columns)),
+        ]
+    }
+
+    /// The post-aggregate (HAVING and the select list) over the touched groups' old and new values: the
+    /// aggregate's change as a retraction of the old rows and an insertion of the new ones.
+    pub fn post_stmts(&self, t: &GlobalTables) -> Vec<String> {
+        vec![
+            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.old)),
+            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.old_out, self.post_sql),
+            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.new_state)),
+            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.new_out, self.post_sql),
+        ]
+    }
+
+    /// The upsert sink's staging: the groups whose sink row changes, and their new rows.
+    pub fn upsert_stmts(&self, t: &GlobalTables) -> Vec<String> {
         let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
         let row = |a: &str| format!("({})", sink_cols.iter().map(|c| format!("{a}.{c}")).collect::<Vec<_>>().join(", "));
         let keys: Vec<String> = self.sink_keys.iter().map(|k| format!("coalesce(o.{k}, n.{k}) AS {k}", k = ident(k))).collect();
         let keys = if keys.is_empty() { "1 AS __one".to_string() } else { keys.join(", ") };
         let changed_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("n", "c") };
         vec![
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.pre, self.pre_sql),
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.delta, self.delta_sql(&t.pre)),
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.old, self.old_sql(&t.state, &t.delta)),
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.new_state, self.merge_sql(&t.delta, &t.old, state_columns)),
-            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.old)),
-            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.old_out, self.post_sql),
-            format!("CREATE OR REPLACE TABLE {} AS {}", self.agg_table, self.finalize_sql(&t.new_state)),
-            format!("CREATE OR REPLACE TABLE {} AS SELECT *, true AS __p FROM ({})", t.new_out, self.post_sql),
             // A group's sink row changes when it appears, disappears (HAVING, or emptied) or differs.
             format!(
                 "CREATE OR REPLACE TABLE {} AS SELECT {keys} FROM {} o FULL OUTER JOIN {} n ON {}
@@ -292,20 +310,42 @@ impl GlobalPlan {
         ]
     }
 
-    /// The epoch's writes to the lake: replace touched groups' state and changed groups' sink rows.
-    pub fn commit_sql(&self, t: &GlobalTables, state_columns: &[(String, String)], epoch: i64) -> Vec<String> {
+    /// One epoch's staging statements (in-memory tables only), in order. `t` names the tables; `state` is read.
+    pub fn stage_sql(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
+        let mut out = vec![self.pre_stmt(t)];
+        out.extend(self.aggregate_stmts(t, state_columns));
+        out.extend(self.post_stmts(t));
+        out.extend(self.upsert_stmts(t));
+        out
+    }
+
+    /// The aggregate's writes at commit: replace the touched groups' state.
+    pub fn commit_state_sql(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
         let st_cols: Vec<String> = state_columns.iter().map(|(c, _)| ident(c)).collect();
-        let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
-        let sink_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("s", "c") };
         vec![
             format!("DELETE FROM {} s WHERE EXISTS (SELECT 1 FROM {} d WHERE {})", t.state, t.delta, self.keys_match("s", "d")),
             format!("INSERT INTO {} ({c}) SELECT {c} FROM {} WHERE __cnt <> 0", t.state, t.new_state, c = st_cols.join(", ")),
+        ]
+    }
+
+    /// The upsert sink's writes at commit: replace the changed groups' rows.
+    pub fn commit_sink_sql(&self, t: &GlobalTables, epoch: &str) -> Vec<String> {
+        let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
+        let sink_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("s", "c") };
+        vec![
             format!("DELETE FROM {} s WHERE EXISTS (SELECT 1 FROM {} c WHERE {sink_match})", t.sink, t.changed),
             format!(
                 "INSERT INTO {} ({c}, _duckwake_epoch) SELECT {c}, {epoch} FROM {}",
                 t.sink, t.upserts, c = sink_cols.join(", ")
             ),
         ]
+    }
+
+    /// The epoch's writes to the lake: replace touched groups' state and changed groups' sink rows.
+    pub fn commit_sql(&self, t: &GlobalTables, state_columns: &[(String, String)], epoch: i64) -> Vec<String> {
+        let mut out = self.commit_state_sql(t, state_columns);
+        out.extend(self.commit_sink_sql(t, &epoch.to_string()));
+        out
     }
 
     /// The state as of the previous epoch while that epoch may still be committing: its new state for the

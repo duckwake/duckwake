@@ -8,6 +8,7 @@
 | View compiler: SQL rewrite to delta + MERGE, rejection at create time | `plan.rs`. DuckDB parses the view (`json_serialize_sql`). The AST is checked against the operator matrix, the stream reference is swapped for the epoch's staging table, and aggregates are split into mergeable partials (`avg` → `sum` + `count`). `json_deserialize_sql` turns it back into SQL. Global aggregates compile into three operators over weighted rows (`__w`): pre-aggregate, aggregate with a DuckLake state table, and post (`HAVING` + select list) into an upsert sink; `GlobalPlan::stage_sql` / `commit_sql` are the per-epoch statements, shared with the unit tests. |
 | Source readers, offsets owned by the lake | `kafka.rs` (`rskafka`, one prefetch task per partition, bounded channel for backpressure). Each fetch is cut into chunks; with Arrow decode a chunk is decoded on a blocking thread before it is queued. |
 | JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `plan.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
+| Views as DBSP circuits: operator graph, incrementalization, SQL per operator | `circuit.rs` (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
 | Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>` |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
@@ -26,6 +27,39 @@ INSERT INTO lake.analytics.clicks_late ...; INSERT INTO lake.__duckwake.dead_let
 INSERT INTO lake.__duckwake.checkpoints VALUES ('clicks_per_min', 42, '{"clicks":{"0":1832,...}}', <watermark>, ...);
 COMMIT;
 ```
+
+## Views as DBSP circuits
+
+Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model Feldera is built on
+(`circuit.rs`). The compiled view becomes an operator graph Q over whole collections: `Source`, `Weigh` (weight
++1 per row), `Window`, `LateSplit`, `Map` (the stateless SQL fragments), `Aggregate`, `Sink`. `incrementalize`
+wraps it as D ∘ Q ∘ I and rewrites with DBSP's rules until no integrator (I) or differentiator (D) is left:
+
+- a linear operator L commutes with both: L ∘ I = I ∘ L, D ∘ L = L ∘ D;
+- D ∘ I = id;
+- D ∘ Aggregate ∘ I = AggregateΔ, the incremental aggregate, whose state is a DuckLake table.
+
+What remains runs on changes, and every operator generates its own SQL: `stage_steps` (in-memory, before the
+epoch's transaction) and `commit_steps` (inside it). Linear operators fuse into their consumer's statement as
+subqueries; an operator's output is a table only where a fragment reads it by name or two operators read it.
+The engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+
+`duckwake explain VIEW` (or `FROM duckwake_explain('VIEW')`) prints Q, each rewrite, the epoch circuit and one
+epoch's SQL. For a windowed view:
+
+```
+Q: the view over whole collections            The circuit that runs every epoch
+  n0  Source(clicks)                            n0  Source(clicks)
+  n1  Window(TUMBLE ts, 10s)       ← n0         n1  Window(TUMBLE ts, 10s)        ← n0
+  n2  LateSplit(on time | late)    ← n1         n2  LateSplit(on time | late)     ← n1
+  n3  Aggregate(windowed)          ← n2.0       n3  AggregateΔ(windowed) [state]  ← n2.0
+  n4  Sink(append)                 ← n3         n4  Sink(append)                  ← n3
+  n5  Sink(late data)              ← n2.1       n5  Sink(late data)               ← n2.1
+```
+
+New operators (DISTINCT, stream–stream joins, more aggregates) are new graph nodes with their own SQL and an
+incremental form; the rules and the engine stay as they are. Feldera's `dbsp` crate is the reference for each
+operator's semantics and a test oracle, not a dependency.
 
 ## Findings that should change the design doc
 
@@ -70,8 +104,7 @@ COMMIT;
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
-  parser hooks, so it needs a C++ shim. The extension is unsigned, built per platform, and has no
-  `duckwake_explain`. The server's Quack token is one shared secret; there are no users or roles.
+  parser hooks, so it needs a C++ shim. The extension is unsigned and built per platform. The server's Quack token is one shared secret; there are no users or roles.
 - **Sources.** Kafka only, JSON only, with declared columns. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
@@ -92,6 +125,7 @@ COMMIT;
 ```
 crates/core      duckwake_core: engine, compiler, catalog, Kafka, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
+crates/core/src/circuit.rs        views as DBSP circuits: graph, incrementalization, SQL per operator
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)

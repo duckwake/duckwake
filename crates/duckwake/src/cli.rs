@@ -142,6 +142,8 @@ enum Cmd {
     },
     /// Differential exactly-once check of a view against a batch recomputation.
     Verify { name: String },
+    /// duckwake_explain(view): the view's circuit, how it was made incremental, and one epoch's SQL.
+    Explain { name: String },
     /// Run SQL against the embedded DuckDB with the lake attached.
     Sql {
         query: String,
@@ -326,6 +328,9 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         }
         Cmd::Produce { brokers, topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos } => {
             rt.block_on(produce(&brokers, &topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos))?;
+        }
+        Cmd::Explain { name } => {
+            print!("{}", api::explain(&open()?, &name)?);
         }
         Cmd::Verify { name } => {
             let conn = open()?;

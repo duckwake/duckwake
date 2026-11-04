@@ -4,7 +4,7 @@
 use crate::catalog;
 use crate::lake::{lit, CTL};
 use crate::model::{JobDef, JobStatus};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use duckdb::Connection;
 
 /// Options of `duckwake_create_view`; `None` takes the default.
@@ -105,4 +105,12 @@ pub fn sources_sql() -> String {
                 options->>'decode' AS decode, created_at::TIMESTAMP AS created_at
          FROM {CTL}.sources ORDER BY name"
     )
+}
+
+/// The view's circuit: the query, how it was made incremental, and the SQL of one epoch.
+pub fn explain(conn: &Connection, name: &str) -> Result<String> {
+    let job = catalog::resolve_view(conn, name)?;
+    let (def, _) = catalog::load_job(conn, &job)?;
+    let source = catalog::load_sources(conn)?.remove(&def.plan.source).ok_or_else(|| anyhow!("source of {job} is gone"))?;
+    crate::circuit::explain(&def, &source.options.columns)
 }

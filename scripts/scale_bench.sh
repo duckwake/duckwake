@@ -45,7 +45,7 @@ CATCHUP=${CATCHUP:-0}
 [[ -f $OUT/summary.csv ]] || echo "label,views,workers,rate,epochs,rows_per_epoch,stage_p50_ms,commit_p50_ms,writes_p50_ms,commit_call_p50_ms,period_p50_s,period_p95_s,fresh_p50_s,fresh_p95_s,drain_s,cpu_pct,rss_mb" >"$OUT/summary.csv"
 
 for n in $COUNTS; do
-  run="$OUT/${LABEL}_${n}$([[ $CATCHUP == 1 ]] && echo _catchup)"
+  run="$OUT/${LABEL}_${n}$( [[ $CATCHUP == 1 ]] && echo _catchup || true)"
   rm -rf "$run"; mkdir -p "$run"
   log "$LABEL: $n views, $WORKERS worker(s), $RATE events/s for $DURATION s, epoch $EPOCH ${FLAGS:+($FLAGS)}"
   docker compose exec -T redpanda rpk topic delete "$TOPIC" >/dev/null 2>&1 || true
