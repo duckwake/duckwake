@@ -53,10 +53,11 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 - [Performance](docs/performance.md): the worker flags and the benchmarks
 - [Testing](docs/testing.md): what has been verified, and how to run the tests
 - [Internals](docs/internals.md): how the code maps to the design, findings, gaps and layout
+- [Roadmap](docs/roadmap.md): what is done and what stands between it and production
 
 ## Status
 
 A proof of concept. Kafka with JSON only; filters, projections, lookup joins, windowed and global
 aggregates (`count`, `sum`, `avg`, `min`, `max`). Every test checks the views against the same SQL run as one
 batch query. Not yet: `CREATE CONTINUOUS VIEW` DDL, a signed extension, `DISTINCT` and stream–stream joins.
-See [gaps](docs/internals.md#simplifications-and-gaps).
+See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.
