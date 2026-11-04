@@ -167,6 +167,8 @@ struct Committed {
     timing: CommitTiming,
     commit_ms: u128,
     attempts: u64,
+    /// When COMMIT returned: the epoch's output became visible.
+    visible_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Where an epoch transaction's time goes, in ms summed over views: `writes` is every statement before
@@ -496,6 +498,8 @@ impl Worker {
         }
         for j in c.batch.jobs.iter().filter(|j| !c.fenced.contains(&j.id)) {
             let s = &j.staged;
+            // Newest event committed to the moment it became visible (negative for event times in the future).
+            let freshness_ms = s.max_event_time_us.map(|us| (c.visible_at.timestamp_micros() - us) / 1000);
             if let Some(m) = &self.cfg.metrics {
                 // A job released while this epoch was in flight is not this worker's any more.
                 if self.jobs.contains_key(&j.id) {
@@ -511,6 +515,7 @@ impl Worker {
                             rows_late: s.rows_late.max(0) as u64,
                             rows_dead: s.rows_dead.max(0) as u64,
                             stage_ms: s.stage_ms + s.source_ms,
+                            commit_freshness_s: freshness_ms.map(|ms| ms as f64 / 1000.0),
                         },
                     );
                 }
@@ -527,6 +532,7 @@ impl Worker {
                 rows_dead = s.rows_dead,
                 watermark = %fmt_us(s.watermark_us),
                 lag = j.lag,
+                freshness_ms = freshness_ms.unwrap_or(-1),
                 stage_ms = s.stage_ms,
                 source_ms = s.source_ms,
                 poll_stage_ms = c.batch.poll_stage_ms,
@@ -1030,6 +1036,7 @@ fn commit_epoch(conn: &Connection, worker: &str, mut batch: CommitBatch) -> Resu
         let (mut fenced, mut timing) = (Vec::new(), CommitTiming::default());
         match commit(conn, worker, &mut batch, &mut fenced, &mut timing) {
             Ok(()) => {
+                let visible_at = chrono::Utc::now();
                 crash_point("after_commit");
                 let commit_ms = t.elapsed().as_millis();
                 info!(
@@ -1053,7 +1060,7 @@ fn commit_epoch(conn: &Connection, worker: &str, mut batch: CommitBatch) -> Resu
                         warn!(table, error = %e, "cannot drop staging table");
                     }
                 }
-                return Ok(Committed { batch, fenced, timing, commit_ms, attempts: attempt });
+                return Ok(Committed { batch, fenced, timing, commit_ms, attempts: attempt, visible_at });
             }
             Err(e) if crate::lake::is_conflict(&e) && attempt < 4 => {
                 warn!(attempt, error = %format!("{e:#}"), "epoch commit conflict, retrying");
@@ -1062,6 +1069,13 @@ fn commit_epoch(conn: &Connection, worker: &str, mut batch: CommitBatch) -> Resu
             Err(e) => return Err(e.context("epoch commit failed")),
         }
     }
+}
+
+/// The wall clock as a SQL TIMESTAMPTZ. A checkpoint's `committed_at` takes it when the view's writes are done:
+/// `now()` would give the transaction's start, and DuckLake's snapshot time is taken before the commit lands too.
+/// What remains after it is the COMMIT call itself; `Committed::visible_at` marks the end of that.
+fn wall_clock() -> String {
+    format!("to_timestamp({:.6})", chrono::Utc::now().timestamp_micros() as f64 / 1e6)
 }
 
 /// Runs `f` and adds its duration to `acc`.
@@ -1169,7 +1183,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                     ));
                 }
                 checkpoint_rows.push(format!(
-                    "({}, {epoch}, {}, {}, 'ducklake', NULL, {}, {}, {}, {}, {}, {}, {}, now(), {})",
+                    "({}, {epoch}, {}, {}, 'ducklake', NULL, {}, {}, {}, {}, {}, {}, {}, {{committed_at}}, {})",
                     lit(id),
                     lit(&offsets.to_string()),
                     ts(s.watermark_us),
@@ -1198,9 +1212,10 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                     &format!(
                         "INSERT INTO {CTL}.checkpoints (job_id, epoch, source_offsets, watermark, state_backend, state_ref,
                            rows_in, rows_out, rows_late, rows_dead, max_event_time, lag, worker, committed_at, rows_sql)
-                         VALUES (?, ?, ?, {}, 'ducklake', NULL, ?, ?, ?, ?, {}, ?, ?, now(), ?)",
+                         VALUES (?, ?, ?, {}, 'ducklake', NULL, ?, ?, ?, ?, {}, ?, ?, {}, ?)",
                         ts(s.watermark_us),
-                        ts(s.max_event_time_us)
+                        ts(s.max_event_time_us),
+                        wall_clock()
                     ),
                     duckdb::params![
                         id,
@@ -1226,7 +1241,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                     "INSERT INTO {CTL}.checkpoints (job_id, epoch, source_offsets, watermark, state_backend, state_ref,
                        rows_in, rows_out, rows_late, rows_dead, max_event_time, lag, worker, committed_at, rows_sql)
                      VALUES {}",
-                    checkpoint_rows.join(", ")
+                    checkpoint_rows.join(", ").replace("{committed_at}", &wall_clock())
                 ))
             })?;
         }

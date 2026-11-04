@@ -764,6 +764,9 @@ async fn view_action(
     body: axum::body::Bytes,
 ) -> ApiResult {
     let req: ActionReq = if body.is_empty() { ActionReq::default() } else { serde_json::from_slice(&body).map_err(|e| ApiError(e.into()))? };
+    if action == "verify" {
+        return verify_view(app, name).await;
+    }
     with_conn(&app, move |app, conn| {
         match action.as_str() {
             "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(&app.worker_id))?,
@@ -771,22 +774,33 @@ async fn view_action(
             "stop" => catalog::set_status(conn, &name, JobStatus::Stopped, None)?,
             "reset" => catalog::reset(conn, &name, req.to_epoch.ok_or_else(|| anyhow!("to_epoch is required"))?)?,
             "drop" => catalog::drop_view(conn, &name, false)?,
-            "verify" => {
-                let r = verify::verify(conn, &app.rt, &name)?;
-                return Ok(json!({
-                    "ok": r.ok(), "from_epoch": r.from_epoch, "epoch": r.epoch, "watermark": r.watermark, "kafka_rows": r.kafka_rows,
-                    "expected_rows": r.expected_rows, "sink_rows": r.sink_rows,
-                    "missing_from_sink": r.missing_from_sink, "unexpected_in_sink": r.unexpected_in_sink,
-                    "dead_expected": r.dead_expected, "dead_mismatch": r.dead_mismatch,
-                    "late_rows": r.late_rows, "late_duplicates": r.late_duplicates,
-                    "closed_windows_left_in_state": r.closed_windows_left_in_state,
-                }));
-            }
             other => bail!("unknown action {other:?}"),
         }
         Ok(json!({ "ok": true }))
     })
     .await
+}
+
+/// Verify reads the view's whole topic and can run for minutes on a big one. It runs on a DuckDB of its own (the
+/// lake attached afresh), not the API connection, so the UI keeps working, and two verifies don't share
+/// scratch tables.
+async fn verify_view(app: Shared, name: String) -> ApiResult {
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let conn = app.lake.open()?;
+        let r = verify::verify(&conn, &app.rt, &name)?;
+        Ok(json!({
+            "ok": r.ok(), "from_epoch": r.from_epoch, "epoch": r.epoch, "watermark": r.watermark, "kafka_rows": r.kafka_rows,
+            "expected_rows": r.expected_rows, "sink_rows": r.sink_rows,
+            "missing_from_sink": r.missing_from_sink, "unexpected_in_sink": r.unexpected_in_sink,
+            "dead_expected": r.dead_expected, "dead_mismatch": r.dead_mismatch,
+            "late_rows": r.late_rows, "late_duplicates": r.late_duplicates,
+            "closed_windows_left_in_state": r.closed_windows_left_in_state,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(anyhow!(e)))?
+    .map(Json)
+    .map_err(ApiError)
 }
 
 /// Creates a demo: a clicks source with a generator, a games dimension table and three views.

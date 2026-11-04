@@ -36,6 +36,7 @@ struct Job {
     rows_late: u64,
     rows_dead: u64,
     stage_seconds: f64,
+    commit_freshness_seconds: Option<f64>,
 }
 
 /// One series' value: `view` is set for per-view series, None for worker-wide ones.
@@ -50,8 +51,9 @@ pub struct Sample {
 type PerView = (&'static str, &'static str, &'static str, fn(&Job, &dyn Fn(i64) -> f64) -> Option<f64>);
 
 /// The per-view series: name, type, help, and how to read it off a view's numbers.
-const PER_VIEW: [PerView; 9] = [
+const PER_VIEW: [PerView; 10] = [
     ("duckwake_freshness_seconds", "gauge", "Now minus the newest event time committed (alert above 3x the epoch interval).", |j, secs| j.max_event_time_us.map(secs)),
+    ("duckwake_commit_freshness_seconds", "gauge", "At the last commit: newest event time to the moment its epoch became visible.", |j, _| j.commit_freshness_seconds),
     ("duckwake_watermark_delay_seconds", "gauge", "Now minus the view's watermark (alert above 2x watermark_delay).", |j, secs| j.watermark_us.map(secs)),
     ("duckwake_lag_events", "gauge", "Events behind the end of the topic after the last commit.", |j, _| Some(j.lag as f64)),
     ("duckwake_epoch", "gauge", "Last committed epoch.", |j, _| Some(j.epoch as f64)),
@@ -73,6 +75,8 @@ pub struct EpochStats {
     pub rows_late: u64,
     pub rows_dead: u64,
     pub stage_ms: u128,
+    /// Newest committed event time to the moment its epoch became visible.
+    pub commit_freshness_s: Option<f64>,
 }
 
 impl Metrics {
@@ -92,6 +96,7 @@ impl Metrics {
         j.rows_late += s.rows_late;
         j.rows_dead += s.rows_dead;
         j.stage_seconds = s.stage_ms as f64 / 1000.0;
+        j.commit_freshness_seconds = s.commit_freshness_s;
     }
 
     /// One committed epoch of the whole worker; `attempts` above 1 were DuckLake write conflicts.
@@ -243,6 +248,7 @@ mod tests {
                 rows_late: 1,
                 rows_dead: 2,
                 stage_ms: 40,
+                commit_freshness_s: Some(0.8),
             },
         );
         m.record_commit(50, 120, 2);

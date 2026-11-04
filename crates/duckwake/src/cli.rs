@@ -496,7 +496,20 @@ async fn produce(
             by_part[(i as usize) % parts.len()].push(payload.into_bytes());
         }
         for (idx, batch) in by_part.into_iter().enumerate() {
-            kafka::produce(&client, topic, parts[idx], batch).await?;
+            // Keep each request under the broker's default 1 MB batch limit.
+            let mut piece: Vec<Vec<u8>> = Vec::new();
+            let mut bytes = 0;
+            for payload in batch {
+                if bytes + payload.len() > 512 * 1024 && !piece.is_empty() {
+                    kafka::produce(&client, topic, parts[idx], std::mem::take(&mut piece)).await?;
+                    bytes = 0;
+                }
+                bytes += payload.len();
+                piece.push(payload);
+            }
+            if !piece.is_empty() {
+                kafka::produce(&client, topic, parts[idx], piece).await?;
+            }
         }
         sent += n;
         let due = tick * (sent / per_tick) as u32;

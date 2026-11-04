@@ -61,6 +61,11 @@ COMMIT;
    - DuckDB does not short-circuit `AND`, so `json_type()` must be guarded with `CASE` against malformed
      payloads.
    - Skipping empty epochs (no new rows, watermark unchanged) avoids empty snapshots when a stream is idle.
+   - `now()` inside a transaction is the transaction's start, and DuckLake's `snapshot_time` is also taken
+     before the commit lands (about 50 ms before the epoch's start, here). Neither tells when output became
+     visible. A checkpoint's `committed_at` is the worker's clock once the view's writes are done, which
+     leaves out only the COMMIT call; the epoch log's `freshness_ms` and the
+     `duckwake_commit_freshness_seconds` metric measure to the moment COMMIT returned.
 
 ## Simplifications and gaps
 

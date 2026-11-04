@@ -14,6 +14,7 @@ catalog and Redpanda, all from `docker-compose.yml`.
 | Matches batch SQL | `verify` in every script | Multiset equality of each sink with the view run as one batch query over everything committed. Late rows and dead letters are also checked. |
 | Matches batch SQL after retention | `scripts/retention_test.sh` | The first quarter of every partition is trimmed. Windowed and append views verify over the retained range. The global aggregate is refused, because it depends on deleted events. A sink row deleted inside the range is caught. |
 | `duckwake_reset` | `scripts/reset_test.sh` | Rewind to epoch 6, replay, and the sinks end identical (verified). |
+| Arrow decode vs SQL decode | `scripts/catchup_test.sh` | One worker drains 600k events of ~1 KB through three views: 34,049 events/s with Arrow against 25,306 with the SQL decode (1.35×), read + stage 0.89 s against 1.63 s per epoch, peak memory 382 MB against 2,392 MB. Both verify exactly. |
 | Parallel processing (worker flags) | `scripts/scale_bench.sh`, all suites with `WORKER_FLAGS` | 16 views on one worker drain a backlog at 40.5k events/s with all four flags, against 21.7k without (1.87×). At a steady 20k events/s, read + stage per epoch drops from 1.55 s to 0.30 s, the commit from 0.66 s to 0.33 s, and CPU from 89% to 46%. Every suite passes with the flags off, with `--lean-commit` alone, with the other three together, and with all four. |
 
 Not measured: the 4 vCPU / 16 GB reference box, the 24 h soak, and recovery time for 1 GB of state.
