@@ -1,7 +1,7 @@
 //! Arrow decode of JSON messages (Phase A of the Arrow ingest plan): one pass in Rust from Kafka payloads to
 //! typed columns, so staging can `append_record_batch` instead of parsing JSON in SQL per column.
 //!
-//! The result must equal the SQL decode (`plan::decode_sql`) row for row. A value is decoded here only when
+//! The result must equal the SQL decode (`decode_sql`) row for row. A value is decoded here only when
 //! its JSON form is on a narrow fast list for the column type; any other form flags the message for the SQL
 //! fallback, which decides value or dead letter exactly as before. Messages are decoded as one stream and
 //! bisected when that stream fails, so a bad message costs extra decodes but never affects its neighbours:
@@ -13,6 +13,7 @@
 //! and forms arrow-json accepts but yyjson may not (anywhere in the object, not only declared fields) are
 //! flagged.
 use crate::kafka::Msg;
+use crate::lake::{ident, lit};
 use crate::model::SourceOptions;
 use anyhow::{bail, Result};
 use arrow_json::reader::{ArrayDecoder, DecoderContext, DecoderFactory, Tape, TapeElement};
@@ -453,6 +454,39 @@ pub fn staging_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     fields.push(Arc::new(Field::new("_err", DataType::Utf8, true)));
     arrays.push(null);
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+}
+
+/// True for payloads that parse as a JSON object. `json_type` raises on malformed input and DuckDB does not
+/// short-circuit AND, so the CASE keeps it away from rows that are not valid JSON.
+pub const IS_JSON_OBJECT: &str = "CASE WHEN json_valid(payload) THEN json_type(payload) = 'OBJECT' ELSE false END";
+
+/// Builds the decode query for raw Kafka rows `(_partition, _offset, payload)` already known to be JSON
+/// objects. Adds the typed source columns and `_err` (NULL when the row is usable).
+pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
+    let o = &src.options;
+    let field = |c: &str| format!("json_extract_string(payload, {})", lit(&format!("$.\"{c}\"")));
+    let cols: Vec<String> = o
+        .columns
+        .iter()
+        .map(|(c, t)| format!("TRY_CAST({} AS {t}) AS {}", field(c), ident(c)))
+        .collect();
+    let mut checks = vec![format!(
+        "WHEN TRY_CAST({} AS TIMESTAMP) IS NULL THEN 'missing or invalid event time {}'",
+        field(&o.event_time),
+        o.event_time
+    )];
+    for (c, t) in &o.columns {
+        checks.push(format!(
+            "WHEN {f} IS NOT NULL AND TRY_CAST({f} AS {t}) IS NULL THEN {}",
+            lit(&format!("type conflict: {c} is not {t}")),
+            f = field(c)
+        ));
+    }
+    format!(
+        "SELECT _partition, _offset, payload, {}, CASE {} ELSE NULL END AS _err FROM {ok_table}",
+        cols.join(", "),
+        checks.join(" ")
+    )
 }
 
 #[cfg(test)]

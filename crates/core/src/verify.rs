@@ -12,7 +12,7 @@
 use crate::catalog::{self, state_table};
 use crate::kafka;
 use crate::lake::{ident, quote_table, CTL};
-use crate::plan::{decode_sql, IS_JSON_OBJECT};
+use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
 use tokio::runtime::Handle;

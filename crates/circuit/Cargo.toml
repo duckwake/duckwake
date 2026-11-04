@@ -1,0 +1,16 @@
+[package]
+name = "duckwake_circuit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# DuckDB parses and binds the view; which DuckDB (bundled or the host's) is chosen by duckwake_core's features.
+duckdb.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# The same features as duckwake_core's default build, so the tests reuse its DuckDB build.
+duckdb = { workspace = true, features = ["bundled", "json", "parquet", "appender-arrow"] }

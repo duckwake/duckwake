@@ -112,5 +112,5 @@ pub fn explain(conn: &Connection, name: &str) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
     let (def, _) = catalog::load_job(conn, &job)?;
     let source = catalog::load_sources(conn)?.remove(&def.plan.source).ok_or_else(|| anyhow!("source of {job} is gone"))?;
-    crate::circuit::explain(&def, &source.options.columns)
+    crate::circuit::explain(def.view(), &source.options.columns)
 }

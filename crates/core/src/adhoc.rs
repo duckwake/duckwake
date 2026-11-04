@@ -5,7 +5,7 @@
 use crate::kafka;
 use crate::lake::ident;
 use crate::model::SourceDef;
-use crate::plan::{decode_sql, IS_JSON_OBJECT};
+use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::Result;
 use duckdb::Connection;
 use std::collections::HashMap;

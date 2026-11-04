@@ -178,3 +178,19 @@ mod tests {
         assert!(parse_duration("1 fortnight").is_err());
     }
 }
+
+impl JobDef {
+    /// The view as the circuit compiler needs it.
+    pub fn view(&self) -> crate::circuit::View<'_> {
+        crate::circuit::View { id: &self.job_id, sink: &self.sink, late_data: self.late_data.as_deref(), plan: &self.plan }
+    }
+}
+
+impl crate::circuit::SourceSchema for SourceDef {
+    fn event_time(&self) -> &str {
+        &self.options.event_time
+    }
+    fn columns(&self) -> &[(String, String)] {
+        &self.options.columns
+    }
+}

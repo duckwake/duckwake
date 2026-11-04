@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+duckwake_circuit = { path = "../circuit" }
 duckdb = { workspace = true, features = ["appender-arrow"] }
 arrow-json = "60"
 anyhow.workspace = true

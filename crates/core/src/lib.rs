@@ -3,7 +3,6 @@
 pub mod adhoc;
 pub mod api;
 pub mod catalog;
-pub mod circuit;
 pub mod decode;
 pub mod engine;
 pub mod kafka;
@@ -11,6 +10,9 @@ pub mod lake;
 pub mod maintenance;
 pub mod metrics;
 pub mod model;
-pub mod plan;
 pub mod sql_functions;
 pub mod verify;
+
+/// Views as DBSP circuits, and the compiler from SQL (`plan`).
+pub use duckwake_circuit as circuit;
+pub use duckwake_circuit::plan;

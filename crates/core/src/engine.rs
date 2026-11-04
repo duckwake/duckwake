@@ -22,7 +22,7 @@ use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
 use crate::model::{parse_duration, JobDef, SourceDef};
-use crate::plan::{decode_sql, IS_JSON_OBJECT};
+use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde_json::json;
@@ -441,7 +441,7 @@ impl Worker {
                 gid
             }
         };
-        let circuit = Arc::new(Circuit::compile(&def.plan, &def)?);
+        let circuit = Arc::new(Circuit::compile(&def.view())?);
         let open_ends = if self.cfg.lean_commit && circuit.emits_final() {
             let mut stmt = self.conns[0].prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", state_table(id)))?;
             let ends = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<duckdb::Result<BTreeSet<_>>>()?;

@@ -16,7 +16,7 @@ use duckdb::{params, Connection};
 use duckwake_core::decode::{ArrowDecoder, Decoded};
 use duckwake_core::kafka::Msg;
 use duckwake_core::model::{SourceDef, SourceOptions};
-use duckwake_core::plan::{decode_sql, IS_JSON_OBJECT};
+use duckwake_core::decode::{decode_sql, IS_JSON_OBJECT};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;

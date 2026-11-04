@@ -724,6 +724,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckwake_circuit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "duckdb",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "duckwake_core"
 version = "0.1.0"
 dependencies = [
@@ -731,6 +741,7 @@ dependencies = [
  "arrow-json",
  "chrono",
  "duckdb",
+ "duckwake_circuit",
  "rand 0.9.5",
  "rskafka",
  "serde",

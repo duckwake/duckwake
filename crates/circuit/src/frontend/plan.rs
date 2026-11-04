@@ -5,8 +5,8 @@
 //! mergeable partials. `json_deserialize_sql` turns the rewritten AST back into SQL, so every expression the
 //! user wrote is executed by DuckDB exactly as written. Anything outside the matrix is rejected here, at
 //! create time, never recomputed silently.
-use crate::lake::{describe, ident, lit};
-use crate::model::SourceDef;
+use super::SourceSchema;
+use crate::sql::{describe, ident};
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
@@ -419,42 +419,9 @@ impl GlobalTables {
     }
 }
 
-/// True for payloads that parse as a JSON object. `json_type` raises on malformed input and DuckDB does not
-/// short-circuit AND, so the CASE keeps it away from rows that are not valid JSON.
-pub const IS_JSON_OBJECT: &str = "CASE WHEN json_valid(payload) THEN json_type(payload) = 'OBJECT' ELSE false END";
-
-/// Builds the decode query for raw Kafka rows `(_partition, _offset, payload)` already known to be JSON
-/// objects. Adds the typed source columns and `_err` (NULL when the row is usable).
-pub fn decode_sql(src: &SourceDef, ok_table: &str) -> String {
-    let o = &src.options;
-    let field = |c: &str| format!("json_extract_string(payload, {})", lit(&format!("$.\"{c}\"")));
-    let cols: Vec<String> = o
-        .columns
-        .iter()
-        .map(|(c, t)| format!("TRY_CAST({} AS {t}) AS {}", field(c), ident(c)))
-        .collect();
-    let mut checks = vec![format!(
-        "WHEN TRY_CAST({} AS TIMESTAMP) IS NULL THEN 'missing or invalid event time {}'",
-        field(&o.event_time),
-        o.event_time
-    )];
-    for (c, t) in &o.columns {
-        checks.push(format!(
-            "WHEN {f} IS NOT NULL AND TRY_CAST({f} AS {t}) IS NULL THEN {}",
-            lit(&format!("type conflict: {c} is not {t}")),
-            f = field(c)
-        ));
-    }
-    format!(
-        "SELECT _partition, _offset, payload, {}, CASE {} ELSE NULL END AS _err FROM {ok_table}",
-        cols.join(", "),
-        checks.join(" ")
-    )
-}
-
 /// Compiles `sql` for job `job`. Creates the (empty) staging table so DuckDB can bind and DESCRIBE the
 /// rewritten queries, which also validates lookup-join tables and column names.
-pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>) -> Result<Plan> {
+pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, S>) -> Result<Plan> {
     let ast = serialize(conn, sql)?;
     let stmts = ast["statements"].as_array().ok_or_else(|| anyhow!("no statements"))?;
     if stmts.len() != 1 {
@@ -481,8 +448,8 @@ pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String
     let window = match &stream.window {
         None => None,
         Some((kind, time_col, size, slide)) => {
-            if time_col != &src.options.event_time {
-                bail!("windows must use the source's event_time column {:?}, not {time_col:?}", src.options.event_time);
+            if time_col != &src.event_time() {
+                bail!("windows must use the source's event_time column {:?}, not {time_col:?}", src.event_time());
             }
             let size_us = interval_us(conn, size)?;
             let slide_us = match slide {
@@ -499,7 +466,7 @@ pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String
     *stream_slot(&mut node["from_table"]).ok_or_else(|| anyhow!("lost stream reference"))? = table_ref;
 
     // Staging table with the source columns (+ window columns) so the rewritten SQL binds.
-    let mut cols: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+    let mut cols: Vec<String> = src.columns().iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
     if window.is_some() {
         cols.push("window_start TIMESTAMP".into());
         cols.push("window_end TIMESTAMP".into());
@@ -949,7 +916,7 @@ fn reject_unsupported(node: &Value) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_from(t: &mut Value, sources: &HashMap<String, SourceDef>, found: &mut Vec<StreamRef>) -> Result<()> {
+fn rewrite_from<S>(t: &mut Value, sources: &HashMap<String, S>, found: &mut Vec<StreamRef>) -> Result<()> {
     match t["type"].as_str().unwrap_or("") {
         "BASE_TABLE" => {
             let name = t["table_name"].as_str().unwrap_or("");
@@ -1112,19 +1079,7 @@ fn interval_us(conn: &Connection, expr: &Value) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SourceOptions;
-
-    fn setup() -> (Connection, HashMap<String, SourceDef>) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE games (game_id VARCHAR, studio VARCHAR)").unwrap();
-        let opts = SourceOptions::from_json(&json!({
-            "brokers": "x", "topic": "clicks", "event_time": "ts",
-            "columns": {"ts": "TIMESTAMP", "game_id": "VARCHAR", "user_id": "VARCHAR", "amount": "DECIMAL(18,2)"}
-        }))
-        .unwrap();
-        let src = SourceDef { name: "clicks".into(), kind: "kafka".into(), options: opts };
-        (conn, HashMap::from([("clicks".to_string(), src)]))
-    }
+    use crate::tests::setup;
 
     fn err(sql: &str) -> String {
         let (c, s) = setup();

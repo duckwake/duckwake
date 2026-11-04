@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/duckwake", "crates/extension"]
+members = ["crates/circuit", "crates/core", "crates/duckwake", "crates/extension"]
 # The extension links against the host's DuckDB instead of bundling one; Cargo would unify the two DuckDB
 # builds if they were built together, so it is built on its own: `cargo build --release -p duckwake_extension`.
-default-members = ["crates/core", "crates/duckwake"]
+default-members = ["crates/circuit", "crates/core", "crates/duckwake"]
 
 [workspace.package]
 version = "0.1.0"

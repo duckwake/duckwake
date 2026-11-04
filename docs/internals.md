@@ -5,10 +5,10 @@
 | Design component | Code |
 | --- | --- |
 | Worker with an embedded DuckDB 2.0 and the lake attached | `lake.rs` (embedded instance via the `duckdb` crate, DuckLake on PostgreSQL) |
-| View compiler: SQL rewrite to delta + MERGE, rejection at create time | `plan.rs`. DuckDB parses the view (`json_serialize_sql`). The AST is checked against the operator matrix, the stream reference is swapped for the epoch's staging table, and aggregates are split into mergeable partials (`avg` → `sum` + `count`). `json_deserialize_sql` turns it back into SQL. Global aggregates compile into three operators over weighted rows (`__w`): pre-aggregate, aggregate with a DuckLake state table, and post (`HAVING` + select list) into an upsert sink; `GlobalPlan::stage_sql` / `commit_sql` are the per-epoch statements, shared with the unit tests. |
+| View compiler: SQL rewrite to delta + MERGE, rejection at create time | `crates/circuit/src/frontend/plan.rs`. DuckDB parses the view (`json_serialize_sql`). The AST is checked against the operator matrix, the stream reference is swapped for the epoch's staging table, and aggregates are split into mergeable partials (`avg` → `sum` + `count`). `json_deserialize_sql` turns it back into SQL. Global aggregates compile into three operators over weighted rows (`__w`): pre-aggregate, aggregate with a DuckLake state table, and post (`HAVING` + select list) into an upsert sink; `GlobalPlan::stage_sql` / `commit_sql` are the per-epoch statements, shared with the unit tests. |
 | Source readers, offsets owned by the lake | `kafka.rs` (`rskafka`, one prefetch task per partition, bounded channel for backpressure). Each fetch is cut into chunks; with Arrow decode a chunk is decoded on a blocking thread before it is queued. |
-| JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `plan.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
-| Views as DBSP circuits: operator graph, incrementalization, SQL per operator | `circuit.rs` (see below) |
+| JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
+| Views as DBSP circuits: operator graph, incrementalization, SQL per operator | the `duckwake_circuit` crate (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
 | Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>` |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
@@ -31,7 +31,7 @@ COMMIT;
 ## Views as DBSP circuits
 
 Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model Feldera is built on
-(`circuit.rs`). The compiled view becomes an operator graph Q over whole collections: `Source` (each row with weight
+(the `duckwake_circuit` crate). The compiled view becomes an operator graph Q over whole collections: `Source` (each row with weight
 `__w`, +1 for Kafka), `Window`, `LateSplit`, `Map` (the stateless SQL fragments), `Aggregate`, `Sink`. An analysis
 marks which edges are append-only; a view whose operators assume append-only input (windowed partials, `MIN`/`MAX`,
 append sinks) is refused when that input can retract. `incrementalize`
@@ -47,6 +47,11 @@ What remains runs on changes, and every operator generates its own SQL: `stage_s
 epoch's transaction) and `commit_steps` (inside it). Linear operators fuse into their consumer's statement as
 subqueries; an operator's output is a table only where a fragment reads it by name or two operators read it.
 The engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+
+Each operator is a file in `crates/circuit/src/ops/` implementing `Operator`: its class (source, sink, linear,
+non-linear), output properties, input checks, and its stage and commit SQL; a non-linear one also implements
+`Stateful`, its incremental form. The rewrite rules read only the class, so a new operator is a new file, a
+variant in `Op`, its lowering and a test.
 
 `duckwake explain VIEW` (or `FROM duckwake_explain('VIEW')`) prints Q, each rewrite, the epoch circuit and one
 epoch's SQL. For a windowed view:
@@ -127,9 +132,10 @@ operator's semantics and a test oracle, not a dependency.
 ## Layout
 
 ```
-crates/core      duckwake_core: engine, compiler, catalog, Kafka, maintenance, verify
+crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
+                 operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
+crates/core      duckwake_core: engine, catalog, Kafka, decode, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
-crates/core/src/circuit.rs        views as DBSP circuits: graph, incrementalization, SQL per operator
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)

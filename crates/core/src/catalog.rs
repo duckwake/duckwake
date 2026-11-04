@@ -15,9 +15,7 @@ pub fn lease_table(job: &str) -> String {
     format!("{CTL}.{}", ident(&format!("lease_{job}")))
 }
 
-pub fn state_table(job: &str) -> String {
-    format!("{CTL}.{}", ident(&format!("state_{job}")))
-}
+pub use duckwake_circuit::sql::state_table;
 
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_json::Value) -> Result<SourceDef> {
     crate::lake::check_name("source", name)?;
@@ -120,7 +118,7 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         plan,
     };
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
-    crate::circuit::Circuit::compile(&def.plan, &def)?;
+    crate::circuit::Circuit::compile(&def.view())?;
     let sink = quote_table(&def.sink)?;
     let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
 
