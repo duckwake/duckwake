@@ -1,0 +1,62 @@
+# Local stack for the DuckWake POC: DuckLake catalog on PostgreSQL, Kafka API on Redpanda.
+# Lake data files live on the host under ./.lake/data (see README).
+services:
+  postgres:
+    image: mirror.gcr.io/library/postgres:16
+    environment:
+      POSTGRES_USER: lake
+      POSTGRES_PASSWORD: lake
+      POSTGRES_DB: lake
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lake"]
+      interval: 2s
+      retries: 30
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      # internal: rpk inside the container; external: the worker and tools on the host.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://localhost:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 2s
+      retries: 30
+
+  # The server (duckwaked) with its own catalog database and data volume: `docker compose --profile server up -d`.
+  # It uses the host network, so it reaches Kafka and PostgreSQL at the same addresses the sources and the CLI use
+  # (localhost:19092, localhost:55432). Quack on :9494 (token below), metrics on :9464.
+  lake-server-db:
+    profiles: ["server"]
+    image: mirror.gcr.io/library/postgres:16
+    network_mode: host
+    depends_on: { postgres: { condition: service_healthy } }
+    environment: { PGPASSWORD: lake }
+    entrypoint:
+      - sh
+      - -c
+      - psql -h localhost -p 55432 -U lake -d lake -tAc "SELECT 1 FROM pg_database WHERE datname = 'lake_server'" | grep -q 1
+        || psql -h localhost -p 55432 -U lake -d lake -c "CREATE DATABASE lake_server"
+
+  duckwaked:
+    profiles: ["server"]
+    build: .
+    image: duckwake:dev
+    network_mode: host
+    depends_on:
+      lake-server-db: { condition: service_completed_successfully }
+      redpanda: { condition: service_healthy }
+    environment:
+      DUCKWAKE_CATALOG: "postgres:dbname=lake_server host=localhost port=55432 user=lake password=lake"
+      DUCKWAKE_QUACK_TOKEN: ${DUCKWAKE_QUACK_TOKEN:-duckwake-dev-token}
+    volumes: ["server-data:/data"]
+
+volumes:
+  server-data:

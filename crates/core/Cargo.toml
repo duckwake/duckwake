@@ -1,0 +1,24 @@
+[package]
+name = "duckwake_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duckdb = { workspace = true, features = ["appender-arrow"] }
+arrow-json = "60"
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rskafka.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+rand.workspace = true
+
+[features]
+default = ["bundled"]
+# Compile DuckDB (with json and parquet) into the binary: the CLI and the daemon.
+bundled = ["duckdb/bundled", "duckdb/json", "duckdb/parquet"]
+# Call the DuckDB of the process that loads us: the loadable extension.
+loadable = ["duckdb/loadable-extension"]

@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DuckWake Playground</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --panel-2: #f0f0ed; --line: #e2e2dd; --line-2: #d0d0ca;
+  --text: #1d1d1b; --muted: #6b6b66; --faint: #9a9a94;
+  --accent: #b86e00; --accent-bg: #fdf1dc; --accent-strong: #8a5200;
+  --ok: #1f8a4c; --ok-bg: #e3f4ea; --warn: #a86400; --warn-bg: #fbefd9; --err: #c0392b; --err-bg: #fbe5e2;
+  --idle: #7a7a74; --idle-bg: #ececea; --code-bg: #f3f3f0; --sel: #fff6e3;
+  --bar: #d99a2b; --bar-2: #8bb6a0;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413; --panel: #1c1c1a; --panel-2: #232320; --line: #2e2e2b; --line-2: #3b3b37;
+    --text: #ecebe6; --muted: #a3a29b; --faint: #74736d;
+    --accent: #f2b54a; --accent-bg: #3a2c12; --accent-strong: #ffd38a;
+    --ok: #5fcf8d; --ok-bg: #16301f; --warn: #f2b54a; --warn-bg: #352812; --err: #f0796b; --err-bg: #3a1c19;
+    --idle: #a3a29b; --idle-bg: #2a2a27; --code-bg: #181816; --sel: #2c2516;
+    --bar: #e0a33a; --bar-2: #6fa88a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.35);
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13.5px/1.45 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif; }
+code, pre, textarea.code, .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+button { font: inherit; cursor: pointer; border: 1px solid var(--line-2); background: var(--panel); color: var(--text); border-radius: 7px; padding: 5px 11px; }
+button:hover { border-color: var(--faint); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+@media (prefers-color-scheme: dark) { button.primary { color: #1a1305; } }
+button.primary:hover { filter: brightness(1.06); }
+button.danger { color: var(--err); }
+button.ghost { border-color: transparent; background: transparent; color: var(--muted); padding: 2px 7px; }
+button.ghost:hover { color: var(--text); background: var(--panel-2); }
+button:disabled { opacity: .5; cursor: default; }
+input, select, textarea { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 7px; padding: 6px 9px; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+textarea { resize: vertical; width: 100%; }
+input[type=checkbox], input[type=radio] { padding: 0; width: auto; box-shadow: none; accent-color: var(--accent); }
+label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; font-weight: 500; }
+
+.app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+header { display: flex; align-items: center; gap: 14px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.01em; }
+.brand-mark { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); display: grid; place-items: center; color: var(--panel); font-size: 13px; font-weight: 800; }
+.brand small { color: var(--muted); font-weight: 450; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 550; background: var(--idle-bg); color: var(--idle); white-space: nowrap; }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ok { background: var(--ok-bg); color: var(--ok); } .pill.warn { background: var(--warn-bg); color: var(--warn); } .pill.err { background: var(--err-bg); color: var(--err); }
+.pill.live .dot { animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.hdr-meta { color: var(--muted); font-size: 12px; }
+
+.body { display: grid; grid-template-columns: 268px 1fr; min-height: 0; }
+aside { background: var(--panel); border-right: 1px solid var(--line); overflow: auto; padding: 10px 8px 20px; }
+.sec { margin-top: 10px; }
+.sec-h { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); font-weight: 650; }
+.sec-h button { font-size: 15px; line-height: 1; padding: 0 6px 2px; }
+.item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer; color: var(--text); min-width: 0; }
+.item:hover { background: var(--panel-2); }
+.item.sel { background: var(--sel); box-shadow: inset 2px 0 0 var(--accent); }
+.item .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.item .sub { font-size: 11px; color: var(--faint); white-space: nowrap; }
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
+.sdot.running { background: var(--ok); } .sdot.paused, .sdot.created { background: var(--warn); } .sdot.failed { background: var(--err); } .sdot.stopped { background: var(--idle); }
+.empty-side { padding: 4px 8px; color: var(--faint); font-size: 12px; }
+.ico { width: 14px; text-align: center; color: var(--faint); flex: none; font-size: 12px; }
+
+main { display: grid; grid-template-rows: 1fr auto; min-height: 0; min-width: 0; }
+.detail { overflow: auto; padding: 22px 26px 30px; min-width: 0; }
+.dock { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: 36px 1fr; height: 34vh; min-height: 0; }
+.dock.collapsed { height: 36px; }
+.dock-tabs { display: flex; align-items: center; gap: 2px; padding: 0 10px; border-bottom: 1px solid var(--line); }
+.tab { padding: 6px 11px; border-radius: 7px; cursor: pointer; color: var(--muted); font-weight: 550; font-size: 12.5px; border: 0; background: none; }
+.tab.on { color: var(--text); background: var(--panel-2); }
+.dock-body { min-height: 0; overflow: hidden; }
+.console { display: grid; grid-template-columns: minmax(280px, 40%) 1fr; height: 100%; min-height: 0; }
+.console-ed { display: grid; grid-template-rows: 1fr auto; border-right: 1px solid var(--line); min-height: 0; }
+.console-ed textarea { border: 0; border-radius: 0; resize: none; padding: 12px 14px; background: var(--code-bg); height: 100%; box-shadow: none; }
+.console-bar { display: flex; gap: 6px; align-items: center; padding: 7px 10px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.console-out { overflow: auto; min-height: 0; padding: 0; }
+.out-meta { padding: 7px 12px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+.logs { height: 100%; overflow: auto; padding: 8px 12px; font-size: 12px; }
+.logline { white-space: pre-wrap; word-break: break-all; padding: 1px 0; color: var(--muted); }
+.logline.epoch { color: var(--text); } .logline.WARN { color: var(--warn); } .logline.ERROR { color: var(--err); }
+.log-tools { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.log-tools input[type=text], .log-tools input:not([type]) { padding: 3px 8px; font-size: 12px; width: 200px; }
+
+h1 { font-size: 20px; margin: 0; letter-spacing: -.015em; font-weight: 650; }
+h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+.title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.subtitle { color: var(--muted); margin-bottom: 18px; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 16px; margin-bottom: 16px; }
+.card.flush { padding: 0; overflow: hidden; }
+.card.flush > h2 { padding: 14px 16px 0; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.kpi .k { font-size: 11.5px; color: var(--muted); }
+.kpi .v { font-size: 18px; font-weight: 650; letter-spacing: -.01em; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.kpi .v.small { font-size: 13px; padding-top: 5px; }
+.subtabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 10px; }
+.subtabs .tab { border-radius: 0; padding: 10px 10px; border-bottom: 2px solid transparent; }
+.subtabs .tab.on { background: none; border-bottom-color: var(--accent); }
+.tbl-wrap { overflow: auto; max-height: 420px; }
+table.grid { border-collapse: collapse; width: 100%; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+table.grid th { position: sticky; top: 0; background: var(--panel-2); text-align: left; font-weight: 600; color: var(--muted); padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.grid td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+table.grid td.num { text-align: right; } table.grid th.num { text-align: right; }
+table.grid td.null { color: var(--faint); font-style: italic; }
+table.grid tr:hover td { background: var(--panel-2); }
+.none { padding: 18px 16px; color: var(--faint); }
+pre.code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow: auto; margin: 0; white-space: pre-wrap; }
+.row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.row > div { min-width: 0; }
+.field { margin-bottom: 12px; }
+.hint { font-size: 12px; color: var(--faint); margin-top: 4px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); }
+.chip b { color: var(--text); font-weight: 600; }
+.chip.accent { background: var(--accent-bg); border-color: transparent; color: var(--accent-strong); }
+.chart { width: 100%; height: 110px; display: block; }
+.chart-legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+.chart-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.verify { border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; font-size: 13px; }
+.verify.ok { background: var(--ok-bg); color: var(--ok); } .verify.bad { background: var(--err-bg); color: var(--err); }
+.verify .vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 2px 14px; margin-top: 8px; color: var(--text); font-size: 12px; }
+.err-box { background: var(--err-bg); color: var(--err); border-radius: 8px; padding: 9px 12px; white-space: pre-wrap; font-size: 12.5px; margin-top: 10px; }
+.hero { max-width: 860px; margin: 8px auto 26px; }
+.hero h1 { font-size: 26px; margin-bottom: 6px; }
+.hero p { color: var(--muted); font-size: 14.5px; margin: 0 0 18px; }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 22px 0; }
+.step { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 14px; }
+.step .n { width: 22px; height: 22px; border-radius: 50%; background: var(--accent-bg); color: var(--accent-strong); display: grid; place-items: center; font-weight: 700; font-size: 12px; margin-bottom: 8px; }
+.step b { display: block; margin-bottom: 3px; }
+.step span { color: var(--muted); font-size: 12.5px; }
+.vcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.vcard { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 14px; cursor: pointer; }
+.vcard:hover { border-color: var(--line-2); box-shadow: var(--shadow); }
+.vcard .top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 600; }
+.vcard .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; font-size: 11.5px; color: var(--muted); }
+.vcard .stats b { display: block; color: var(--text); font-size: 14px; font-variant-numeric: tabular-nums; }
+
+.modal-bg { position: fixed; inset: 0; background: rgba(15,15,12,.45); display: grid; place-items: center; z-index: 50; padding: 16px; }
+.modal { background: var(--panel); border-radius: 14px; box-shadow: var(--shadow); width: min(720px, 100%); max-height: calc(100vh - 32px); display: grid; grid-template-rows: auto 1fr auto; border: 1px solid var(--line); }
+.modal-h { padding: 16px 20px 6px; } .modal-h h1 { font-size: 17px; } .modal-h p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
+.modal-b { padding: 12px 20px; overflow: auto; }
+.modal-f { padding: 12px 20px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+.colrow { display: grid; grid-template-columns: 1fr 160px 90px 28px; gap: 6px; margin-bottom: 6px; align-items: center; }
+.colrow .et { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
+.toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 60; }
+.toast { background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: 9px; box-shadow: var(--shadow); font-size: 13px; max-width: 420px; }
+.toast.err { background: var(--err); color: #fff; }
+@media (max-width: 860px) {
+  .body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  aside { max-height: 34vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  .console { grid-template-columns: 1fr; grid-template-rows: 45% 1fr; }
+  .console-ed { border-right: 0; border-bottom: 1px solid var(--line); }
+  .detail { padding: 16px; }
+  .hdr-meta { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand"><div class="brand-mark">≋</div>DuckWake <small>playground</small></div>
+    <span id="worker-pill" class="pill"><span class="dot"></span>worker</span>
+    <span class="hdr-meta" id="hdr-meta"></span>
+    <div class="spacer"></div>
+    <button id="demo-btn">Load demo</button>
+  </header>
+  <div class="body">
+    <aside id="side"></aside>
+    <main>
+      <div class="detail" id="detail"></div>
+      <div class="dock" id="dock">
+        <div class="dock-tabs">
+          <button class="tab on" data-dock="sql">SQL console</button>
+          <button class="tab" data-dock="log">Activity</button>
+          <div class="log-tools" id="log-tools" style="display:none">
+            <input id="log-filter" placeholder="Filter log…">
+            <label style="margin:0;display:flex;gap:5px;align-items:center;white-space:nowrap"><input type="checkbox" id="log-epochs"> epochs only</label>
+          </div>
+          <button class="ghost" id="dock-toggle" style="margin-left:auto" title="Collapse">▾</button>
+        </div>
+        <div class="dock-body">
+          <div class="console" id="pane-sql">
+            <div class="console-ed">
+              <textarea id="sql" class="code" spellcheck="false"></textarea>
+              <div class="console-bar">
+                <button class="primary" id="run">Run</button>
+                <span class="hint" style="margin:0">⌘/Ctrl + Enter</span>
+                <span class="spacer"></span>
+                <select id="snippets" style="max-width:210px"><option value="">Snippets…</option></select>
+              </div>
+            </div>
+            <div class="console-out" id="sql-out"><div class="none">Results show here. Lake tables are addressed as <code>schema.table</code>; a source name reads the newest events of its topic.</div></div>
+          </div>
+          <div class="logs" id="pane-log" style="display:none"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => (v === null || v === undefined || v === "") ? "–" : Number(v).toLocaleString();
+const S = { state: null, sel: { kind: "home" }, viewTab: "output", viewDetail: null, sourceDetail: null, tableDetail: null, verify: {}, logNext: 0, logs: [] };
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: opts.body ? { "content-type": "application/json" } : {}, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || res.statusText);
+  return data;
+}
+function toast(msg, err = false) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : "");
+  t.textContent = msg;
+  $("#toasts").appendChild(t);
+  setTimeout(() => t.remove(), err ? 7000 : 3000);
+}
+
+// ---------- results grid ----------
+const isNumType = (t) => /Int|Float|Decimal|UInt/.test(t || "");
+function gridHTML(res, opts = {}) {
+  if (!res || !res.columns) return `<div class="none">No data.</div>`;
+  if (!res.rows.length) return `<div class="none">${opts.empty || "No rows."}</div>`;
+  const cols = res.columns.map((c, i) => ({ c, n: isNumType(res.types?.[i]) })).filter((x) => !opts.hide || !opts.hide.includes(x.c));
+  const idx = cols.map((x) => res.columns.indexOf(x.c));
+  let h = `<div class="tbl-wrap" style="${opts.maxh ? `max-height:${opts.maxh}` : ""}"><table class="grid"><thead><tr>`;
+  h += cols.map((x) => `<th class="${x.n ? "num" : ""}">${esc(x.c)}</th>`).join("") + `</tr></thead><tbody>`;
+  for (const r of res.rows) {
+    h += "<tr>" + idx.map((i, k) => r[i] === null ? `<td class="null">null</td>` : `<td class="${cols[k].n ? "num" : ""}" title="${esc(r[i])}">${esc(r[i])}</td>`).join("") + "</tr>";
+  }
+  return h + "</tbody></table></div>";
+}
+const rowsAsObjects = (res) => (res?.rows || []).map((r) => Object.fromEntries(res.columns.map((c, i) => [c, r[i]])));
+
+// ---------- sidebar ----------
+function renderSide() {
+  const st = S.state; if (!st) return;
+  const sel = S.sel;
+  const isSel = (k, n) => sel.kind === k && sel.name === n ? " sel" : "";
+  let h = `<div class="item${sel.kind === "home" ? " sel" : ""}" data-go="home"><span class="ico">⌂</span><span class="nm">Overview</span></div>`;
+  h += `<div class="sec"><div class="sec-h">Sources<button class="ghost" data-new="source" title="New source">+</button></div>`;
+  h += st.sources.length ? st.sources.sort((a, b) => a.name.localeCompare(b.name)).map((s) =>
+    `<div class="item${isSel("source", s.name)}" data-go="source" data-name="${esc(s.name)}"><span class="ico">⇢</span><span class="nm">${esc(s.name)}</span>${s.generator ? `<span class="pill ok live" style="padding:1px 7px;font-size:11px"><span class="dot"></span>${s.generator.rate}/s</span>` : ""}</div>`).join("")
+    : `<div class="empty-side">No sources yet</div>`;
+  h += `</div><div class="sec"><div class="sec-h">Views<button class="ghost" data-new="view" title="New continuous view">+</button></div>`;
+  h += st.views.length ? st.views.map((v) =>
+    `<div class="item${isSel("view", v.job_id)}" data-go="view" data-name="${esc(v.job_id)}"><span class="sdot ${esc(v.status)}"></span><span class="nm">${esc(v.job_id)}</span><span class="sub">${v.epoch ? "e" + v.epoch : esc(v.status)}</span></div>`).join("")
+    : `<div class="empty-side">No views yet</div>`;
+  h += `</div><div class="sec"><div class="sec-h">Lake tables<button class="ghost" data-new="table" title="New table">+</button></div>`;
+  h += st.tables.length ? st.tables.map(([sch, t, cols]) => {
+    const n = `${sch}.${t}`;
+    return `<div class="item${isSel("table", n)}" data-go="table" data-name="${esc(n)}"><span class="ico">▦</span><span class="nm">${esc(n)}</span></div>`;
+  }).join("") : `<div class="empty-side">No tables yet</div>`;
+  h += `</div>`;
+  $("#side").innerHTML = h;
+}
+$("#side").addEventListener("click", (e) => {
+  const nb = e.target.closest("[data-new]");
+  if (nb) { openModal(nb.dataset.new); return; }
+  const it = e.target.closest("[data-go]");
+  if (it) select(it.dataset.go, it.dataset.name);
+});
+function select(kind, name) {
+  S.sel = { kind, name }; S.viewDetail = null; S.sourceDetail = null; S.tableDetail = null; S.viewTab = "output";
+  history.replaceState(null, "", kind === "home" ? location.pathname : `#${kind}/${name}`);
+  renderSide(); renderDetail(); refreshDetail();
+}
+
+// ---------- header ----------
+function renderHeader() {
+  const w = S.state?.worker; if (!w) return;
+  const p = $("#worker-pill");
+  if (w.running && !w.last_error) { p.className = "pill ok live"; p.innerHTML = `<span class="dot"></span>worker ${esc(w.id)} running`; p.title = ""; }
+  else if (w.running) { p.className = "pill warn live"; p.innerHTML = `<span class="dot"></span>worker ${esc(w.id)} · ${w.restarts} restart${w.restarts === 1 ? "" : "s"}`; p.title = "Last error: " + w.last_error; }
+  else { p.className = "pill err"; p.innerHTML = `<span class="dot"></span>worker restarting`; p.title = w.last_error || ""; }
+  $("#hdr-meta").textContent = `Kafka ${S.state.brokers} · DuckLake attached as lake`;
+}
+
+// ---------- detail ----------
+function renderDetail() {
+  const d = $("#detail"), st = S.state;
+  if (!st) { d.innerHTML = `<div class="none">Connecting…</div>`; return; }
+  const k = S.sel.kind;
+  if (k === "home") d.innerHTML = homeHTML();
+  else if (k === "source") d.innerHTML = sourceHTML();
+  else if (k === "view") d.innerHTML = viewHTML();
+  else if (k === "table") d.innerHTML = tableHTML();
+}
+
+function homeHTML() {
+  const st = S.state;
+  let h = `<div class="hero"><h1>Continuous SQL into DuckLake</h1>
+    <p>Stream events from Kafka through SQL views. Every epoch writes view output, window state and source offsets in one DuckLake transaction, so results are exactly-once and you can query or time-travel them like any lake table.</p>`;
+  if (!st.sources.length && !st.views.length) h += `<button class="primary" data-act="demo">Load the demo</button> <span class="hint" style="display:inline">a clicks stream, a games table and three views</span>`;
+  h += `<div class="steps">
+    <div class="step"><div class="n">1</div><b>Create a source</b><span>A Kafka topic plus its JSON columns and event-time column. Start the generator or send your own events.</span></div>
+    <div class="step"><div class="n">2</div><b>Add lake tables</b><span>Dimension tables for lookup joins, e.g. <code>dim.games</code>. Any SQL works in the console.</span></div>
+    <div class="step"><div class="n">3</div><b>Create a view</b><span>Filters, lookup joins, and <code>TUMBLE</code> / <code>HOP</code> window aggregates. Unsupported SQL is rejected up front.</span></div>
+    <div class="step"><div class="n">4</div><b>Watch and verify</b><span>Follow epochs, watermarks and late rows. Verify recomputes the view as batch SQL and compares.</span></div>
+  </div></div>`;
+  if (st.views.length) {
+    h += `<h2>Views</h2><div class="vcards">` + st.views.map((v) => `
+      <div class="vcard" data-go="view" data-name="${esc(v.job_id)}">
+        <div class="top"><span class="sdot ${esc(v.status)}"></span>${esc(v.job_id)}<span class="chip" style="margin-left:auto">${esc(v.kind)}</span></div>
+        <div class="stats"><div>epoch<b>${num(v.epoch)}</b></div><div>rows in<b>${num(v.rows_in)}</b></div><div>rows out<b>${num(v.rows_out)}</b></div></div>
+      </div>`).join("") + `</div>`;
+  }
+  return h;
+}
+
+function sourceHTML() {
+  const s = S.state.sources.find((x) => x.name === S.sel.name);
+  if (!s) return `<div class="none">Source not found.</div>`;
+  const g = s.generator;
+  const users = S.state.views.filter((v) => v.source === s.name);
+  const parts = S.sourceDetail?.partitions;
+  const sample = JSON.stringify(sampleEvent(s), null, 0);
+  return `
+  <div class="title-row"><h1>${esc(s.name)}</h1><span class="chip">kafka</span>${g ? `<span class="pill ok live"><span class="dot"></span>generating ${g.rate}/s</span>` : ""}
+    <div class="actions"><button data-act="source-query">Query events</button><button class="danger" data-act="drop-source">Delete source</button></div></div>
+  <div class="subtitle">Topic <code>${esc(s.topic)}</code> · event time <code>${esc(s.event_time)}</code> · watermark delay ${esc(s.watermark_delay)} · idle timeout ${esc(s.idle_timeout)} · ${decodeLabel(s)}</div>
+  <div class="grid2">
+    <div class="card"><h2>Generator</h2>
+      <div class="row">
+        <div><label>Events / second</label><input id="g-rate" type="number" min="1" max="20000" value="${g ? g.rate : 100}" style="width:110px"></div>
+        <div><label>Late %</label><input id="g-late" type="number" min="0" max="100" step="0.5" value="${g ? g.late_pct : 1}" style="width:80px"></div>
+        <div><label>Malformed %</label><input id="g-bad" type="number" min="0" max="100" step="0.5" value="${g ? g.bad_pct : 0.5}" style="width:90px"></div>
+        <div style="display:flex;gap:6px">${g ? `<button class="primary" data-act="gen-start">Update</button><button data-act="gen-stop">Stop</button>` : `<button class="primary" data-act="gen-start">Start</button>`}</div>
+      </div>
+      <div class="hint">Random values per column type; late events are 5 minutes old, malformed ones are broken JSON (they go to the dead-letter table).${g ? ` Produced so far: <b>${num(g.produced)}</b>.` : ""}</div>
+    </div>
+    <div class="card"><h2>Send events</h2>
+      <textarea id="ev-text" class="code" rows="4" spellcheck="false">${esc(sample)}</textarea>
+      <div class="row" style="margin-top:8px"><button class="primary" data-act="send-events">Send</button><button data-act="sample-event">New sample</button>
+      <span class="hint" style="margin:0">A JSON array, one object, or one raw payload per line.</span></div>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card flush"><h2>Columns</h2>${gridHTML({ columns: ["column", "type"], types: [], rows: s.columns.map(([c, t]) => [c + (c === s.event_time ? "  ⏱" : ""), t]) })}</div>
+    <div class="card flush"><h2>Partitions</h2>${parts ? gridHTML({ columns: ["partition", "end offset"], types: ["Int32", "Int64"], rows: parts.map((p) => [String(p.partition), String(p.end_offset)]) }) : `<div class="none">Loading…</div>`}</div>
+  </div>
+  <div class="card"><h2>Views reading this source</h2>${users.length ? `<div class="chips">${users.map((v) => `<span class="chip accent" style="cursor:pointer" data-go="view" data-name="${esc(v.job_id)}">${esc(v.job_id)}</span>`).join("")}</div>` : `<span class="hint">None yet. <a href="#" data-new="view">Create a view</a>.</span>`}</div>`;
+}
+
+function sampleEvent(s) {
+  const o = {};
+  const now = new Date();
+  for (const [c, t] of s.columns) {
+    const T = t.toUpperCase();
+    if (c === s.event_time || T.startsWith("TIMESTAMP")) o[c] = now.toISOString().replace("T", " ").replace("Z", "");
+    else if (T.startsWith("DECIMAL") || T === "DOUBLE" || T === "FLOAT") o[c] = Math.round(Math.random() * 10000) / 100;
+    else if (T.includes("INT")) o[c] = Math.floor(Math.random() * 1000);
+    else if (T === "BOOLEAN") o[c] = Math.random() < 0.5;
+    else o[c] = (c.replace(/_id$/, "")[0] || "v") + Math.floor(Math.random() * 10);
+  }
+  return o;
+}
+
+function viewHTML() {
+  const v = S.state.views.find((x) => x.job_id === S.sel.name);
+  if (!v) return `<div class="none">View not found.</div>`;
+  const d = S.viewDetail;
+  const statusCls = { running: "ok", paused: "warn", created: "warn", failed: "err" }[v.status] || "";
+  const btn = (act, label, show = true, cls = "") => show ? `<button class="${cls}" data-act="${act}">${label}</button>` : "";
+  const fresh = v.freshness_s === null ? "–" : (Number(v.freshness_s) < 0 ? "ahead" : Number(v.freshness_s).toFixed(1) + " s");
+  const vr = S.verify[v.job_id];
+  let h = `
+  <div class="title-row"><h1>${esc(v.job_id)}</h1>
+    <span class="pill ${statusCls} ${v.status === "running" ? "live" : ""}"><span class="dot"></span>${esc(v.status)}</span>
+    <span class="chip">${esc(v.kind)}</span><span class="chip">epoch every ${esc(v.epoch_interval)}</span>
+    <div class="actions">
+      ${btn("view-start", "Start", v.status !== "running", "primary")}${btn("view-pause", "Pause", v.status === "running")}${btn("view-stop", "Stop", v.status === "running" || v.status === "paused")}
+      ${btn("view-reset", "Reset…", v.status !== "running")}<button data-act="view-verify">Verify</button>
+      <button data-act="view-query">Query table</button>${btn("view-drop", "Drop", v.status !== "running", "danger")}
+    </div></div>
+  <div class="subtitle">From <a href="#" data-go="source" data-name="${esc(v.source)}">${esc(v.source)}</a> into <code>${esc(v.sink)}</code>${v.late_data ? ` · late rows to <code>${esc(v.late_data)}</code>` : ""} · worker ${esc(v.worker || "–")} (lease ${esc(v.lease ?? "–")})</div>`;
+  if (vr) h += verifyHTML(vr);
+  h += `<div class="kpis">
+    <div class="kpi"><div class="k">Epoch</div><div class="v">${num(v.epoch)}</div></div>
+    <div class="kpi" title="${esc(v.watermark || "")}"><div class="k">Watermark</div><div class="v">${esc(v.watermark ? v.watermark.replace("T", " ").slice(11, 19) : "–")}</div></div>
+    <div class="kpi"><div class="k">Freshness</div><div class="v">${fresh}</div></div>
+    <div class="kpi"><div class="k">Lag (events)</div><div class="v">${num(v.lag)}</div></div>
+    <div class="kpi"><div class="k">Rows in</div><div class="v">${num(v.rows_in)}</div></div>
+    <div class="kpi"><div class="k">Rows out</div><div class="v">${num(v.rows_out)}</div></div>
+    <div class="kpi"><div class="k">Late</div><div class="v">${num(v.late)}</div></div>
+    <div class="kpi"><div class="k">Dead letters</div><div class="v">${num(v.dead)}</div></div>
+  </div>`;
+  const ck = d ? rowsAsObjects(d.checkpoints).reverse() : null;
+  h += `<div class="grid2">
+    <div class="card"><h2>Rows in per epoch${ck ? arrowShare(ck) : ""}</h2>${ck ? chartHTML(ck, "rows_in", "var(--bar)") : `<div class="none">Loading…</div>`}</div>
+    <div class="card"><h2>Rows out per epoch</h2>${ck ? chartHTML(ck, "rows_out", "var(--bar-2)") : `<div class="none">Loading…</div>`}</div></div>`;
+  const tabs = [["output", `Output${d ? ` (${num(d.sink_rows)})` : ""}`], ...(v.kind === "windowed" ? [["windows", "Open windows"]] : []), ["checkpoints", "Checkpoints"], ...(v.late_data ? [["late", "Late rows"]] : []), ["dead", "Dead letters"], ["sql", "SQL"]];
+  h += `<div class="card flush"><div class="subtabs">${tabs.map(([k, l]) => `<button class="tab ${S.viewTab === k ? "on" : ""}" data-vtab="${k}">${l}</button>`).join("")}</div>`;
+  if (!d) h += `<div class="none">Loading…</div>`;
+  else if (S.viewTab === "output") h += (v.kind === "aggregate" ? `<div class="hint" style="padding:10px 16px 0">One row per group, replaced whenever the group's result changes; <code>_duckwake_epoch</code> is the epoch that last wrote it.</div>` : "") + gridHTML(d.preview, { empty: "No output yet. Windowed views emit a window once the watermark passes its end." });
+  else if (S.viewTab === "windows") h += gridHTML(d.open_windows, { empty: "No open windows in state." }) + `<div class="hint" style="padding:0 16px 12px">Partial aggregates held in <code>__duckwake.state_${esc(v.job_id)}</code>, merged every epoch and emitted when the watermark passes <code>window_end</code>.</div>`;
+  else if (S.viewTab === "checkpoints") h += gridHTML(d.checkpoints);
+  else if (S.viewTab === "late") h += gridHTML(d.late, { empty: "No late rows." });
+  else if (S.viewTab === "dead") h += gridHTML(d.dead, { empty: "No dead letters." });
+  else if (S.viewTab === "sql") h += `<div style="padding:14px 16px"><label>View SQL</label><pre class="code">${esc(v.sql)}</pre>
+      <label style="margin-top:12px">Per-epoch SQL (compiled)</label><pre class="code">${esc(v.delta_sql)}</pre>
+      <label style="margin-top:12px">Table columns</label><div class="chips">${(v.sink_columns || []).map(([c, t]) => `<span class="chip"><b>${esc(c)}</b> ${esc(t)}</span>`).join("")}<span class="chip"><b>_duckwake_epoch</b> BIGINT</span></div></div>`;
+  h += `</div>`;
+  return h;
+}
+
+// Share of the shown epochs' events that skipped the SQL decode (epochs from before rows_sql existed are left out).
+function arrowShare(ck) {
+  const known = ck.filter((r) => r.decoded_in_sql !== null && r.decoded_in_sql !== undefined);
+  const n = known.reduce((a, r) => a + Number(r.rows_in), 0);
+  if (!n) return "";
+  const sql = known.reduce((a, r) => a + Number(r.decoded_in_sql), 0);
+  return ` <span class="hint" style="display:inline" title="${num(sql)} of ${num(n)} events in these epochs went through the SQL decode">· ${((n - sql) / n * 100).toFixed(1)}% decoded with Arrow</span>`;
+}
+
+function verifyHTML(r) {
+  if (r.pending) return `<div class="verify ok" style="background:var(--panel-2);color:var(--muted)">Verifying: re-reading the topic and recomputing the view as one batch query…</div>`;
+  if (r.error) return `<div class="verify bad">Verify failed to run: ${esc(r.error)}</div>`;
+  const items = [["events read", r.kafka_rows], ["expected rows", r.expected_rows], ["sink rows", r.sink_rows], ["missing from sink", r.missing_from_sink], ["unexpected in sink", r.unexpected_in_sink], ["dead letters expected", r.dead_expected], ["dead-letter mismatches", r.dead_mismatch], ["late rows", r.late_rows], ["late duplicates", r.late_duplicates], ["closed windows left in state", r.closed_windows_left_in_state]];
+  return `<div class="verify ${r.ok ? "ok" : "bad"}"><b>${r.ok ? "✓ Exactly-once check passed" : "✗ Verify found differences"}</b> at epoch ${r.epoch}, watermark ${esc(r.watermark)}: the sink ${r.ok ? "equals" : "differs from"} the view recomputed as batch SQL over ${r.from_epoch == null ? "everything committed" : `the events Kafka still retains (output after epoch ${r.from_epoch})`}.
+    <div class="vgrid">${items.map(([k, v]) => `<div>${k}: <b>${num(v)}</b></div>`).join("")}</div></div>`;
+}
+
+function chartHTML(rows, key, color) {
+  if (!rows.length) return `<div class="none">No epochs committed yet.</div>`;
+  const W = 600, H = 100;
+  const vals = rows.map((r) => Number(r[key]) || 0);
+  const max = Math.max(1, ...vals);
+  const bw = W / Math.max(rows.length, 20);
+  const bars = rows.map((r, i) => {
+    const h = vals[i] / max * (H - 6);
+    return `<g><title>epoch ${r.epoch} · in ${r.rows_in}${r.decoded_in_sql == null ? "" : ` (${r.decoded_in_sql} decoded in SQL)`} · out ${r.rows_out} · late ${r.rows_late} · dead ${r.rows_dead} · ${r.committed}</title>
+      <rect x="${i * bw}" y="0" width="${bw}" height="${H}" fill="transparent"/>
+      <rect x="${i * bw + 1}" y="${H - h}" width="${Math.max(bw - 2, 1)}" height="${h}" rx="2" fill="${color}"/></g>`;
+  }).join("");
+  const total = vals.reduce((a, b) => a + b, 0);
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>
+    <div class="chart-legend"><span>last ${rows.length} epochs</span><span>max ${num(max)}</span><span>total ${num(total)}</span></div>`;
+}
+
+function tableHTML() {
+  const [sch, t] = S.sel.name.split(".");
+  const meta = S.state.tables.find(([a, b]) => a === sch && b === t);
+  const d = S.tableDetail;
+  const owner = S.state.views.find((v) => v.sink.endsWith("." + S.sel.name) || v.sink === S.sel.name || (v.late_data || "").endsWith(S.sel.name));
+  let h = `<div class="title-row"><h1>${esc(S.sel.name)}</h1><span class="chip">DuckLake table</span>
+    <div class="actions"><button data-act="table-query">Query in console</button><button class="danger" data-act="table-drop">Drop</button></div></div>
+    <div class="subtitle">${owner ? `Written by view <a href="#" data-go="view" data-name="${esc(owner.job_id)}">${esc(owner.job_id)}</a> · ` : ""}${d ? `${num(d.rows)} rows · ${num(d.files?.[0])} data file${d.files?.[0] === "1" ? "" : "s"} (${fmtBytes(d.files?.[1])}) · small writes stay inlined in the catalog until flushed` : "…"}</div>`;
+  if (meta) h += `<div class="card"><h2>Columns</h2><div class="chips">${meta[2].replace(/^\[|\]$/g, "").split(", ").map((c) => { const i = c.indexOf(" "); return `<span class="chip"><b>${esc(c.slice(0, i))}</b> ${esc(c.slice(i + 1))}</span>`; }).join("")}</div></div>`;
+  h += `<div class="card flush"><h2>First 100 rows</h2>${d ? gridHTML(d.preview) : `<div class="none">Loading…</div>`}</div>`;
+  return h;
+}
+const fmtBytes = (b) => { b = Number(b) || 0; return b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(1) + " KB" : (b / 1048576).toFixed(1) + " MB"; };
+
+// ---------- detail actions ----------
+$("#detail").addEventListener("click", async (e) => {
+  const go = e.target.closest("[data-go]");
+  if (go) { e.preventDefault(); select(go.dataset.go, go.dataset.name); return; }
+  const nb = e.target.closest("[data-new]");
+  if (nb) { e.preventDefault(); openModal(nb.dataset.new); return; }
+  const vt = e.target.closest("[data-vtab]");
+  if (vt) { S.viewTab = vt.dataset.vtab; renderDetail(); return; }
+  const a = e.target.closest("[data-act]"); if (!a) return;
+  const act = a.dataset.act, name = S.sel.name;
+  try {
+    if (act === "demo") await loadDemo();
+    else if (act === "gen-start") {
+      await api(`/api/sources/${name}/generator`, { method: "POST", body: { running: true, rate: +$("#g-rate").value, late_pct: +$("#g-late").value, bad_pct: +$("#g-bad").value } });
+      toast("Generator running"); await refreshState();
+    } else if (act === "gen-stop") { await api(`/api/sources/${name}/generator`, { method: "POST", body: { running: false } }); toast("Generator stopped"); await refreshState(); }
+    else if (act === "send-events") { const r = await api(`/api/sources/${name}/events`, { method: "POST", body: { events: $("#ev-text").value } }); toast(`Sent ${r.sent} event${r.sent === 1 ? "" : "s"}`); refreshDetail(); }
+    else if (act === "source-query") { const s = S.state.sources.find((x) => x.name === name); setSQL(`-- A source query reads the newest 100,000 events of the topic (a snapshot, not a stream).\nSELECT *\nFROM ${name}\nORDER BY ${s.event_time} DESC\nLIMIT 100;`, true); }
+    else if (act === "sample-event") { const s = S.state.sources.find((x) => x.name === name); $("#ev-text").value = JSON.stringify(sampleEvent(s)); }
+    else if (act === "drop-source") { if (confirm(`Delete source ${name}? The Kafka topic is kept.`)) { await api(`/api/sources/${name}`, { method: "DELETE" }); toast("Source deleted"); S.sel = { kind: "home" }; await refreshState(); } }
+    else if (act.startsWith("view-")) {
+      const op = act.slice(5);
+      if (op === "query") { setSQL(`SELECT * FROM ${S.state.views.find((v) => v.job_id === name).sink}\nORDER BY _duckwake_epoch DESC\nLIMIT 100;`, true); return; }
+      if (op === "drop" && !confirm(`Drop view ${name}? Its table, state, lease and checkpoints are removed; a late-data table is kept.`)) return;
+      let body;
+      if (op === "reset") {
+        const ep = prompt(`Rewind ${name} to which epoch? Sink rows written after it are deleted, window state is restored from that epoch's snapshot, and the next start replays from its offsets.`, Math.max(0, (S.state.views.find((v) => v.job_id === name).epoch || 0) - 5));
+        if (ep === null) return; body = { to_epoch: +ep };
+      }
+      if (op === "verify") { S.verify[name] = { pending: true }; renderDetail(); }
+      const r = await api(`/api/views/${name}/${op}`, { method: "POST", body });
+      if (op === "verify") S.verify[name] = r;
+      else toast({ start: "Started", pause: "Paused", stop: "Stopped", reset: `Reset to epoch ${body?.to_epoch}. Start it to replay.`, drop: "View dropped" }[op]);
+      if (op === "drop") S.sel = { kind: "home" };
+      await refreshState(); refreshDetail();
+    } else if (act === "table-query") setSQL(`SELECT * FROM ${name} LIMIT 100;`, true);
+    else if (act === "table-drop") { if (confirm(`DROP TABLE ${name}?`)) { await api("/api/sql", { method: "POST", body: { sql: `DROP TABLE ${name}` } }); toast("Table dropped"); S.sel = { kind: "home" }; await refreshState(); } }
+  } catch (err) {
+    if (act === "view-verify") { S.verify[name] = { error: err.message }; renderDetail(); }
+    else toast(err.message, true);
+  }
+});
+
+// ---------- modals ----------
+const TYPES = ["TIMESTAMP", "VARCHAR", "BIGINT", "INTEGER", "DOUBLE", "DECIMAL(18,2)", "BOOLEAN", "DATE"];
+function openModal(kind) {
+  const bg = document.createElement("div");
+  bg.className = "modal-bg";
+  bg.innerHTML = `<div class="modal">${kind === "source" ? sourceForm() : kind === "view" ? viewForm() : tableForm()}</div>`;
+  document.body.appendChild(bg);
+  const close = () => bg.remove();
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+  bg.querySelector("[data-close]").onclick = close;
+  document.addEventListener("keydown", function k(e) { if (e.key === "Escape") { close(); document.removeEventListener("keydown", k); } });
+  if (kind === "source") wireSourceForm(bg, close);
+  else if (kind === "view") wireViewForm(bg, close);
+  else wireTableForm(bg, close);
+  bg.querySelector("input, textarea")?.focus();
+}
+const footer = (label) => `<div class="modal-f"><div class="err-box" id="m-err" style="display:none;margin:0 auto 0 0;flex:1"></div><button data-close>Cancel</button><button class="primary" id="m-ok">${label}</button></div>`;
+function showErr(bg, msg) { const e = bg.querySelector("#m-err"); e.textContent = msg; e.style.display = msg ? "block" : "none"; }
+
+function decodeLabel(s) {
+  const how = s.decodes_in === "arrow" ? "JSON decoded with Arrow" : "JSON decoded in SQL";
+  if (s.decode !== "auto") return how;
+  return `${how} (auto${s.decodes_in === "sql" ? ": a column type has no Arrow decoder" : ""})`;
+}
+function sourceForm() {
+  return `<div class="modal-h"><h1>New source</h1><p>A Kafka topic of JSON events. The topic is created if it doesn't exist.</p></div>
+  <div class="modal-b">
+    <div class="row"><div class="field" style="flex:1"><label>Name</label><input id="s-name" placeholder="clicks" style="width:100%"></div>
+      <div class="field" style="flex:1"><label>Topic</label><input id="s-topic" placeholder="same as name" style="width:100%"></div>
+      <div class="field"><label>Partitions</label><input id="s-parts" type="number" value="3" min="1" max="32" style="width:80px"></div></div>
+    <label>Columns <span class="hint" style="display:inline">— pick the event-time column (TIMESTAMP)</span></label>
+    <div id="s-cols"></div><button class="ghost" id="s-add">+ Add column</button>
+    <div class="row" style="margin-top:14px">
+      <div class="field"><label>Watermark delay</label><input id="s-delay" value="5 seconds" style="width:130px"></div>
+      <div class="field"><label>Idle timeout</label><input id="s-idle" value="30 seconds" style="width:130px"></div>
+      <div class="field"><label>Start from</label><select id="s-start"><option>earliest</option><option>latest</option></select></div>
+      <div class="field"><label>Decode</label><select id="s-decode"><option>auto</option><option>arrow</option><option>sql</option></select></div>
+    </div>
+    <div class="hint">Windows close when the watermark (max event time minus the delay, over active partitions) passes their end. Events for already-closed windows are late.</div>
+    <div class="hint">Decode: <b>arrow</b> parses JSON in the readers with Arrow; any message it can't read exactly as DuckDB would goes to the SQL decode, so rows and dead letters are the same as <b>sql</b>. <b>auto</b> uses Arrow when every column type allows it (not DATE or FLOAT).</div>
+  </div>${footer("Create source")}`;
+}
+function wireSourceForm(bg, close) {
+  const cols = bg.querySelector("#s-cols");
+  const add = (n = "", t = "VARCHAR", et = false) => {
+    const r = document.createElement("div"); r.className = "colrow";
+    r.innerHTML = `<input class="c-n" value="${esc(n)}" placeholder="column"><select class="c-t">${TYPES.map((x) => `<option ${x === t ? "selected" : ""}>${x}</option>`).join("")}</select>
+      <label class="et"><input type="radio" name="et" ${et ? "checked" : ""}> event time</label><button class="ghost" title="Remove">×</button>`;
+    r.querySelector("button").onclick = () => r.remove();
+    cols.appendChild(r);
+  };
+  add("ts", "TIMESTAMP", true); add("user_id", "VARCHAR"); add("country", "VARCHAR"); add("value", "DOUBLE");
+  bg.querySelector("#s-add").onclick = () => add();
+  bg.querySelector("#m-ok").onclick = async () => {
+    const rows = [...cols.querySelectorAll(".colrow")];
+    const columns = rows.map((r) => [r.querySelector(".c-n").value.trim(), r.querySelector(".c-t").value]).filter(([n]) => n);
+    const etRow = rows.find((r) => r.querySelector("input[type=radio]").checked);
+    const body = { name: $("#s-name", bg).value.trim(), topic: $("#s-topic", bg).value.trim(), partitions: +$("#s-parts", bg).value, columns,
+      event_time: etRow ? etRow.querySelector(".c-n").value.trim() : "", watermark_delay: $("#s-delay", bg).value, idle_timeout: $("#s-idle", bg).value, start: $("#s-start", bg).value, decode: $("#s-decode", bg).value };
+    try { await api("/api/sources", { method: "POST", body }); close(); toast(`Source ${body.name} created`); await refreshState(); select("source", body.name); }
+    catch (e) { showErr(bg, e.message); }
+  };
+}
+
+function templates() {
+  const s = S.state.sources[0];
+  const src = s?.name || "clicks", et = s?.event_time || "ts";
+  const cols = s?.columns || [["ts", "TIMESTAMP"], ["game_id", "VARCHAR"], ["amount", "DECIMAL(18,2)"]];
+  const key = cols.find(([c, t]) => t === "VARCHAR")?.[0] || "key";
+  const val = cols.find(([c, t]) => /DECIMAL|DOUBLE|INT|FLOAT/.test(t) && c !== et)?.[0] || "value";
+  const dim = S.state.tables.find(([sch]) => sch === "dim");
+  return {
+    tumble: { late: true, sql: `SELECT window_start, ${key}, count(*) AS events, sum(${val}) AS total, max(${val}) AS top\nFROM TUMBLE(${src}, ${et}, INTERVAL 10 SECOND)\nGROUP BY ALL` },
+    hop: { late: true, sql: `SELECT window_start, window_end, ${key}, count(*) AS events, avg(${val}) AS avg_${val}\nFROM HOP(${src}, ${et}, INTERVAL 1 MINUTE, INTERVAL 10 SECOND)\nGROUP BY ALL` },
+    agg: { late: false, sql: `SELECT ${key}, count(*) AS events, sum(${val}) AS total, avg(${val}) AS avg_${val}, max(${val}) AS top\nFROM ${src}\nGROUP BY ALL\nHAVING count(*) > 100` },
+    filter: { late: false, sql: `SELECT ${cols.map(([c]) => c).join(", ")}\nFROM ${src}\nWHERE ${val} > 50` },
+    join: { late: !!dim, sql: dim ? `SELECT s.window_start, d.*, count(*) AS events\nFROM TUMBLE(${src}, ${et}, INTERVAL 10 SECOND) s\nJOIN ${dim[0]}.${dim[1]} d ON d.${key} = s.${key}\nGROUP BY ALL` : `SELECT s.*, d.label\nFROM ${src} s\nJOIN dim.labels d ON d.${key} = s.${key}` },
+    reject: { late: false, sql: `-- Rejected at create time: ORDER BY / LIMIT, DISTINCT, window functions,\n-- HAVING, global GROUP BY and stream-stream joins are outside the v1 matrix.\nSELECT ${key}, count(*) AS n\nFROM ${src}\nGROUP BY ALL\nORDER BY n DESC\nLIMIT 10` },
+  };
+}
+function viewForm() {
+  return `<div class="modal-h"><h1>New continuous view</h1><p>Incrementally maintained SQL over a source. The view is the DuckLake table it names, updated every epoch.</p></div>
+  <div class="modal-b">
+    <div class="row"><div class="field" style="flex:1"><label>Table</label><input id="v-name" value="analytics." placeholder="analytics.clicks_per_10s" style="width:100%"></div>
+      <div class="field"><label>Template</label><select id="v-tpl"><option value="tumble">Tumbling window</option><option value="hop">Hopping window</option><option value="agg">Global aggregate (upsert)</option><option value="filter">Filter / project</option><option value="join">Lookup join</option><option value="reject">Unsupported (see rejection)</option></select></div></div>
+    <div class="field"><label>SQL</label><textarea id="v-sql" class="code" rows="8" spellcheck="false"></textarea>
+      <div class="hint">Use a source name directly (stateless), <code>TUMBLE(source, time_col, size)</code> / <code>HOP(source, time_col, size, slide)</code> windows, or a plain <code>GROUP BY</code> with <code>HAVING</code> (kept up to date: one row per group). Aggregates: <code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code>. Lake tables can be joined.</div></div>
+    <div class="row">
+      <div class="field" style="flex:1"><label>Late-data table (windowed)</label><input id="v-late" placeholder="optional" style="width:100%"></div>
+      <div class="field"><label>Epoch</label><select id="v-epoch"><option>1s</option><option>2s</option><option selected>3s</option><option>5s</option><option>10s</option><option>30s</option></select></div>
+    </div>
+    <label style="display:flex;gap:6px;align-items:center;color:var(--text)"><input type="checkbox" id="v-start" checked> Start on the playground worker</label>
+  </div>${footer("Create view")}`;
+}
+function wireViewForm(bg, close) {
+  const tpl = $("#v-tpl", bg), sqlEl = $("#v-sql", bg), name = $("#v-name", bg), late = $("#v-late", bg);
+  let lateTouched = false; late.oninput = () => (lateTouched = true);
+  // A bare name means the analytics schema, as on the server.
+  const table = () => { const n = name.value.trim(); return !n || n.endsWith(".") ? "" : n.includes(".") ? n : `analytics.${n}`; };
+  const apply = () => { const t = templates()[tpl.value]; sqlEl.value = t.sql; if (!lateTouched) late.value = t.late && table() ? `${table()}_late` : ""; };
+  tpl.onchange = apply; apply();
+  name.oninput = () => { if (!lateTouched) late.value = /TUMBLE|HOP/i.test(sqlEl.value) && table() ? `${table()}_late` : ""; };
+  bg.querySelector("#m-ok").onclick = async () => {
+    const body = { name: table(), sql: sqlEl.value, late_data: late.value.trim() || null, epoch_interval: $("#v-epoch", bg).value, start: $("#v-start", bg).checked };
+    showErr(bg, "");
+    try { const r = await api("/api/views", { method: "POST", body }); close(); toast(`View ${body.name} created (${r.kind})`); await refreshState(); select("view", r.job_id); }
+    catch (e) { showErr(bg, e.message); }
+  };
+}
+
+function tableForm() {
+  return `<div class="modal-h"><h1>New lake table</h1><p>Any DuckDB SQL; runs against DuckLake (<code>schema.table</code> means <code>lake.schema.table</code>). Useful as a dimension table for lookup joins.</p></div>
+  <div class="modal-b"><textarea id="t-sql" class="code" rows="11" spellcheck="false">CREATE SCHEMA IF NOT EXISTS dim;
+CREATE TABLE dim.countries AS
+SELECT * FROM (VALUES
+  ('c0', 'Vietnam',   'APAC'),
+  ('c1', 'Germany',   'EMEA'),
+  ('c2', 'Brazil',    'LATAM'),
+  ('c3', 'Japan',     'APAC'),
+  ('c4', 'Canada',    'NA')
+) t(country, country_name, region);</textarea></div>${footer("Run")}`;
+}
+function wireTableForm(bg, close) {
+  bg.querySelector("#m-ok").onclick = async () => {
+    try { await api("/api/sql", { method: "POST", body: { sql: $("#t-sql", bg).value } }); close(); toast("Done"); await refreshState(); }
+    catch (e) { showErr(bg, e.message); }
+  };
+}
+
+// ---------- console ----------
+const SNIPPETS = {
+  "Events in a source, per partition": "SELECT _partition, count(*) AS events, min(_offset) AS first_offset, max(_offset) AS last_offset,\n       count(_error) AS undecodable\nFROM clicks\nGROUP BY ALL ORDER BY 1;",
+  "Source vs. view (batch check)": "SELECT game_id, count(*) AS events, sum(amount) AS amount\nFROM clicks\nWHERE _error IS NULL\nGROUP BY ALL ORDER BY events DESC;",
+  "Snapshots (one per epoch)": "SELECT snapshot_id, snapshot_time, commit_message, commit_extra_info, changes\nFROM ducklake_snapshots('lake')\nORDER BY snapshot_id DESC LIMIT 20;",
+  "Latest checkpoints": "SELECT job_id, epoch, source_offsets, watermark, rows_in, rows_sql, rows_out, rows_late, rows_dead, committed_at\nFROM __duckwake.checkpoints\nORDER BY committed_at DESC LIMIT 20;",
+  "Time travel (sink as of 5 snapshots ago)": "SELECT count(*)\nFROM analytics.big_spends AT (VERSION => (SELECT max(snapshot_id) - 5 FROM ducklake_snapshots('lake')));",
+  "Dead letters": "SELECT * FROM __duckwake.dead_letter ORDER BY failed_at DESC LIMIT 50;",
+  "Data files of a table": "SELECT count(*) AS files, sum(data_file_size_bytes) AS bytes\nFROM ducklake_list_files('lake', 'big_spends', schema => 'analytics');",
+  "Run maintenance now": "CALL ducklake_flush_inlined_data('lake');\nCALL ducklake_merge_adjacent_files('lake');\nSELECT 'done' AS maintenance;",
+};
+$("#snippets").innerHTML += Object.keys(SNIPPETS).map((k) => `<option>${esc(k)}</option>`).join("");
+$("#snippets").onchange = (e) => { if (e.target.value) setSQL(SNIPPETS[e.target.value]); e.target.value = ""; };
+function setSQL(sql, run = false) { showDock("sql"); $("#sql").value = sql; if (run) runSQL(); }
+async function runSQL() {
+  const out = $("#sql-out");
+  out.innerHTML = `<div class="out-meta">Running…</div>`;
+  try {
+    const r = await api("/api/sql", { method: "POST", body: { sql: $("#sql").value } });
+    const shown = r.rows.length < r.total ? `showing ${num(r.rows.length)} of ${num(r.total)} rows` : `${num(r.total)} row${r.total === 1 ? "" : "s"}`;
+    const snaps = (r.snapshots || []).map((x) => `${esc(x.source)}: newest ${num(x.events)} events of topic ${esc(x.topic)}`).join(" · ");
+    out.innerHTML = `<div class="out-meta">${shown} · ${r.elapsed_ms} ms${r.statements > 1 ? ` · ${r.statements} statements` : ""}${snaps ? ` · <span title="Sources are read as a snapshot of the topic for each query">${snaps}</span>` : ""}</div>` + gridHTML(r, { maxh: "none" });
+    refreshState();
+  } catch (e) { out.innerHTML = `<div style="padding:12px"><div class="err-box" style="margin:0">${esc(e.message)}</div></div>`; }
+}
+$("#run").onclick = runSQL;
+$("#sql").addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runSQL(); } });
+$("#sql").value = "-- Lake tables are schema.table; control data lives in __duckwake.\n-- A source name (e.g. clicks) reads the newest 100,000 events of its topic.\nSELECT * FROM __duckwake.jobs;";
+
+// ---------- dock ----------
+function showDock(which) {
+  $("#dock").classList.remove("collapsed");
+  document.querySelectorAll("[data-dock]").forEach((b) => b.classList.toggle("on", b.dataset.dock === which));
+  $("#pane-sql").style.display = which === "sql" ? "" : "none";
+  $("#pane-log").style.display = which === "log" ? "" : "none";
+  $("#log-tools").style.display = which === "log" ? "flex" : "none";
+  if (which === "log") renderLogs(true);
+}
+document.querySelectorAll("[data-dock]").forEach((b) => (b.onclick = () => showDock(b.dataset.dock)));
+$("#dock-toggle").onclick = () => { const c = $("#dock").classList.toggle("collapsed"); $("#dock-toggle").textContent = c ? "▴" : "▾"; };
+$("#log-filter").oninput = () => renderLogs(true);
+$("#log-epochs").onchange = () => renderLogs(true);
+function renderLogs(force) {
+  const el = $("#pane-log");
+  if (el.style.display === "none" && !force) return;
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const f = $("#log-filter").value.toLowerCase(), epochs = $("#log-epochs").checked;
+  const lines = S.logs.filter((l) => (!f || l.toLowerCase().includes(f)) && (!epochs || l.includes("epoch committed"))).slice(-600);
+  el.innerHTML = lines.map((l) => {
+    const lvl = / (WARN|ERROR) /.exec(l)?.[1] || "";
+    return `<div class="logline ${lvl} ${l.includes("epoch committed") ? "epoch" : ""}">${esc(l.replace(/^(\S+)T(\S+?)\.\d+Z/, "$2"))}</div>`;
+  }).join("") || `<div class="none">No log lines yet.</div>`;
+  if (atBottom || force) el.scrollTop = el.scrollHeight;
+}
+
+// ---------- polling ----------
+async function refreshState() {
+  try {
+    S.state = await api("/api/state");
+    renderHeader(); renderSide();
+    if (S.sel.kind !== "home" && S.sel.kind !== "table") {
+      const exists = S.sel.kind === "source" ? S.state.sources.some((s) => s.name === S.sel.name) : S.state.views.some((v) => v.job_id === S.sel.name);
+      if (!exists) S.sel = { kind: "home" };
+    }
+    if (!document.querySelector(".modal-bg") && !isEditing()) renderDetail();
+  } catch (e) { $("#worker-pill").className = "pill err"; $("#worker-pill").innerHTML = `<span class="dot"></span>playground unreachable`; }
+}
+function isEditing() { const a = document.activeElement; return a && $("#detail").contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName); }
+async function refreshDetail() {
+  const { kind, name } = S.sel;
+  try {
+    if (kind === "view") S.viewDetail = await api(`/api/views/${name}`);
+    else if (kind === "source") S.sourceDetail = await api(`/api/sources/${name}`);
+    else if (kind === "table") { const [a, b] = name.split("."); S.tableDetail = await api(`/api/tables/${a}/${b}`); }
+    if (S.sel.kind === kind && S.sel.name === name && !isEditing() && !document.querySelector(".modal-bg")) renderDetail();
+  } catch (e) { /* view may be gone; next state refresh resets selection */ }
+}
+async function refreshLogs() {
+  try {
+    const r = await api(`/api/log?since=${S.logNext}`);
+    if (r.lines.length) { S.logs.push(...r.lines.map(([, l]) => l)); if (S.logs.length > 3000) S.logs.splice(0, S.logs.length - 3000); renderLogs(false); }
+    S.logNext = r.next;
+  } catch (e) {}
+}
+async function loadDemo() {
+  const b = $("#demo-btn"); b.disabled = true; b.textContent = "Loading…";
+  try { await api("/api/demo", { method: "POST" }); toast("Demo loaded: clicks generating 300/s into three views"); await refreshState(); select("view", "revenue_per_studio"); }
+  catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.textContent = "Load demo"; }
+}
+$("#demo-btn").onclick = loadDemo;
+
+{ const m = /^#(view|source|table)\/(.+)$/.exec(location.hash); if (m) S.sel = { kind: m[1], name: decodeURIComponent(m[2]) }; }
+refreshState().then(() => { renderDetail(); refreshDetail(); });
+setInterval(refreshState, 2000);
+setInterval(() => { if (S.sel.kind !== "home") refreshDetail(); }, 2500);
+setInterval(refreshLogs, 1000);
+</script>
+</body>
+</html>

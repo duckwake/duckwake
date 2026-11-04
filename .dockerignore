@@ -1,0 +1,6 @@
+target/
+.lake/
+.tmp/
+.git/
+.claude/
+*.log

@@ -1,0 +1,51 @@
+# Builds the duckwake extension on each platform and lays it out as a DuckDB extension repository
+# (dist/extensions/v2.0.0/<platform>/duckwake.duckdb_extension.gz). On a tag, the merged repository is attached
+# to the GitHub release; publish that folder on any static host and users run
+#   INSTALL duckwake FROM 'https://your-host/extensions'; LOAD duckwake;   (with duckdb -unsigned)
+# Not run yet: this repository has no remote. Linux builds link against the runner's glibc, which may be newer
+# than DuckDB's own Linux builds expect.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  extension:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04, platform: linux_amd64 }
+          - { os: ubuntu-24.04-arm, platform: linux_arm64 }
+          - { os: macos-14, platform: osx_arm64 }
+          - { os: macos-13, platform: osx_amd64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/package_extension.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ matrix.platform }}
+          path: dist/extensions
+
+  repository:
+    needs: extension
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: extension-*
+          path: dist/extensions
+          merge-multiple: true
+      - run: find dist -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckwake-extension-repository
+          path: dist/extensions
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: tar -czf duckwake-extensions-${{ github.ref_name }}.tar.gz -C dist extensions
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: duckwake-extensions-${{ github.ref_name }}.tar.gz

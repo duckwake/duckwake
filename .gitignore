@@ -1,0 +1,6 @@
+target/
+.lake/
+*.log
+dist/
+.tmp/
+.claude/settings.local.json

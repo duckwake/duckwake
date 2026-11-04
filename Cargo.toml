@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/duckwake", "crates/extension"]
+# The extension links against the host's DuckDB instead of bundling one; Cargo would unify the two DuckDB
+# builds if they were built together, so it is built on its own: `cargo build --release -p duckwake_extension`.
+default-members = ["crates/core", "crates/duckwake"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Bundled (the CLI and daemon) or linked to a host DuckDB (the extension): see duckwake_core's features.
+duckdb = { version = "=1.20000.1" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+rskafka = { version = "0.6", default-features = false, features = ["compression-lz4", "compression-snappy", "compression-zstd", "compression-gzip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+chrono = "0.4"
+rand = "0.9"
+
+# DuckDB must be built like its release extensions: DEBUG builds turn on allocator
+# assertions that trip when a downloaded (release) extension such as ducklake frees memory.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
+debug = false
