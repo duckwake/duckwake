@@ -119,6 +119,8 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         inline_row_limit: v.inline_row_limit,
         plan,
     };
+    // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
+    crate::circuit::Circuit::compile(&def.plan, &def)?;
     let sink = quote_table(&def.sink)?;
     let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
 

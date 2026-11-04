@@ -441,7 +441,7 @@ impl Worker {
                 gid
             }
         };
-        let circuit = Arc::new(Circuit::compile(&def.plan, &def));
+        let circuit = Arc::new(Circuit::compile(&def.plan, &def)?);
         let open_ends = if self.cfg.lean_commit && circuit.emits_final() {
             let mut stmt = self.conns[0].prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", state_table(id)))?;
             let ends = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<duckdb::Result<BTreeSet<_>>>()?;

@@ -31,13 +31,17 @@ COMMIT;
 ## Views as DBSP circuits
 
 Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model Feldera is built on
-(`circuit.rs`). The compiled view becomes an operator graph Q over whole collections: `Source`, `Weigh` (weight
-+1 per row), `Window`, `LateSplit`, `Map` (the stateless SQL fragments), `Aggregate`, `Sink`. `incrementalize`
-wraps it as D ∘ Q ∘ I and rewrites with DBSP's rules until no integrator (I) or differentiator (D) is left:
+(`circuit.rs`). The compiled view becomes an operator graph Q over whole collections: `Source` (each row with weight
+`__w`, +1 for Kafka), `Window`, `LateSplit`, `Map` (the stateless SQL fragments), `Aggregate`, `Sink`. An analysis
+marks which edges are append-only; a view whose operators assume append-only input (windowed partials, `MIN`/`MAX`,
+append sinks) is refused when that input can retract. `incrementalize`
+wraps it as D ∘ Q ∘ I and pushes every integrator (I) forward until it meets a differentiator (D), the way
+Feldera's `OptimizeIncrementalVisitor` does:
 
-- a linear operator L commutes with both: L ∘ I = I ∘ L, D ∘ L = L ∘ D;
-- D ∘ I = id;
-- D ∘ Aggregate ∘ I = AggregateΔ, the incremental aggregate, whose state is a DuckLake table.
+- a linear operator L commutes with I: L ∘ I = I ∘ L;
+- any other operator S becomes its incremental form SΔ = D ∘ S ∘ I, so S ∘ I = I ∘ SΔ; AggregateΔ keeps its
+  state in a DuckLake table;
+- D ∘ I = id.
 
 What remains runs on changes, and every operator generates its own SQL: `stage_steps` (in-memory, before the
 epoch's transaction) and `commit_steps` (inside it). Linear operators fuse into their consumer's statement as
