@@ -185,17 +185,33 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
     Ok(def)
 }
 
-/// Sized so a typical epoch's sink rows land in the catalog instead of a tiny Parquet file. Must run after
-/// the sink is committed (DuckLake rejects options on tables created in the same transaction), and the
-/// worker re-applies it on its own connection: an attached lake does not see options set later by
-/// another connection, so its epochs would keep writing one small file each.
+/// Sized so a typical epoch's sink rows land in the catalog instead of a tiny Parquet file (DuckLake's
+/// default inlines at most 10 rows). Must run after the sink is committed (DuckLake rejects options on tables
+/// created in the same transaction), and the worker re-applies it on its own connection: an attached lake
+/// does not see options set later by another connection, so its epochs would keep writing one small file each.
 pub fn set_sink_inlining(conn: &Connection, def: &JobDef) -> Result<()> {
     let (_, schema, table) = crate::lake::qualified_table(&def.sink)?;
+    set_inlining(conn, &schema, &table, def.inline_row_limit)
+}
+
+/// Rows per insert the checkpoint table inlines. With `lean_commit` one INSERT carries the checkpoint rows of
+/// every job on the worker, more than DuckLake's default of 10 once a worker runs more than 10 jobs.
+const CHECKPOINT_INLINE_ROWS: usize = 1_000;
+
+/// Inlining for the checkpoint table, set by each worker on its own connection at start (see
+/// `set_sink_inlining`). Dead letters and late rows keep DuckLake's default: they come in thousands per
+/// epoch, which cost more as catalog rows than as one Parquet file (16-view bench, `docs/internals.md`).
+/// Lease and state tables keep it too: a lease write is one row, and state is rewritten every epoch.
+pub fn set_control_inlining(conn: &Connection) -> Result<()> {
+    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
+    set_inlining(conn, schema, "checkpoints", CHECKPOINT_INLINE_ROWS)
+}
+
+fn set_inlining(conn: &Connection, schema: &str, table: &str, rows: usize) -> Result<()> {
     conn.execute_batch(&format!(
-        "CALL {LAKE}.set_option('data_inlining_row_limit', {}, schema => {}, table_name => {})",
-        def.inline_row_limit,
-        lit(&schema),
-        lit(&table)
+        "CALL {LAKE}.set_option('data_inlining_row_limit', {rows}, schema => {}, table_name => {})",
+        lit(schema),
+        lit(table)
     ))?;
     Ok(())
 }
@@ -384,6 +400,11 @@ pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<()> {
     } else {
         None
     };
+    // Its deletes from the shared control tables can lose to a running job's checkpoint insert.
+    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot))
+}
+
+fn reset_once(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64, snapshot: Option<i64>) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         let sink = quote_table(&def.sink)?;
@@ -422,6 +443,11 @@ pub fn drop_view(conn: &Connection, job: &str, keep_table: bool) -> Result<()> {
     if status == JobStatus::Running {
         bail!("stop {job:?} before dropping it");
     }
+    // Like `reset`, its deletes from the shared control tables can lose to a running job's inserts.
+    retry_conflicts(|| drop_view_once(conn, job, &def, keep_table))
+}
+
+fn drop_view_once(conn: &Connection, job: &str, def: &JobDef, keep_table: bool) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute(&format!("DELETE FROM {CTL}.jobs WHERE job_id = ?"), [job])?;

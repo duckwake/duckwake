@@ -122,6 +122,14 @@ operator's semantics and a test oracle, not a dependency.
      visible. A checkpoint's `committed_at` is the worker's clock once the view's writes are done, which
      leaves out only the COMMIT call; the epoch log's `freshness_ms` and the
      `duckwake_commit_freshness_seconds` metric measure to the moment COMMIT returned.
+8. **DuckLake inlines an insert of at most 10 rows by default** (DuckDB v2.0.0, DuckLake format 1.1); one of
+   11 rows writes a Parquet file. With `--lean-commit` one INSERT carries the checkpoint rows of every job on
+   the worker, so a worker with more than 10 jobs wrote one small checkpoint file per epoch (27 files after
+   the 16-view bench). Each worker now sets the checkpoint table's limit to 1000 at start. Inlining the dead
+   letters and late rows as well removed their files too, but at thousands of rows per epoch it raised the
+   bench's commit p50 from 321–329 ms to 382 ms (the COMMIT call from 82 to 113 ms): writing them into the
+   Postgres catalog costs more than one local Parquet file. They keep the default, and maintenance merges
+   their files.
 
 ## Simplifications and gaps
 
