@@ -8,4 +8,8 @@ pub trait SourceSchema {
     fn event_time(&self) -> &str;
     /// Its columns and their DuckDB types, in order.
     fn columns(&self) -> &[(String, String)];
+    /// Whether its rows are only ever inserted. A source that can retract stages a weight `__w` with each row.
+    fn append_only(&self) -> bool {
+        true
+    }
 }

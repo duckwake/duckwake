@@ -70,6 +70,9 @@ pub struct Plan {
     /// Global (non-windowed) aggregate: the operator chain pre-aggregate -> aggregate -> post.
     #[serde(default)]
     pub global: Option<GlobalPlan>,
+    /// The sources the view reads that can retract rows: their staged rows carry a weight `__w`.
+    #[serde(default)]
+    pub retracting: Vec<String>,
 }
 
 /// One branch of a `UNION ALL` view.
@@ -123,7 +126,8 @@ pub enum SinkMode {
     /// Rows are only ever added (stateless views, closed windows).
     #[default]
     Append,
-    /// One row per group, replaced when the group's result changes (global aggregates).
+    /// Rows replaced or removed as they change: a global aggregate's groups, or any view but a windowed one
+    /// over a source that can retract.
     Upsert,
 }
 
@@ -162,6 +166,16 @@ pub struct GlobalPlan {
     pub aggs: Vec<AggSpec>,
     /// Sink column holding group key j.
     pub sink_keys: Vec<String>,
+    /// MIN and MAX over a source that can retract: the state also counts each group's values, one row per
+    /// (group, aggregate `__i`, value `__v<i>`) with its count `__n`, so a retracted extreme gives way to the
+    /// next value still present (spike S4). Group rows have `__i` NULL.
+    #[serde(default)]
+    pub counted_values: bool,
+}
+
+/// The state columns of value rows (`GlobalPlan::counted_values`) besides the group keys.
+fn is_value_col(c: &str) -> bool {
+    c == "__i" || c == "__n" || c.strip_prefix("__v").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
 }
 
 const SUPPORTED_AGGS: [&str; 6] = ["count", "count_star", "sum", "min", "max", "avg"];
@@ -186,6 +200,11 @@ impl Plan {
         out
     }
 
+    /// Whether a source of the view can retract rows.
+    pub fn retracts(&self) -> bool {
+        !self.retracting.is_empty()
+    }
+
     /// Whether the plan keeps a state table in `__duckwake`.
     pub fn has_state(&self) -> bool {
         self.is_windowed() || self.is_global() || self.distinct
@@ -196,8 +215,9 @@ impl Plan {
         self.is_global() || self.distinct
     }
 
+    /// Over a source that can retract, every view's table but a windowed one's has rows replaced or removed.
     pub fn sink_mode(&self) -> SinkMode {
-        if self.is_global() { SinkMode::Upsert } else { SinkMode::Append }
+        if self.is_global() || (self.retracts() && !self.is_windowed()) { SinkMode::Upsert } else { SinkMode::Append }
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -278,27 +298,19 @@ impl GlobalPlan {
         if eq.is_empty() { "TRUE".into() } else { eq.join(" AND ") }
     }
 
-    /// The same over the sink's key columns.
-    pub fn sink_keys_match(&self, a: &str, b: &str) -> String {
-        let eq: Vec<String> =
-            self.sink_keys.iter().map(|k| format!("{a}.{k} IS NOT DISTINCT FROM {b}.{k}", k = ident(k))).collect();
-        if eq.is_empty() { "TRUE".into() } else { eq.join(" AND ") }
-    }
-
     /// Weighted partials per group for one epoch's pre-aggregate rows.
     pub fn delta_sql(&self, pre: &str) -> String {
-        let signed = |k: usize| format!("CASE WHEN __w = 1 THEN __x{k} WHEN __w = -1 THEN -__x{k} ELSE __x{k} * __w END");
-        let nonnull = |k: usize| format!("CAST(sum(CASE WHEN __x{k} IS NOT NULL THEN __w ELSE 0 END) AS BIGINT)");
+        let x = |k: usize| format!("__x{k}");
         let mut cols = self.key_cols();
         cols.push("CAST(sum(__w) AS BIGINT) AS __cnt".into());
         for (i, a) in self.aggs.iter().enumerate() {
             let k = a.arg.unwrap_or(0);
             match a.kind {
                 AggKind::CountStar => cols.push(format!("CAST(sum(__w) AS BIGINT) AS __a{i}")),
-                AggKind::Count => cols.push(format!("{} AS __a{i}", nonnull(k))),
+                AggKind::Count => cols.push(format!("{} AS __a{i}", weighted_count(&x(k)))),
                 AggKind::Sum | AggKind::Avg => {
-                    cols.push(format!("sum({}) AS __a{i}_s", signed(k)));
-                    cols.push(format!("{} AS __a{i}_n", nonnull(k)));
+                    cols.push(format!("sum({}) AS __a{i}_s", signed(&x(k))));
+                    cols.push(format!("{} AS __a{i}_n", weighted_count(&x(k))));
                 }
                 AggKind::Min => cols.push(format!("min(__x{k}) AS __a{i}")),
                 AggKind::Max => cols.push(format!("max(__x{k}) AS __a{i}")),
@@ -314,33 +326,124 @@ impl GlobalPlan {
     }
 
     /// New state of every touched group: stored state plus this epoch's partials.
-    pub fn merge_sql(&self, delta: &str, old: &str, state_columns: &[(String, String)]) -> String {
+    /// New state of every touched group: stored state plus this epoch's partials. With counted values, MIN
+    /// and MAX come from `extrema` instead: the touched groups' smallest and largest values still present.
+    pub fn merge_sql(&self, delta: &str, old: &str, extrema: Option<&str>, state_columns: &[(String, String)]) -> String {
         let ty = |c: &str| state_columns.iter().find(|(n, _)| n == c).map(|(_, t)| t.clone()).unwrap();
         let add = |c: &str| format!("CAST(coalesce(o.{c}, 0) + coalesce(d.{c}, 0) AS {}) AS {c}", ty(c));
         let mut cols: Vec<String> = self.key_cols().iter().map(|k| format!("d.{k}")).collect();
         cols.push(add("__cnt"));
         for (i, a) in self.aggs.iter().enumerate() {
-            match a.kind {
-                AggKind::CountStar | AggKind::Count => cols.push(add(&format!("__a{i}"))),
-                AggKind::Sum | AggKind::Avg => {
+            match (a.kind, extrema) {
+                (AggKind::CountStar | AggKind::Count, _) => cols.push(add(&format!("__a{i}"))),
+                (AggKind::Sum | AggKind::Avg, _) => {
                     cols.push(add(&format!("__a{i}_s")));
                     cols.push(add(&format!("__a{i}_n")));
                 }
-                AggKind::Min => cols.push(format!("least(o.__a{i}, d.__a{i}) AS __a{i}")),
-                AggKind::Max => cols.push(format!("greatest(o.__a{i}, d.__a{i}) AS __a{i}")),
+                (AggKind::Min | AggKind::Max, Some(_)) => cols.push(format!("CAST(e.__a{i} AS {}) AS __a{i}", ty(&format!("__a{i}")))),
+                (AggKind::Min, None) => cols.push(format!("least(o.__a{i}, d.__a{i}) AS __a{i}")),
+                (AggKind::Max, None) => cols.push(format!("greatest(o.__a{i}, d.__a{i}) AS __a{i}")),
             }
         }
-        format!("SELECT {} FROM {delta} d LEFT JOIN {old} o ON {}", cols.join(", "), self.keys_match("d", "o"))
+        let extrema = extrema.map(|e| format!(" LEFT JOIN {e} e ON {}", self.keys_match("d", "e"))).unwrap_or_default();
+        format!("SELECT {} FROM {delta} d LEFT JOIN {old} o ON {}{extrema}", cols.join(", "), self.keys_match("d", "o"))
     }
 
     /// The incremental aggregate: the epoch's partials per group, the touched groups' stored state (read
-    /// from `t.state`) and their new state.
+    /// from `t.state`) and their new state. With counted values also the epoch's value counts, the touched
+    /// groups' stored ones (from `t.state_values`), the changed values' new counts, and the extremes.
     pub fn aggregate_stmts(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
-        vec![
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.delta, self.delta_sql(&t.pre)),
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.old, self.old_sql(&t.state, &t.delta)),
-            format!("CREATE OR REPLACE TABLE {} AS {}", t.new_state, self.merge_sql(&t.delta, &t.old, state_columns)),
-        ]
+        let table = |name: &str, sql: String| format!("CREATE OR REPLACE TABLE {name} AS {sql}");
+        let mut stmts = vec![table(&t.delta, self.delta_sql(&t.pre)), table(&t.old, self.old_sql(&t.state, &t.delta))];
+        if !self.counted_values {
+            stmts.push(table(&t.new_state, self.merge_sql(&t.delta, &t.old, None, state_columns)));
+            return stmts;
+        }
+        let vcols = self.value_columns(state_columns);
+        let cols = |a: &str, count: bool| {
+            vcols.iter().filter(|(c, _)| count || c != "__n").map(|(c, _)| format!("{a}.{c}")).collect::<Vec<_>>().join(", ")
+        };
+        let list = |a: &str| cols(a, true);
+        let vmatch = |a: &str, b: &str| self.values_match(a, b, state_columns);
+        stmts.push(table(&t.vdelta, self.value_delta_sql(&t.pre, state_columns)));
+        stmts.push(table(&t.vold, self.old_sql(&t.state_values, &t.delta)));
+        stmts.push(table(
+            &t.vnew,
+            format!(
+                "SELECT {}, CAST(coalesce(o.__n, 0) + d.__n AS BIGINT) AS __n FROM {} d LEFT JOIN {} o ON {}",
+                cols("d", false),
+                t.vdelta,
+                t.vold,
+                vmatch("d", "o")
+            ),
+        ));
+        let extremes: Vec<String> = self
+            .value_aggs()
+            .map(|(i, kind)| format!("{}(__v{i}) FILTER (WHERE __i = {i}) AS __a{i}", if kind == AggKind::Min { "min" } else { "max" }))
+            .collect();
+        let group = if self.keys == 0 { String::new() } else { format!(" GROUP BY {}", self.key_cols().join(", ")) };
+        stmts.push(table(
+            &t.extrema,
+            format!(
+                "SELECT {} FROM (SELECT {} FROM {vnew} v WHERE v.__n > 0
+                   UNION ALL SELECT {} FROM {vold} o WHERE o.__n > 0 AND NOT EXISTS (SELECT 1 FROM {vnew} v WHERE {}))
+                 {group}",
+                self.key_cols().into_iter().chain(extremes).collect::<Vec<_>>().join(", "),
+                list("v"),
+                list("o"),
+                vmatch("o", "v"),
+                vnew = t.vnew,
+                vold = t.vold,
+            ),
+        ));
+        stmts.push(table(&t.new_state, self.merge_sql(&t.delta, &t.old, Some(&t.extrema), state_columns)));
+        stmts
+    }
+
+    /// The state columns of group rows: all but the value rows' own.
+    pub fn group_columns(&self, state_columns: &[(String, String)]) -> Vec<(String, String)> {
+        state_columns.iter().filter(|(c, _)| !is_value_col(c)).cloned().collect()
+    }
+
+    /// The state columns of value rows: the group keys, `__i`, `__v<i>` and `__n`.
+    pub fn value_columns(&self, state_columns: &[(String, String)]) -> Vec<(String, String)> {
+        let keys = self.key_cols();
+        state_columns.iter().filter(|(c, _)| keys.contains(c) || is_value_col(c)).cloned().collect()
+    }
+
+    /// The MIN and MAX aggregates, by index, whose values the state counts.
+    fn value_aggs(&self) -> impl Iterator<Item = (usize, AggKind)> + '_ {
+        let counted = self.counted_values;
+        self.aggs.iter().enumerate().filter(move |(_, a)| counted && matches!(a.kind, AggKind::Min | AggKind::Max)).map(|(i, a)| (i, a.kind))
+    }
+
+    /// One epoch's value counts: per group, MIN/MAX aggregate and non-NULL value, the sum of its weights.
+    fn value_delta_sql(&self, pre: &str, state_columns: &[(String, String)]) -> String {
+        let ty = |c: &str| state_columns.iter().find(|(n, _)| n == c).map(|(_, t)| t.clone()).unwrap();
+        let aggs: Vec<(usize, AggKind)> = self.value_aggs().collect();
+        let parts: Vec<String> = aggs
+            .iter()
+            .map(|&(i, _)| {
+                let k = self.aggs[i].arg.unwrap();
+                let mut cols = self.key_cols();
+                cols.push(format!("{i} AS __i"));
+                for &(j, _) in &aggs {
+                    cols.push(if j == i { format!("__x{k} AS __v{j}") } else { format!("CAST(NULL AS {}) AS __v{j}", ty(&format!("__v{j}"))) });
+                }
+                cols.push("CAST(sum(__w) AS BIGINT) AS __n".into());
+                format!("SELECT {} FROM {pre} WHERE __x{k} IS NOT NULL GROUP BY ALL HAVING sum(__w) <> 0", cols.join(", "))
+            })
+            .collect();
+        parts.join(" UNION ALL ")
+    }
+
+    /// Value rows `a` and `b` count the same group, aggregate and value.
+    fn values_match(&self, a: &str, b: &str, state_columns: &[(String, String)]) -> String {
+        let mut eq = vec![self.keys_match(a, b), format!("{a}.__i = {b}.__i")];
+        for (c, _) in state_columns.iter().filter(|(c, _)| c.starts_with("__v") && is_value_col(c)) {
+            eq.push(format!("{a}.{c} IS NOT DISTINCT FROM {b}.{c}"));
+        }
+        eq.join(" AND ")
     }
 
     /// The aggregate's output change: the touched groups' old finalized rows retracted (weight −1) and their
@@ -353,42 +456,45 @@ impl GlobalPlan {
         )
     }
 
-    /// The upsert sink's staging: its input change consolidated, so a group whose row did not change cancels
-    /// out, and the keys of the groups whose row did.
-    pub fn upsert_stmts(&self, t: &GlobalTables, input: &str) -> Vec<String> {
-        let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
-        let keys: Vec<String> = self.sink_keys.iter().map(|k| ident(k)).collect();
-        let keys = if keys.is_empty() { "1 AS __one".to_string() } else { keys.join(", ") };
-        vec![
-            format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT {}, CAST(sum(__w) AS INTEGER) AS __w FROM {input} GROUP BY ALL HAVING sum(__w) <> 0",
-                t.changes,
-                sink_cols.join(", ")
-            ),
-            format!("CREATE OR REPLACE TABLE {} AS SELECT DISTINCT {keys} FROM {}", t.changed, t.changes),
-        ]
-    }
-
     /// The aggregate's writes at commit: replace the touched groups' state.
     pub fn commit_state_sql(&self, t: &GlobalTables, state_columns: &[(String, String)]) -> Vec<String> {
-        let st_cols: Vec<String> = state_columns.iter().map(|(c, _)| ident(c)).collect();
-        vec![
-            format!("DELETE FROM {} s WHERE EXISTS (SELECT 1 FROM {} d WHERE {})", t.state, t.delta, self.keys_match("s", "d")),
-            format!("INSERT INTO {} ({c}) SELECT {c} FROM {} WHERE __cnt <> 0", t.state, t.new_state, c = st_cols.join(", ")),
-        ]
+        let names = |cols: Vec<(String, String)>| cols.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+        let groups = if self.counted_values { "s.__i IS NULL AND " } else { "" };
+        let mut stmts = vec![
+            format!("DELETE FROM {} s WHERE {groups}EXISTS (SELECT 1 FROM {} d WHERE {})", t.state, t.delta, self.keys_match("s", "d")),
+            format!("INSERT INTO {} ({c}) SELECT {c} FROM {} WHERE __cnt <> 0", t.state, t.new_state, c = names(self.group_columns(state_columns))),
+        ];
+        if self.counted_values {
+            // The changed values' counts replaced; a value whose count reached 0 is gone.
+            stmts.push(format!(
+                "DELETE FROM {} s WHERE s.__i IS NOT NULL AND EXISTS (SELECT 1 FROM {} v WHERE {})",
+                t.state,
+                t.vnew,
+                self.values_match("s", "v", state_columns)
+            ));
+            stmts.push(format!(
+                "INSERT INTO {} ({c}) SELECT {c} FROM {} WHERE __n <> 0",
+                t.state,
+                t.vnew,
+                c = names(self.value_columns(state_columns))
+            ));
+        }
+        stmts
     }
 
-    /// The upsert sink's writes at commit: replace the changed groups' rows by their new ones, if any.
-    pub fn commit_sink_sql(&self, t: &GlobalTables, epoch: &str) -> Vec<String> {
-        let sink_cols: Vec<String> = t.sink_columns.iter().map(|c| ident(c)).collect();
-        let sink_match = if self.sink_keys.is_empty() { "TRUE".to_string() } else { self.sink_keys_match("s", "c") };
-        vec![
-            format!("DELETE FROM {} s WHERE EXISTS (SELECT 1 FROM {} c WHERE {sink_match})", t.sink, t.changed),
-            format!(
-                "INSERT INTO {} ({c}, _duckwake_epoch) SELECT {c}, {epoch} FROM {} WHERE __w > 0",
-                t.sink, t.changes, c = sink_cols.join(", ")
-            ),
-        ]
+    /// The value rows as of the previous epoch while it may still be committing, like `overlay_sql`: its new
+    /// counts for the values it changed (those it emptied left out), the stored ones for every other value.
+    pub fn values_overlay_sql(&self, values: &str, prev_vnew: &str, state_columns: &[(String, String)]) -> String {
+        let vcols = self.value_columns(state_columns);
+        let cast: Vec<String> = vcols.iter().map(|(c, t)| format!("CAST({c} AS {t}) AS {c}")).collect();
+        let cols: Vec<String> = vcols.iter().map(|(c, _)| c.clone()).collect();
+        format!(
+            "(SELECT {} FROM {prev_vnew} WHERE __n <> 0
+              UNION ALL SELECT {} FROM {values} s WHERE NOT EXISTS (SELECT 1 FROM {prev_vnew} p WHERE {}))",
+            cast.join(", "),
+            cols.join(", "),
+            self.values_match("s", "p", state_columns)
+        )
     }
 
     /// The state as of the previous epoch while that epoch may still be committing: its new state for the
@@ -436,6 +542,14 @@ pub struct GlobalTables {
     /// The DuckLake state table, written at commit. While staging it is what `old` reads: the table itself, or
     /// `GlobalPlan::overlay_sql` over it when the previous epoch may not have committed yet.
     pub state: String,
+    /// With counted values: the epoch's value counts, the touched groups' stored ones, the changed values' new
+    /// counts and the touched groups' extremes; and while staging, what `vold` reads (the state's value rows,
+    /// or `GlobalPlan::values_overlay_sql` over them).
+    pub vdelta: String,
+    pub vold: String,
+    pub vnew: String,
+    pub extrema: String,
+    pub state_values: String,
     /// The sink table and its user-visible columns.
     pub sink: String,
     pub sink_columns: Vec<String>,
@@ -452,6 +566,11 @@ impl GlobalTables {
             new_state: set("gnew"),
             changes: set("changes"),
             changed: set("changed"),
+            vdelta: set("gvdelta"),
+            vold: mem("gvold"),
+            vnew: set("gvnew"),
+            extrema: mem("gextrema"),
+            state_values: state.clone(),
             state,
             sink,
             sink_columns: plan.sink_columns.iter().map(|(c, _)| c.clone()).collect(),
@@ -547,6 +666,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         query,
         union: vec![],
         global: None,
+        retracting: if src.append_only() { vec![] } else { vec![stream.source.clone()] },
     };
 
     let node = &mut stmt["node"];
@@ -562,7 +682,18 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
             compile_global(conn, job, &mut stmt, &stream.alias, &aggs, &mut plan)?;
             return Ok(plan);
         }
-        plan.query.project = vec![list_sql(conn, &node["select_list"])?];
+        // The view's rows, each with its weight; a `*` over the stream leaves the weight out.
+        let mut list = node["select_list"].as_array().unwrap().clone();
+        for e in list.iter_mut().filter(|e| e["class"] == "STAR") {
+            let rel = e["relation_name"].as_str().unwrap_or("");
+            if rel.is_empty() || rel.eq_ignore_ascii_case(&stream.alias) {
+                e["exclude_list"].as_array_mut().ok_or_else(|| anyhow!("unexpected star expression"))?.push(json!("__w"));
+            }
+        }
+        list.push(weight_ref(conn, &stream.alias)?);
+        conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN __w INTEGER", plan.input_table))?;
+        plan.query.columns.push("__w".into());
+        plan.query.project = vec![list_sql(conn, &Value::Array(list))?];
         if plan.distinct {
             plan.state_columns = plan.sink_columns.iter().cloned().chain([("__cnt".to_string(), "BIGINT".to_string())]).collect();
         }
@@ -596,7 +727,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
     }
     let mut nodes = Vec::new();
     branches(&stmt["node"], &mut nodes)?;
-    let mut union = Vec::new();
+    let (mut union, mut retracting) = (Vec::new(), Vec::new());
     for (k, node) in nodes.into_iter().enumerate() {
         let mut branch = stmt.clone();
         branch["node"] = node;
@@ -604,6 +735,11 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         let p = compile(conn, &format!("{job}_{k}"), &sql, sources).with_context(|| format!("branch {} of the UNION ALL", k + 1))?;
         if p.window.is_some() || p.global.is_some() || p.distinct || !p.union.is_empty() {
             bail!("each branch of a UNION ALL must be a plain view (no windows, aggregates or DISTINCT) for now");
+        }
+        for s in p.retracting {
+            if !retracting.contains(&s) {
+                retracting.push(s);
+            }
         }
         union.push((p.batch_sql, Branch { source: p.source, input_table: p.input_table, query: p.query }));
     }
@@ -625,6 +761,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         query: union[0].query.clone(),
         union,
         global: None,
+        retracting,
     })
 }
 
@@ -654,6 +791,7 @@ fn compile_windowed(
         bail!("SELECT * is not supported in windowed views; list the columns");
     }
     // The aggregate's input: the keys `__k<j>`, the aggregates' arguments `__x<k>`, the window, the weight.
+    let weighted = plan.retracts();
     let mut project = Vec::new();
     let mut args: Vec<Value> = Vec::new();
     let mut finals = Vec::new();
@@ -704,36 +842,66 @@ fn compile_windowed(
             plan.partials.push(format!("{sql} AS {name}"));
             plan.merge_ops.push((name.to_string(), op));
         };
-        let finalize = match fname.as_str() {
-            "count_star" => {
+        // Over a source that can retract, the partials sum weights (as Feldera's ExpandAggregates does when the
+        // input is not append-only); over Kafka they count rows, which is the same there and cheaper. A sum
+        // keeps its weighted non-NULL count too, so that it is NULL again once every value is retracted.
+        let finalize = match (fname.as_str(), weighted) {
+            ("count_star", false) => {
                 partial(&p, "count(*)".into(), MergeOp::Add);
                 ident(&p)
             }
-            "count" => {
+            ("count_star", true) => {
+                partial(&p, "CAST(sum(__w) AS BIGINT)".into(), MergeOp::Add);
+                ident(&p)
+            }
+            ("count", false) => {
                 partial(&p, format!("count({x})"), MergeOp::Add);
                 ident(&p)
             }
-            "sum" => {
+            ("count", true) => {
+                partial(&p, weighted_count(&x), MergeOp::Add);
+                ident(&p)
+            }
+            ("sum", false) => {
                 partial(&p, format!("sum({x})"), MergeOp::AddNullable);
                 ident(&p)
             }
-            "min" => {
+            ("sum", true) => {
+                let (s, c) = (format!("{p}s"), format!("{p}c"));
+                partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
+                partial(&c, weighted_count(&x), MergeOp::Add);
+                format!("CASE WHEN {} = 0 THEN NULL ELSE {} END", ident(&c), ident(&s))
+            }
+            ("min" | "max", true) => {
+                bail!("{fname}() in a window over a source that can retract needs a count per value: not supported yet")
+            }
+            ("min", false) => {
                 partial(&p, format!("min({x})"), MergeOp::Min);
                 ident(&p)
             }
-            "max" => {
+            ("max", false) => {
                 partial(&p, format!("max({x})"), MergeOp::Max);
                 ident(&p)
             }
-            "avg" => {
+            ("avg", _) => {
                 let (s, c) = (format!("{p}s"), format!("{p}c"));
-                partial(&s, format!("sum({x})"), MergeOp::AddNullable);
-                partial(&c, format!("count({x})"), MergeOp::Add);
+                if weighted {
+                    partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
+                    partial(&c, weighted_count(&x), MergeOp::Add);
+                } else {
+                    partial(&s, format!("sum({x})"), MergeOp::AddNullable);
+                    partial(&c, format!("count({x})"), MergeOp::Add);
+                }
                 format!("CAST({} AS DOUBLE) / NULLIF({}, 0)", ident(&s), ident(&c))
             }
             _ => unreachable!(),
         };
         finals.push(format!("CAST({finalize} AS {sink_type}) AS {}", ident(sink_name)));
+    }
+    // Each window and group's total weight: one whose rows are all retracted is not emitted.
+    if weighted {
+        plan.partials.push(format!("CAST(sum(__w) AS BIGINT) AS {WINDOW_WEIGHT}"));
+        plan.merge_ops.push((WINDOW_WEIGHT.to_string(), MergeOp::Add));
     }
     // A GROUP BY key left out of the select list would merge its groups into one state row.
     if !group_all {
@@ -768,6 +936,19 @@ fn compile_windowed(
     plan.state_columns = state;
     plan.final_select = finals.join(", ");
     Ok(())
+}
+
+/// The state column holding a window and group's total weight, when the view's input can retract.
+pub const WINDOW_WEIGHT: &str = "__pw";
+
+/// `x` times the row's weight; written out for ±1 so an integer `x` keeps its type and cannot overflow.
+fn signed(x: &str) -> String {
+    format!("CASE WHEN __w = 1 THEN {x} WHEN __w = -1 THEN -{x} ELSE {x} * __w END")
+}
+
+/// The weighted count of `x`'s non-NULL values.
+fn weighted_count(x: &str) -> String {
+    format!("CAST(sum(CASE WHEN {x} IS NOT NULL THEN __w ELSE 0 END) AS BIGINT)")
 }
 
 /// A windowed aggregate's partials per window and key over `input`, a relation of its input rows.
@@ -896,8 +1077,18 @@ fn compile_global(
     describe(conn, &format!("SELECT {} FROM {agg_table}{having_sql}", plan.query.finish.join(", ")))
         .context("binding the select list over the aggregates (every non-aggregate column must be a GROUP BY key)")?;
 
+    // MIN and MAX over a source that can retract: value rows in the same state table.
+    let counted_values = plan.retracts() && specs.iter().any(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max));
+    if counted_values {
+        state.push(("__i".into(), "INTEGER".into()));
+        for (i, (_, a)) in specs.iter().enumerate().filter(|(_, (_, a))| matches!(a.kind, AggKind::Min | AggKind::Max)) {
+            state.push((format!("__v{i}"), col_type(&format!("__x{}", a.arg.unwrap()))));
+        }
+        state.push(("__n".into(), "BIGINT".into()));
+    }
     plan.state_columns = state;
-    plan.global = Some(GlobalPlan { keys: groups.len(), aggs: specs.into_iter().map(|(_, a)| a).collect(), sink_keys });
+    let aggs = specs.into_iter().map(|(_, a)| a).collect();
+    plan.global = Some(GlobalPlan { keys: groups.len(), aggs, sink_keys, counted_values });
     Ok(())
 }
 

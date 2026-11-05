@@ -1,9 +1,7 @@
 use super::{not_incremental, Class, Operator, Stateful};
 use crate::codegen::{staging, Cost, Counter, Cx, Rel, Step};
-use crate::ir::Props;
-use crate::plan::Plan;
 use crate::sql::{ident, state_table};
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 /// `SELECT DISTINCT`: a row is in the output while its total weight is positive.
 ///
@@ -23,13 +21,6 @@ impl Operator for Distinct {
 
     // On append-only input a row's weight only grows: it enters once and never leaves, so the output is
     // append-only too; with retractions it is not. The default (the input's) says exactly that.
-
-    fn check(&self, inputs: &[Props], _plan: &Plan) -> Result<()> {
-        if !inputs.iter().all(|p| p.append_only) {
-            bail!("Distinct reads a stream that can retract rows, but its input carries no weights yet: not supported yet");
-        }
-        Ok(())
-    }
 
     fn stage(&self, _cx: &mut Cx, _inputs: &[Rel]) -> Result<Vec<Rel>> {
         Err(not_incremental(&self.name()))
@@ -68,8 +59,12 @@ impl Stateful for Distinct {
         let (cols, m) = columns(cx);
         let list = cols.join(", ");
         let prefixed = |a: &str| cols.iter().map(|c| format!("{a}.{c}")).collect::<Vec<_>>().join(", ");
-        // Each input row has weight +1 (`check` makes sure the input is append-only).
-        let delta = format!("CREATE OR REPLACE TABLE {} AS SELECT {list}, count(*)::BIGINT AS __w FROM {} GROUP BY ALL", t.delta, inputs[0].sql());
+        // Each row's weight change; rows whose weights cancel out within the epoch are not a change.
+        let delta = format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT {list}, sum(__w)::BIGINT AS __w FROM {} GROUP BY ALL HAVING sum(__w) <> 0",
+            t.delta,
+            inputs[0].sql()
+        );
         cx.steps.push(Step::stage(delta).counting(Counter::Staged, &t.delta));
         // The previous epoch may still be committing: read its new weights for the rows it touched.
         let mut state = state_table(cx.x.job);
@@ -95,13 +90,16 @@ impl Stateful for Distinct {
             t.old,
             m("d", "o")
         )));
-        // The rows whose weight became positive this epoch. (On append-only input none becomes 0.)
+        // The rows whose weight became positive this epoch enter (+1), those whose weight fell to 0 leave (−1).
+        // On append-only input none leaves. `new` has a row for every touched row, so every left one is found.
         Ok(vec![Rel::Sql(format!(
-            "(SELECT {} FROM {} n LEFT JOIN {} o ON {} WHERE n.__cnt > 0 AND coalesce(o.__cnt, 0) <= 0)",
+            "(SELECT {}, 1::INTEGER AS __w FROM {new} n LEFT JOIN {old} o ON {nm} WHERE n.__cnt > 0 AND coalesce(o.__cnt, 0) <= 0
+              UNION ALL SELECT {}, (-1)::INTEGER AS __w FROM {old} o JOIN {new} n ON {nm} WHERE o.__cnt > 0 AND n.__cnt <= 0)",
             prefixed("n"),
-            t.new,
-            t.old,
-            m("n", "o")
+            prefixed("o"),
+            new = t.new,
+            old = t.old,
+            nm = m("n", "o")
         ))])
     }
 

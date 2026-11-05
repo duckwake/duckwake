@@ -63,8 +63,9 @@ default.
 
 - `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL (needs a C++ parser shim; DuckDB's C API has no parser hooks)
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
-- `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` over deletes, stream–stream joins,
-  DuckLake tables as sources
+- `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
+  stream–stream joins, DuckLake tables and other views as sources (every operator but windowed `MIN`/`MAX`
+  already takes retracting input)
 - Avro and Protobuf with a schema registry; Kafka keys and headers
 - Splitting one topic's partitions across workers
 - A Windows build
