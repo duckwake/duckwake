@@ -77,3 +77,19 @@ fn retracting_input_is_refused_where_an_operator_assumes_append_only() {
         assert_eq!(q.check(&def.plan).is_err(), refused.contains(sql), "{sql}");
     }
 }
+
+#[test]
+fn retracting_sources_pick_their_sinks_and_refuse_what_is_not_supported_yet() {
+    let sinks = |sql: &str| ops(&Circuit::compile(&def_for(sql, false).view()).unwrap()).pop().unwrap();
+    assert_eq!(sinks("SELECT ts, amount FROM changes"), "Sink(counted rows)");
+    assert_eq!(sinks("SELECT DISTINCT game_id FROM changes"), "Sink(upsert)");
+    assert_eq!(sinks("SELECT DISTINCT game_id FROM clicks"), "Sink(append)");
+    assert_eq!(sinks("SELECT ts FROM clicks UNION ALL SELECT ts FROM changes"), "Sink(counted rows)");
+    // A window is emitted once and never retracted, so its sink stays an append sink.
+    assert_eq!(sinks("SELECT window_start, count(*) AS n FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL"), "Sink(append)");
+    let late = Circuit::compile(&def_for("SELECT window_start, count(*) AS n FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL", true).view());
+    assert!(late.unwrap_err().to_string().contains("late-data table"));
+    let (conn, sources) = super::setup();
+    let window_min = "SELECT window_start, min(amount) AS lo FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    assert!(crate::plan::compile(&conn, "v", window_min, &sources).unwrap_err().to_string().contains("count per value"));
+}

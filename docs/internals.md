@@ -35,8 +35,8 @@ Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model
 `__w`, +1 for Kafka), `Window`, `LateSplit`, `From` (the stream under the view's alias, joined with its lookup
 tables), `Filter` (`WHERE`, `HAVING`), `Map` (a select list), `Aggregate`, `Sink`. The frontend cuts the view
 into these pieces from DuckDB's parse tree, each kept as SQL text in the view's own names. An analysis
-marks which edges are append-only; a view whose operators assume append-only input (windowed partials, `MIN`/`MAX`,
-append sinks) is refused when that input can retract. `incrementalize`
+marks which edges are append-only; a view whose operators assume append-only input (append sinks, late-data
+tables) is refused when that input can retract. `incrementalize`
 wraps it as D ∘ Q ∘ I and pushes every integrator (I) forward until it meets a differentiator (D), the way
 Feldera's `OptimizeIncrementalVisitor` does:
 
@@ -51,6 +51,24 @@ epoch's transaction) and `commit_steps` (inside it). Linear operators fuse: a ch
 A global aggregate's output is its change as a Z-set, the touched groups' old rows with weight −1 and their
 new rows with +1; the upsert sink consolidates it, so a group whose row did not change cancels out. The
 engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+
+**Retractions (C1).** A source whose `SourceSchema::append_only` is false stages each row's weight, and every
+operator then sums weights instead of counting rows, choosing the weighted form only when the input can
+retract, as Feldera's `ExpandAggregates` does (Kafka views keep the cheaper partials):
+
+| Operator | Over a retracting source |
+| --- | --- |
+| Stateless view | sink `Counted`: one row per distinct row with its multiplicity in `_duckwake_count`; changes move the count, and a row whose count reaches 0 is deleted |
+| `DISTINCT` | the state sums weights; a row leaves with −1 when its weight returns to 0; sink `Upsert` by the whole row |
+| Global `count`, `sum`, `avg` | already weighted |
+| Global `MIN`/`MAX` | value rows in the state table (`__i` the aggregate, `__v<i>` the value, `__n` its count); the extreme is recomputed for the epoch's groups from the values still present |
+| Windowed `count`, `sum`, `avg` | partials `sum(__w)`, `sum(x * __w)` and a weighted non-NULL count; a window and group whose weight returns to 0 is not emitted |
+| Windowed `MIN`/`MAX` | refused for now |
+| Late-data table | refused for now: late rows would need their weights (C4) |
+
+A window is still emitted once, when it closes; a retraction into a closed window is a late row. The
+harness's `changes` source deletes and updates rows of the previous epoch and cancels rows within an epoch,
+and every view kind over it matches the batch query over the net rows after every epoch.
 
 The tests in `crates/circuit/src/tests/` run each view kind epoch by epoch through its circuit's own SQL,
 against an in-memory lake, and compare the view's table with the batch query after every epoch, with epochs
@@ -147,8 +165,8 @@ operator's semantics and a test oracle, not a dependency.
   epoch and commits all their offsets in one checkpoint row. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
   row is written the first time its count turns positive. `HAVING` in windowed views, `DISTINCT` over
   windows and aggregates, `DISTINCT ON`, `count(DISTINCT ...)`, `approx_count_distinct` and stream-stream
-  joins are rejected at create time. `min`/`max` in global aggregates and `DISTINCT` assume append-only
-  input, which holds while sources are Kafka topics; retracting inputs need weights through them (milestone 3).
+  joins are rejected at create time. Every operator handles retracting input (see Retractions above) except
+  `MIN`/`MAX` in windows and late-data tables; no source kind retracts yet.
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark

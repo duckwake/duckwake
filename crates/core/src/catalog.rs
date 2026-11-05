@@ -134,14 +134,15 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         plan,
     };
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
-    crate::circuit::Circuit::compile(&def.view())?;
+    let circuit = crate::circuit::Circuit::compile(&def.view())?;
     let sink = quote_table(&def.sink)?;
     let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
 
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&sink_schema)))?;
-        let mut cols: Vec<String> = def.plan.sink_columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+        let mut cols: Vec<String> =
+            def.plan.sink_columns.iter().chain(&circuit.sink_extra_columns()).map(|(c, t)| format!("{} {t}", ident(c))).collect();
         cols.push("_duckwake_epoch BIGINT".into());
         // The view owns its table: creating one over an existing table would mix in rows no epoch wrote.
         if table_exists(conn, &sink_schema, &sink_name)? {

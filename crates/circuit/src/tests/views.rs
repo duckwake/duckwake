@@ -90,3 +90,69 @@ fn global_without_group_by() {
     check_view(sql, &EPOCHS, false);
     check_view(sql, &EPOCHS, true);
 }
+
+#[test]
+fn stateless_over_retractions() {
+    // A counted sink: each row with its multiplicity.
+    check_view("SELECT * FROM changes WHERE amount > 5", &EPOCHS, false);
+    check_view("SELECT c.ts, g.studio, c.amount FROM changes c JOIN games g ON g.game_id = c.game_id", &EPOCHS, true);
+    // Few distinct rows, so most counts are above 1 and go up and down.
+    check_view("SELECT game_id, user_id FROM changes", &EPOCHS, true);
+}
+
+#[test]
+fn distinct_over_retractions() {
+    // Rows leave the table when their last copy is deleted or updated away.
+    let sql = "SELECT DISTINCT game_id, user_id FROM changes WHERE amount > 2";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn global_over_retractions() {
+    let sql = "SELECT game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS total, avg(amount) AS mean
+               FROM changes GROUP BY ALL HAVING count(*) > 3";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view("SELECT count(*) AS n, sum(amount) AS s FROM changes WHERE amount > 5", &EPOCHS, true);
+}
+
+#[test]
+fn union_with_a_retracting_branch() {
+    let sql = "SELECT ts, game_id, amount AS value FROM changes WHERE amount > 4 UNION ALL SELECT ts, game_id, price FROM purchases";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn windowed_over_retractions() {
+    // Weighted partials; a window and group whose rows are all retracted has no row.
+    let tumble = "SELECT window_start, game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS revenue,
+                         avg(amount) AS mean
+                  FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(tumble, &EPOCHS, false);
+    check_view(tumble, &EPOCHS, true);
+    check_view(
+        "SELECT c.window_end, g.studio, user_id, count(*) AS n, sum(c.amount) AS s
+         FROM HOP(changes, ts, INTERVAL 1 MINUTE, INTERVAL 20 SECOND) c JOIN games g ON g.game_id = c.game_id
+         WHERE c.amount > 3 GROUP BY ALL",
+        &EPOCHS,
+        true,
+    );
+}
+
+#[test]
+fn global_min_max_over_retractions() {
+    // A group's extreme is deleted or updated away: the next value still present takes its place, and NULL
+    // once none is left. Two MINs and a MAX over different arguments share the value rows.
+    let sql = "SELECT game_id, min(amount) AS lo, max(amount) AS hi, min(user_id) AS first_user, count(*) AS n
+               FROM changes GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view("SELECT max(amount) AS hi, min(ts) AS first_ts FROM changes WHERE amount > 3", &EPOCHS, true);
+    check_view(
+        "SELECT g.studio, user_id, max(c.amount) AS top FROM changes c JOIN games g ON g.game_id = c.game_id GROUP BY ALL HAVING count(*) > 2",
+        &EPOCHS,
+        true,
+    );
+}
