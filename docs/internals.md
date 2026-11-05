@@ -148,6 +148,24 @@ operator's semantics and a test oracle, not a dependency.
    bench's commit p50 from 321–329 ms to 382 ms (the COMMIT call from 82 to 113 ms): writing them into the
    Postgres catalog costs more than one local Parquet file. They keep the default, and maintenance merges
    their files.
+9. **Reading a table's change feed by snapshot position is exact** (spike F0,
+   `crates/core/examples/phase_f0_change_feed.rs`, Postgres catalog, one machine). What views over lake
+   tables rely on:
+   - With 4 writers committing 600 inserts concurrently (12s, inlined and file-backed), a reader that read
+     `ducklake_table_changes` over (P, newest] about every 125 ms saw all 12,240 inserts exactly once, and
+     the visible snapshot ids had no gap at any of 97 polls: an id is taken as the catalog's max + 1 under
+     its primary key, so N + 1 is never visible before N.
+   - `ducklake_current_snapshot('lake')` returns the newest snapshot another process committed, in 6–8 ms.
+     `max(snapshot_id)` over `ducklake_snapshots` takes 20–38 ms and grows with the snapshot count.
+   - Paging a table at an old snapshot by `rowid` (`AT (VERSION => s) WHERE rowid > r ORDER BY rowid LIMIT
+     n`) returns exactly that version after later deletes, updates and inserts. The `rowid` filter is
+     pushed into the scan, and every page of 200k rows takes 40–65 ms.
+   - One snapshot's changes cost 45–55 ms warm whatever the table's file count (10 to 1000 files), against
+     16–20 ms for a full scan of 100k–1M rows: a fixed cost of catalog round trips, not file reads. Cold, and
+     on a table with 30 deletes, it was 150–170 ms. Every lake input of every view pays it each epoch, so
+     views reading the same table should read its range once (F4).
+   - `snapshot_time` never ran backwards against snapshot ids (0 of 599 pairs). Writers on other machines
+     may still disagree on the clock, so the change time stays a running maximum.
 
 ## Simplifications and gaps
 
