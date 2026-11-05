@@ -1,11 +1,11 @@
 //! The compiled plan as Q, a graph of operators over whole collections.
 use crate::ir::{Circuit, Port, View};
-use crate::ops::{Aggregate, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Window};
+use crate::ops::{Aggregate, Distinct, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Window};
 
 impl Circuit {
     /// Q: the view as a query over whole collections, built from the compiled plan.
     ///
-    /// - stateless: Source → From → Filter → Map → Sink(append)
+    /// - stateless: Source → From → Filter → Map → Sink(append), with a Distinct before the sink for DISTINCT
     /// - windowed: Source → Window → LateSplit → From → Filter → Map → Aggregate → Sink(append), late rows to
     ///   Sink(late data)
     /// - global aggregate: Source → From → Filter → Map → Aggregate → Filter(HAVING) → Map → Sink(upsert)
@@ -45,6 +45,9 @@ impl Circuit {
             last = c.add(Op::Map(Map { label: "select".into(), items }), vec![last]);
             c.add(Op::Sink(Sink { kind: SinkKind::Upsert }), vec![last]);
         } else {
+            if plan.distinct {
+                last = c.add(Op::Distinct(Distinct), vec![last]);
+            }
             c.add(Op::Sink(Sink { kind: SinkKind::Append }), vec![last]);
         }
         c.analyze();

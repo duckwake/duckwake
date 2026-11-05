@@ -61,8 +61,8 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
 
     let earliest = rt.block_on(kafka::earliest_offsets(&src.options))?;
     let truncated = earliest.values().any(|&o| o > 0);
-    if truncated && plan.is_global() {
-        bail!("retention has deleted the oldest events of {:?}, and an aggregate view depends on all of them", src.options.topic);
+    if truncated && plan.needs_whole_topic() {
+        bail!("retention has deleted the oldest events of {:?}, and a {} view depends on all of them", src.options.topic, plan.kind_name());
     }
 
     // Snapshot the lake side in one transaction so checkpoint, sink, late rows and state agree.

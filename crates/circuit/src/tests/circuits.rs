@@ -64,6 +64,7 @@ fn retracting_input_is_refused_where_an_operator_assumes_append_only() {
         "SELECT window_start, game_id, count(*) AS n FROM TUMBLE(clicks, ts, INTERVAL 10 SECOND) GROUP BY ALL",
         "SELECT game_id, min(amount) AS lo FROM clicks GROUP BY ALL",
         "SELECT ts, amount FROM clicks",
+        "SELECT DISTINCT game_id FROM clicks",
     ];
     let allowed = ["SELECT game_id, count(*) AS n, sum(amount) AS s, avg(amount) AS a FROM clicks GROUP BY ALL"];
     for sql in refused.iter().chain(&allowed) {

@@ -5,10 +5,11 @@
 //! rules look only at `class()` and the engine runs only steps, so neither changes.
 mod aggregate;
 mod differentiate;
-mod integrate;
-mod late_split;
+mod distinct;
 mod filter;
 mod from;
+mod integrate;
+mod late_split;
 mod map;
 mod sink;
 mod source;
@@ -16,6 +17,7 @@ mod window;
 
 pub use aggregate::{Aggregate, Grouping};
 pub use differentiate::Differentiate;
+pub use distinct::Distinct;
 pub use filter::Filter;
 pub use from::From;
 pub use integrate::Integrate;
@@ -88,6 +90,7 @@ pub enum Op {
     Filter(Filter),
     Map(Map),
     Aggregate(Aggregate),
+    Distinct(Distinct),
     Sink(Sink),
     Integrate(Integrate),
     Differentiate(Differentiate),
@@ -106,6 +109,7 @@ macro_rules! dispatch {
             Op::Filter($o) => $e,
             Op::Map($o) => $e,
             Op::Aggregate($o) => $e,
+            Op::Distinct($o) => $e,
             Op::Sink($o) => $e,
             Op::Integrate($o) => $e,
             Op::Differentiate($o) => $e,

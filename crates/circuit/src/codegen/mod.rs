@@ -159,9 +159,9 @@ pub fn staging(name: &str, key: &str) -> String {
 pub enum Counter {
     /// Late rows routed to the late-data table.
     Late,
-    /// Rows the commit would write from staging: partials, touched groups, or sink rows.
+    /// Rows a stateful operator merges into its state: windowed partials, touched groups or rows.
     Staged,
-    /// Groups whose row in an upsert sink changes.
+    /// Rows the view's table changes by: an append sink's rows, an upsert sink's changed groups.
     Changed,
 }
 

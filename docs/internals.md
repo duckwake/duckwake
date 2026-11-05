@@ -130,9 +130,11 @@ operator's semantics and a test oracle, not a dependency.
 - **Operators.** Filter, project and lookup joins (any lake table in `FROM`; a lookup table is read whole each
   epoch, so a change to it reaches only rows that arrive later). TUMBLE/HOP windows and
   global `GROUP BY` (with `HAVING` and expressions over aggregates) with `count`, `sum`, `min`, `max`
-  and `avg`. `HAVING` in windowed views, `DISTINCT`, `approx_count_distinct` and stream-stream joins
-  are rejected at create time. `min`/`max` in global aggregates assume append-only input, which holds
-  while sources are Kafka topics; retracting inputs need value counts (milestone 3).
+  and `avg`. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
+  row is written the first time its count turns positive. `HAVING` in windowed views, `DISTINCT` over
+  windows and aggregates, `DISTINCT ON`, `count(DISTINCT ...)`, `approx_count_distinct` and stream-stream
+  joins are rejected at create time. `min`/`max` in global aggregates and `DISTINCT` assume append-only
+  input, which holds while sources are Kafka topics; retracting inputs need weights through them (milestone 3).
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark

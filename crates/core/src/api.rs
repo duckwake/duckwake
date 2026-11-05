@@ -48,6 +48,7 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
     let kind = match def.plan.kind_name() {
         "windowed" => "windowed aggregate, append sink",
         "aggregate" => "global aggregate, upsert sink",
+        "distinct" => "distinct, append sink",
         _ => "stateless, append sink",
     };
     let msg = format!("view {}: {kind}, table {}", def.job_id, def.sink);

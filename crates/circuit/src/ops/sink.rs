@@ -61,7 +61,7 @@ impl Operator for Sink {
             // The epoch's rows, written at commit. A windowed aggregate writes closed windows itself.
             SinkKind::Append if !cx.emits_final => {
                 let out = staging("out", &cx.set);
-                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {out} AS {}", inputs[0].query())).counting(Counter::Staged, &out));
+                cx.steps.push(Step::stage(format!("CREATE OR REPLACE TABLE {out} AS {}", inputs[0].query())).counting(Counter::Changed, &out));
             }
             SinkKind::Append | SinkKind::Late => {}
         }
@@ -82,7 +82,7 @@ impl Operator for Sink {
             SinkKind::Append if cx.emits_final => {}
             SinkKind::Append => {
                 let sql = format!("INSERT INTO {} ({}) SELECT *, {} FROM {}", x.sink, cx.sink_cols(), x.epoch, staging("out", &cx.set));
-                steps.push(Step::commit(sql, Cost::Sink).skip_if_none(Counter::Staged).output_rows().crash_after());
+                steps.push(Step::commit(sql, Cost::Sink).skip_if_none(Counter::Changed).output_rows().crash_after());
             }
             SinkKind::Late => {
                 let Some(late) = &x.late_table else { return Ok(steps) };

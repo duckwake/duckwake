@@ -30,6 +30,7 @@ remote "CALL duckwake_create_view('analytics.big_spend', 'SELECT ts, game_id, us
 remote "CALL duckwake_create_view('analytics.game_totals',
   'SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
    FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5', epoch_interval := '2s')"
+remote "CALL duckwake_create_view('analytics.active_users', 'SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50', epoch_interval := '2s')"
 for v in "${VIEWS[@]}"; do remote "CALL duckwake_start('$v')"; done
 
 log "produce $((RATE * DURATION)) events at $RATE/s"

@@ -57,6 +57,9 @@ pub struct Plan {
     /// Windowed only: the partial aggregates over the aggregate's input, named like `merge_ops`.
     #[serde(default)]
     pub partials: Vec<String>,
+    /// `SELECT DISTINCT`: the state counts each distinct row, in `state_columns` (the view's columns and `__cnt`).
+    #[serde(default)]
+    pub distinct: bool,
     /// The view in pieces, which the operator graph is built from.
     #[serde(default)]
     pub query: Query,
@@ -161,7 +164,12 @@ impl Plan {
 
     /// Whether the plan keeps a state table in `__duckwake`.
     pub fn has_state(&self) -> bool {
-        self.is_windowed() || self.is_global()
+        self.is_windowed() || self.is_global() || self.distinct
+    }
+
+    /// Whether the view's state depends on every event of its topic, so retention's deletes break it.
+    pub fn needs_whole_topic(&self) -> bool {
+        self.is_global() || self.distinct
     }
 
     pub fn sink_mode(&self) -> SinkMode {
@@ -173,6 +181,8 @@ impl Plan {
             "windowed"
         } else if self.is_global() {
             "aggregate"
+        } else if self.distinct {
+            "distinct"
         } else {
             "stateless"
         }
@@ -504,6 +514,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         merge_ops: vec![],
         final_select: String::new(),
         partials: vec![],
+        distinct: false,
         query,
         global: None,
     };
@@ -512,12 +523,19 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     let has_group = node["aggregate_handling"] == "FORCE_AGGREGATES"
         || node["group_expressions"].as_array().is_some_and(|g| !g.is_empty());
     let has_agg = node["select_list"].as_array().unwrap().iter().any(|e| contains_fn(e, &aggs));
+    plan.distinct = node["modifiers"].as_array().is_some_and(|m| m.iter().any(|m| m["type"] == "DISTINCT_MODIFIER"));
+    if plan.distinct && (plan.window.is_some() || has_group || has_agg || !node["having"].is_null()) {
+        bail!("SELECT DISTINCT is supported over plain views; over windows and aggregates it is not supported yet");
+    }
     if plan.window.is_none() {
         if has_group || has_agg || !node["having"].is_null() {
             compile_global(conn, job, &mut stmt, &stream.alias, &aggs, &mut plan)?;
             return Ok(plan);
         }
         plan.query.project = vec![list_sql(conn, &node["select_list"])?];
+        if plan.distinct {
+            plan.state_columns = plan.sink_columns.iter().cloned().chain([("__cnt".to_string(), "BIGINT".to_string())]).collect();
+        }
         return Ok(plan);
     }
     if !node["having"].is_null() {
@@ -898,10 +916,12 @@ struct StreamRef {
 }
 
 fn reject_unsupported(node: &Value) -> Result<()> {
-    if let Some(m) = node["modifiers"].as_array().and_then(|m| m.first()) {
+    // Plain DISTINCT is supported (see `compile`); DISTINCT ON is not.
+    let plain_distinct = |m: &Value| m["type"] == "DISTINCT_MODIFIER" && m["distinct_on_targets"].as_array().is_none_or(|t| t.is_empty());
+    if let Some(m) = node["modifiers"].as_array().and_then(|m| m.iter().find(|m| !plain_distinct(m))) {
         let what = match m["type"].as_str().unwrap_or("") {
             "ORDER_MODIFIER" => "ORDER BY",
-            "DISTINCT_MODIFIER" => "DISTINCT",
+            "DISTINCT_MODIFIER" => "DISTINCT ON",
             "LIMIT_MODIFIER" | "LIMIT_PERCENT_MODIFIER" => "LIMIT",
             other => other,
         };
@@ -1203,7 +1223,8 @@ mod tests {
     fn rejections() {
         assert!(err("SELECT * FROM clicks ORDER BY ts").contains("ORDER BY"));
         assert!(err("SELECT * FROM clicks LIMIT 5").contains("LIMIT"));
-        assert!(err("SELECT DISTINCT game_id FROM clicks").contains("DISTINCT"));
+        assert!(err("SELECT DISTINCT ON (game_id) * FROM clicks").contains("DISTINCT ON"));
+        assert!(err("SELECT DISTINCT game_id, count(*) FROM clicks GROUP BY ALL").contains("DISTINCT"));
         assert!(err("SELECT ts, row_number() OVER () FROM clicks").contains("window functions"));
         assert!(err("SELECT window_start, approx_count_distinct(user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("not supported in v1"));
         assert!(err("SELECT window_start, count(DISTINCT user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("DISTINCT"));

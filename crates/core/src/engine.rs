@@ -123,10 +123,9 @@ struct Staged {
     rows_dead: i64,
     rows_late: i64,
     rows_out: i64,
-    /// Rows the commit would write from staging: windowed partials, global-aggregate touched groups, or
-    /// stateless sink rows.
+    /// Rows stateful operators merge into their state: windowed partials, touched groups or distinct rows.
     rows_staged: i64,
-    /// Global aggregates: groups whose sink row changes.
+    /// Rows the view's table changes by: rows appended, or groups of an upsert sink.
     rows_changed: i64,
     /// Windowed: whether a window closes this epoch, and the open window ends after it (with `lean_commit`).
     closes: bool,

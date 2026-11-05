@@ -9,7 +9,7 @@ OUT=${OUT:-.lake/run}
 TEST_DB=${TEST_DB:-duckwake_test}
 export DUCKWAKE_CATALOG="postgres:dbname=$TEST_DB host=localhost port=55432 user=lake password=lake"
 export DUCKWAKE_DATA_PATH=".lake/test/data/"
-VIEWS=(clicks_per_window big_spend game_totals)
+VIEWS=(clicks_per_window big_spend game_totals active_users)
 # How the source decodes JSON: auto (Arrow where the column types allow), arrow or sql.
 export DECODE=${DECODE:-auto}
 # Extra flags for every worker the tests start, e.g. "--stage-threads 4 --pipeline --shared-readers".
@@ -49,6 +49,9 @@ setup_views() {
   "$BIN" create-view analytics.game_totals --epoch-interval "$epoch" \
     --sql "SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
            FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5" | head -1
+  # DISTINCT: each pair once, the first time it is seen.
+  "$BIN" create-view analytics.active_users --epoch-interval "$epoch" \
+    --sql "SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50" | head -1
 }
 
 start_views() {

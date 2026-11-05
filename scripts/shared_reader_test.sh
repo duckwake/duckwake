@@ -11,7 +11,7 @@ WORKER_FLAGS=${WORKER_FLAGS:---pipeline --stage-threads 4}
 log "reset lake and topic"; reset_env
 log "create source and views"; setup_views 2s "10 SECOND" "5 seconds" >/dev/null
 "$BIN" stop game_totals >/dev/null
-for v in clicks_per_window big_spend; do "$BIN" start "$v" --worker w1 >/dev/null; done
+for v in clicks_per_window big_spend active_users; do "$BIN" start "$v" --worker w1 >/dev/null; done
 "$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!

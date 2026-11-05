@@ -14,6 +14,15 @@ fn stateless() {
 }
 
 #[test]
+fn distinct() {
+    let sql = "SELECT DISTINCT game_id, user_id FROM clicks WHERE amount > 2";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    // NULL keys, and rows that repeat within an epoch and across epochs.
+    check_view("SELECT DISTINCT g.studio, c.amount FROM clicks c LEFT JOIN games g ON g.game_id = c.game_id", &EPOCHS, true);
+}
+
+#[test]
 fn windowed() {
     let tumble = "SELECT window_start, game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS revenue,
                          avg(amount) AS mean, min(amount) AS lo, max(ts) AS last_ts
