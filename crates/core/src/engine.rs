@@ -254,6 +254,7 @@ fn crash_point(point: &str) {
 pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> Result<()> {
     let conn = cfg.lake.open()?;
     crate::lake::bootstrap(&conn)?;
+    catalog::set_control_inlining(&conn)?;
     if let Some(m) = &cfg.metrics {
         m.set_worker(&cfg.worker_id);
         m.set_up(true);
