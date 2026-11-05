@@ -1,19 +1,28 @@
 //! Runs a view epoch by epoch through its circuit's own SQL against an in-memory lake, and checks the view's
 //! table against the view run as one batch query over every row so far: QΔ = D ∘ Q ∘ I, end to end.
 use super::{setup, SINK};
-use crate::codegen::{staging, EpochCtx};
+use crate::codegen::{staging, EpochCtx, SourceInput};
 use crate::plan;
 use crate::sql::{ident, quote_table, state_table};
 use crate::{Circuit, View};
 
-/// Rows `from..to` of the test stream: one per second of event time, with NULLs in some columns.
-fn rows(from: i64, to: i64) -> String {
-    format!(
-        "SELECT i AS _offset, TIMESTAMP '2026-01-01' + to_seconds(i) AS ts,
-                CASE WHEN i % 17 = 0 THEN NULL ELSE 'g' || (i * 7 % 5) END AS game_id, 'u' || (i % 9) AS user_id,
-                CASE WHEN i % 11 = 0 THEN NULL ELSE ((i * 37) % 13)::DECIMAL(18,2) END AS amount
-         FROM range({from}, {to}) t(i)"
-    )
+/// Rows `from..to` of a test source: one per second of event time, with NULLs in some columns. `purchases`
+/// has other values than `clicks`, under `price`.
+fn rows(source: &str, from: i64, to: i64) -> String {
+    match source {
+        "purchases" => format!(
+            "SELECT i AS _offset, TIMESTAMP '2026-01-01' + to_seconds(i) AS ts,
+                    'g' || (i * 3 % 4) AS game_id, 'u' || (i % 5) AS user_id,
+                    CASE WHEN i % 7 = 0 THEN NULL ELSE ((i * 11) % 17)::DECIMAL(18,2) END AS price
+             FROM range({from}, {to}) t(i)"
+        ),
+        _ => format!(
+            "SELECT i AS _offset, TIMESTAMP '2026-01-01' + to_seconds(i) AS ts,
+                    CASE WHEN i % 17 = 0 THEN NULL ELSE 'g' || (i * 7 % 5) END AS game_id, 'u' || (i % 9) AS user_id,
+                    CASE WHEN i % 11 = 0 THEN NULL ELSE ((i * 37) % 13)::DECIMAL(18,2) END AS amount
+             FROM range({from}, {to}) t(i)"
+        ),
+    }
 }
 
 /// Runs `sql` over `epochs` (ranges of rows) and checks the view's table after every epoch; a windowed view's
@@ -24,18 +33,22 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
     let (c, sources) = setup();
     c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
     let p = plan::compile(&c, "v", sql, &sources).unwrap();
-    let cols = sources["clicks"].columns.clone();
+    let names_of = p.sources();
+    let cols: Vec<Vec<(String, String)>> = names_of.iter().map(|n| sources[n].columns.clone()).collect();
     let names = |cs: &[(String, String)]| cs.iter().map(|(n, _)| ident(n)).collect::<Vec<_>>().join(", ");
     let typed = |cs: &[(String, String)]| cs.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect::<Vec<_>>().join(", ");
     c.execute_batch(&format!(
         "ATTACH ':memory:' AS lake; CREATE SCHEMA lake.__duckwake; CREATE SCHEMA lake.analytics;
-         CREATE TABLE {} ({}, _duckwake_epoch BIGINT);
-         CREATE TABLE memory.main.seen ({});",
+         CREATE TABLE {} ({}, _duckwake_epoch BIGINT);",
         quote_table(SINK).unwrap(),
         typed(&p.sink_columns),
-        typed(&cols)
     ))
     .unwrap();
+    // The rows each source has committed so far.
+    let seen = |k: usize| format!("memory.main.seen_{k}");
+    for (k, cs) in cols.iter().enumerate() {
+        c.execute_batch(&format!("CREATE TABLE {} ({})", seen(k), typed(cs))).unwrap();
+    }
     if !p.state_columns.is_empty() {
         c.execute_batch(&format!("CREATE TABLE {} ({})", state_table("v"), typed(&p.state_columns))).unwrap();
     }
@@ -54,8 +67,12 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
         plan: &p,
         sink: quote_table(SINK).unwrap(),
         late_table: None,
-        source_columns: &cols,
-        typed: staging("typed", "g0"),
+        sources: names_of
+            .iter()
+            .zip(&cols)
+            .enumerate()
+            .map(|(k, (name, columns))| SourceInput { name, columns, typed: staging("typed", &format!("g{k}")) })
+            .collect(),
         parity: e as u64 % 2,
         overlay: (pipelined && e > 0).then(|| (e as u64 - 1) % 2),
         prev_watermark: if e == 0 { "NULL".into() } else { watermark(e - 1) },
@@ -70,22 +87,30 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
     let commit = |e: usize| {
         run(circuit.commit_steps(&ctx(e)).unwrap().into_iter().map(|s| s.sql).collect());
         let (from, to) = epochs[e];
-        c.execute_batch(&format!("INSERT INTO memory.main.seen SELECT {} FROM ({})", names(&cols), rows(from, to))).unwrap();
+        for (k, name) in names_of.iter().enumerate() {
+            c.execute_batch(&format!("INSERT INTO {} SELECT {} FROM ({})", seen(k), names(&cols[k]), rows(name, from, to))).unwrap();
+        }
     };
     let check = |committed: usize| {
         if windowed && committed < epochs.len() {
             return;
         }
-        let input = if windowed {
-            format!("SELECT {}, window_start, window_end, 1::INTEGER AS __w FROM ({})", names(&cols), p.window_sql("memory.main.seen"))
+        // Each staging table the batch query reads, filled with its source's rows.
+        let inputs: Vec<(String, &str)> = if p.union.is_empty() {
+            vec![(p.input_table.clone(), p.source.as_str())]
         } else {
-            format!("SELECT *, 1::INTEGER AS __w FROM memory.main.seen")
+            p.union.iter().map(|b| (b.input_table.clone(), b.source.as_str())).collect()
         };
-        c.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {} AS {input}; CREATE OR REPLACE TABLE memory.main.expected AS {};",
-            p.input_table, p.batch_sql
-        ))
-        .unwrap();
+        for (table, source) in inputs {
+            let k = names_of.iter().position(|n| n == source).unwrap();
+            let input = if windowed {
+                format!("SELECT {}, window_start, window_end, 1::INTEGER AS __w FROM ({})", names(&cols[k]), p.window_sql(&seen(k)))
+            } else {
+                format!("SELECT *, 1::INTEGER AS __w FROM {}", seen(k))
+            };
+            c.execute_batch(&format!("CREATE OR REPLACE TABLE {table} AS {input}")).unwrap();
+        }
+        c.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.expected AS {}", p.batch_sql)).unwrap();
         // DOUBLE results (avg) to 9 decimals: merged partials add in another order than one batch query.
         let cols: Vec<String> = p
             .sink_columns
@@ -111,13 +136,15 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
             commit(e - 1);
         }
         let (from, to) = epochs[e];
-        c.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {} AS SELECT 0::INTEGER AS _partition, _offset, {}, NULL::VARCHAR AS _err FROM ({})",
-            staging("typed", "g0"),
-            names(&cols),
-            rows(from, to)
-        ))
-        .unwrap();
+        for (k, name) in names_of.iter().enumerate() {
+            c.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT 0::INTEGER AS _partition, _offset, {}, NULL::VARCHAR AS _err FROM ({})",
+                staging("typed", &format!("g{k}")),
+                names(&cols[k]),
+                rows(name, from, to)
+            ))
+            .unwrap();
+        }
         run(circuit.stage_steps(&ctx(e)).unwrap().into_iter().map(|s| s.sql).collect());
         if !pipelined {
             commit(e);

@@ -111,7 +111,12 @@ pub fn sources_sql() -> String {
 /// The view's circuit: the query, how it was made incremental, and the SQL of one epoch.
 pub fn explain(conn: &Connection, name: &str) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    let (def, mut sources) = catalog::load_compiled(conn, &job)?;
-    let source = sources.remove(&def.plan.source).ok_or_else(|| anyhow!("source of {job} is gone"))?;
-    crate::circuit::explain(def.view(), &source.options.columns)
+    let (def, sources) = catalog::load_compiled(conn, &job)?;
+    let columns: Vec<(String, Vec<(String, String)>)> = def
+        .plan
+        .sources()
+        .into_iter()
+        .map(|n| Ok((n.clone(), sources.get(&n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))?.options.columns.clone())))
+        .collect::<Result<_>>()?;
+    crate::circuit::explain(def.view(), &columns)
 }

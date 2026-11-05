@@ -443,7 +443,7 @@ pub fn drop_source(conn: &Connection, name: &str) -> Result<()> {
     for row in rows {
         let (job, def) = row?;
         let def: JobDef = serde_json::from_str(&def)?;
-        if def.plan.source == name {
+        if def.plan.sources().iter().any(|s| s == name) {
             bail!("view {job:?} reads from {name:?}; drop it first");
         }
     }

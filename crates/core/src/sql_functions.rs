@@ -462,20 +462,26 @@ impl Spec for Wait {
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
         let timeout = std::time::Duration::from_secs(a.opt_num("timeout_s")?.unwrap_or(60));
-        let (job, source) = api.with(|c| {
+        let (job, sources) = api.with(|c| {
             let job = crate::catalog::resolve_view(c, a.arg(0))?;
             let (def, _) = crate::catalog::load_job(c, &job)?;
-            let source = crate::catalog::load_sources(c)?.remove(&def.plan.source).ok_or_else(|| anyhow!("source of {job} is gone"))?;
-            Ok((job, source))
+            let mut all = crate::catalog::load_sources(c)?;
+            let sources = def.plan.sources().iter().map(|n| all.remove(n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))).collect::<Result<Vec<_>>>()?;
+            Ok((job, sources))
         })?;
-        let end = api.rt.block_on(crate::kafka::latest_offsets(&source.options))?;
+        // Every source's end now; caught up once one checkpoint covers all of them.
+        let ends = sources.iter().map(|s| Ok((s.name.clone(), api.rt.block_on(crate::kafka::latest_offsets(&s.options))?))).collect::<Result<Vec<_>>>()?;
         let t = std::time::Instant::now();
         loop {
-            let ckpt = api.with(|c| crate::catalog::latest_checkpoint(c, &job, &source.name))?;
-            if let Some(ck) = &ckpt {
-                if end.iter().all(|(p, o)| ck.offsets.get(p).is_some_and(|c| c >= o)) {
-                    return one(&job, format!("{job}: caught up at epoch {}", ck.epoch));
-                }
+            let mut ckpt = None;
+            let mut done = true;
+            for (name, end) in &ends {
+                let ck = api.with(|c| crate::catalog::latest_checkpoint(c, &job, name))?;
+                done &= ck.as_ref().is_some_and(|ck| end.iter().all(|(p, o)| ck.offsets.get(p).is_some_and(|c| c >= o)));
+                ckpt = ck;
+            }
+            if done {
+                return one(&job, format!("{job}: caught up at epoch {}", ckpt.map_or(0, |c| c.epoch)));
             }
             if t.elapsed() > timeout {
                 bail!("duckwake_wait: {job} did not catch up within {}s (at epoch {})", timeout.as_secs(), ckpt.map_or(0, |c| c.epoch));

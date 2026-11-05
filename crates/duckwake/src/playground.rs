@@ -374,7 +374,7 @@ async fn state(State(app): State<Shared>) -> ApiResult {
                 v.insert("sql".into(), json!(def.sql));
                 v.insert("sink".into(), json!(def.sink));
                 v.insert("late_data".into(), json!(def.late_data));
-                v.insert("source".into(), json!(def.plan.source));
+                v.insert("source".into(), json!(def.plan.sources().join(", ")));
                 v.insert("epoch_interval".into(), json!(def.epoch_interval));
                 v.insert("kind".into(), json!(def.plan.kind_name()));
                 v.insert("explain".into(), json!(duckwake_core::api::explain(conn, &def.job_id).unwrap_or_else(|e| format!("{e:#}"))));

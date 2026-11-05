@@ -11,7 +11,7 @@ log "reset lake and topic"; reset_env
 log "create source and views"; setup_views "${EPOCH:-2s}" "10 SECOND" "5 seconds"; start_views w1
 
 log "produce $((RATE * DURATION)) events at $RATE/s (every 997th 5 min late, every 1499th malformed)"
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
+produce --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 

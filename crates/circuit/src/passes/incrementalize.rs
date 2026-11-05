@@ -35,10 +35,13 @@ impl Circuit {
                 if dead[n] || self.nodes[n].inputs.is_empty() {
                     continue;
                 }
-                let input = self.nodes[n].inputs[0];
-                if self.nodes[input.node].op != Op::Integrate(Integrate) {
+                // Every input must be integrated: for an operator of several inputs, such as Union, the rules
+                // hold only then (Feldera's DBSPSumOperator).
+                let inputs = self.nodes[n].inputs.clone();
+                if !inputs.iter().all(|p| self.nodes[p.node].op == Op::Integrate(Integrate)) {
                     continue;
                 }
+                let input = inputs[0];
                 let op = self.nodes[n].op.clone();
                 let rule = match op.class() {
                     // D ∘ I = id.
@@ -59,7 +62,7 @@ impl Circuit {
                     _ => continue,
                 };
                 if op != Op::Differentiate(Differentiate) {
-                    self.nodes[n].inputs[0] = self.nodes[input.node].inputs[0];
+                    self.nodes[n].inputs = inputs.iter().map(|p| self.nodes[p.node].inputs[0]).collect();
                     for port in 0..op.outputs() {
                         let out = Port { node: n, port };
                         let i = self.add(Op::Integrate(Integrate), vec![out]);
@@ -67,8 +70,10 @@ impl Circuit {
                         self.redirect(out, i, Some(i.node), &dead);
                     }
                 }
-                if self.readers(input, &dead).is_empty() {
-                    dead[input.node] = true;
+                for p in &inputs {
+                    if self.readers(*p, &dead).is_empty() {
+                        dead[p.node] = true;
+                    }
                 }
                 trace.push(rule);
                 changed = true;

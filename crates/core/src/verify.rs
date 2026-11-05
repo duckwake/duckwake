@@ -11,7 +11,7 @@
 //! job had seen by then). Global aggregates fold in all history, so they need the whole topic.
 use crate::catalog::{self, state_table};
 use crate::kafka;
-use crate::lake::{ident, quote_table, CTL};
+use crate::lake::{ident, lit, quote_table, CTL};
 use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
@@ -53,37 +53,42 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::load_sources(conn)?;
-    let src = &sources[&def.plan.source];
     let plan = crate::plan::compile(conn, job, &def.sql, &sources)?;
     if plan.is_windowed() && def.late_data.is_none() {
         bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
     }
+    // The view's sources, the first holding a windowed view's only stream.
+    let names = plan.sources();
+    let srcs = names.iter().map(|n| sources.get(n).with_context(|| format!("source {n} is gone"))).collect::<Result<Vec<_>>>()?;
 
-    let earliest = rt.block_on(kafka::earliest_offsets(&src.options))?;
-    let truncated = earliest.values().any(|&o| o > 0);
+    let earliest = srcs.iter().map(|s| rt.block_on(kafka::earliest_offsets(&s.options))).collect::<Result<Vec<_>>>()?;
+    let truncated = earliest.iter().any(|e| e.values().any(|&o| o > 0));
     if truncated && plan.needs_whole_topic() {
-        bail!("retention has deleted the oldest events of {:?}, and a {} view depends on all of them", src.options.topic, plan.kind_name());
+        let topics: Vec<&str> = srcs.iter().map(|s| s.options.topic.as_str()).collect();
+        bail!("retention has deleted the oldest events of {topics:?}, and a {} view depends on all of them", plan.kind_name());
     }
 
     // Snapshot the lake side in one transaction so checkpoint, sink, late rows and state agree.
     conn.execute_batch("BEGIN")?;
-    let ckpt = catalog::latest_checkpoint(conn, job, &src.name)?.context("job has no checkpoint yet")?;
+    let ckpt = catalog::latest_checkpoint(conn, job, &names[0])?.context("job has no checkpoint yet")?;
+    // Every source's offsets in that checkpoint row (and in each older one: they are the same rows).
+    let ends: Vec<_> = names.iter().map(|n| Ok(catalog::latest_checkpoint(conn, job, n)?.unwrap_or_default().offsets)).collect::<Result<_>>()?;
     let (base, sink_filter) = if truncated {
-        let all = catalog::all_checkpoints(conn, job, &src.name)?;
-        let retained = |c: &catalog::Checkpoint| {
-            earliest.iter().all(|(p, &e)| c.offsets.get(p).copied().unwrap_or(0) >= e)
+        let all = names.iter().map(|n| catalog::all_checkpoints(conn, job, n)).collect::<Result<Vec<_>>>()?;
+        let retained = |i: usize| {
+            all.iter().zip(&earliest).all(|(cs, e)| e.iter().all(|(p, &o)| cs[i].offsets.get(p).copied().unwrap_or(0) >= o))
         };
-        let base = all.iter().find(|c| retained(c)).cloned().with_context(|| {
-            format!("no checkpoint left starts inside the retained range of {:?} (earliest offsets {earliest:?})", src.options.topic)
+        let i = (0..all[0].len()).find(|&i| retained(i)).with_context(|| {
+            format!("no checkpoint left starts inside the retained range of the view's topics (earliest offsets {earliest:?})")
         })?;
         let filter = if plan.is_windowed() {
-            // Every event read up to `base` has an event time at or before this bound.
-            let bound = all.iter().filter(|c| c.epoch <= base.epoch).filter_map(|c| c.max_event_time_us).max();
+            // Every event read up to the base checkpoint has an event time at or before this bound.
+            let bound = all[0].iter().filter(|c| c.epoch <= all[0][i].epoch).filter_map(|c| c.max_event_time_us).max();
             bound.map(|b| format!("window_start > make_timestamp({b})")).unwrap_or("true".into())
         } else {
-            format!("_duckwake_epoch > {}", base.epoch)
+            format!("_duckwake_epoch > {}", all[0][i].epoch)
         };
-        (Some(base), filter)
+        (Some((all[0][i].epoch, all.iter().map(|cs| cs[i].offsets.clone()).collect::<Vec<_>>())), filter)
     } else {
         (None, "true".into())
     };
@@ -91,7 +96,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let sink_cols = sink_cols.join(", ");
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TABLE memory.main.v_sink AS SELECT {sink_cols} FROM {} WHERE {sink_filter};
-         CREATE OR REPLACE TABLE memory.main.v_dead AS SELECT source_partition AS _partition, source_offset AS _offset
+         CREATE OR REPLACE TABLE memory.main.v_dead AS SELECT source, source_partition AS _partition, source_offset AS _offset
            FROM {CTL}.dead_letter WHERE job_id = '{job}';",
         quote_table(&def.sink)?
     ))?;
@@ -106,42 +111,55 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     }
     conn.execute_batch("COMMIT")?;
 
-    let from = base.as_ref().map(|b| b.offsets.clone()).unwrap_or_default();
+    // Each source's events from the base checkpoint (or the start) to the latest one, decoded as the job did.
+    let from: Vec<_> = (0..srcs.len()).map(|k| base.as_ref().map(|(_, b)| b[k].clone()).unwrap_or_default()).collect();
+    let in_range = |k: usize| -> String {
+        let range: Vec<String> = from[k].iter().map(|(p, o)| format!("(_partition = {p} AND _offset >= {o})")).collect();
+        if range.is_empty() { "true".into() } else { range.join(" OR ") }
+    };
     if base.is_some() {
         // Dead and late rows before the base checkpoint come from events no longer retained.
-        let range: Vec<String> = from.iter().map(|(p, o)| format!("(_partition = {p} AND _offset >= {o})")).collect();
-        let range = range.join(" OR ");
-        conn.execute_batch(&format!("DELETE FROM memory.main.v_dead WHERE NOT ({range})"))?;
+        let keep: Vec<String> = names.iter().enumerate().map(|(k, n)| format!("(source = {} AND ({}))", lit(n), in_range(k))).collect();
+        conn.execute_batch(&format!("DELETE FROM memory.main.v_dead WHERE NOT ({})", keep.join(" OR ")))?;
         if def.late_data.is_some() {
-            conn.execute_batch(&format!("DELETE FROM memory.main.v_late WHERE NOT ({range})"))?;
+            conn.execute_batch(&format!("DELETE FROM memory.main.v_late WHERE NOT ({})", in_range(0)))?;
         }
     }
-    let msgs = rt.block_on(kafka::read_between(&src.options, &from, &ckpt.offsets))?;
-    conn.execute_batch("CREATE OR REPLACE TABLE memory.main.v_raw (_partition INTEGER, _offset BIGINT, payload VARCHAR)")?;
-    {
-        let mut app = conn.appender_to_catalog_and_db("v_raw", "memory", "main")?;
-        for m in &msgs {
-            let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-            app.append_row(duckdb::params![m.partition, m.offset, payload.as_deref()])?;
+    let mut kafka_rows = 0;
+    let mut dead_expected = Vec::new();
+    for (k, src) in srcs.iter().enumerate() {
+        let msgs = rt.block_on(kafka::read_between(&src.options, &from[k], &ends[k]))?;
+        kafka_rows += msgs.len();
+        let raw = format!("v_raw_{k}");
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.{raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR)"))?;
+        {
+            let mut app = conn.appender_to_catalog_and_db(&raw, "memory", "main")?;
+            for m in &msgs {
+                let payload = m.payload.as_deref().map(String::from_utf8_lossy);
+                app.append_row(duckdb::params![m.partition, m.offset, payload.as_deref()])?;
+            }
+            app.flush()?;
         }
-        app.flush()?;
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE memory.main.v_ok_{k} AS SELECT * FROM memory.main.{raw} WHERE {IS_JSON_OBJECT};
+             CREATE OR REPLACE TABLE memory.main.v_typed_{k} AS {};",
+            decode_sql(src, &format!("memory.main.v_ok_{k}"))
+        ))?;
+        dead_expected.push(format!(
+            "SELECT {n} AS source, _partition, _offset FROM memory.main.{raw} WHERE NOT ({IS_JSON_OBJECT})
+             UNION ALL SELECT {n}, _partition, _offset FROM memory.main.v_typed_{k} WHERE _err IS NOT NULL",
+            n = lit(&src.name)
+        ));
     }
-    conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE memory.main.v_ok AS SELECT * FROM memory.main.v_raw
-           WHERE {IS_JSON_OBJECT};
-         CREATE OR REPLACE TABLE memory.main.v_typed AS {};",
-        decode_sql(src, "memory.main.v_ok")
-    ))?;
-    let dead_expected = &format!(
-        "SELECT _partition, _offset FROM memory.main.v_raw WHERE NOT ({IS_JSON_OBJECT})
-         UNION ALL SELECT _partition, _offset FROM memory.main.v_typed WHERE _err IS NOT NULL"
-    );
+    let dead_expected = &dead_expected.join(" UNION ALL ");
     let dead_mismatch = count(conn, &format!("({dead_expected}) EXCEPT ALL (SELECT * FROM memory.main.v_dead)"))?
         + count(conn, &format!("(SELECT * FROM memory.main.v_dead) EXCEPT ALL ({dead_expected})"))?;
 
-    let cols: Vec<String> = src.options.columns.iter().map(|(c, _)| ident(c)).collect();
-    let cols = cols.join(", ");
-    let valid = format!("(SELECT _partition, _offset, {cols} FROM memory.main.v_typed WHERE _err IS NULL)");
+    // The valid rows of source k, and its columns.
+    let cols_of = |k: usize| srcs[k].options.columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+    let valid = |k: usize| format!("(SELECT _partition, _offset, {} FROM memory.main.v_typed_{k} WHERE _err IS NULL)", cols_of(k));
+    let (cols, valid0) = (cols_of(0), valid(0));
+    let valid = &valid0;
     let (mut late_rows, mut late_duplicates, mut left_in_state) = (0, 0, 0);
     if plan.is_windowed() {
         let wm = ckpt.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
@@ -159,8 +177,15 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         left_in_state = count(conn, &format!("SELECT * FROM memory.main.v_state WHERE __we <= {wm}"))?;
     } else if plan.is_global() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT {cols}, 1::INTEGER AS __w FROM {valid}", plan.input_table))?;
-    } else {
+    } else if plan.union.is_empty() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT {cols} FROM {valid}", plan.input_table))?;
+    } else {
+        // Each branch's staging table, from its own source.
+        for b in &plan.union {
+            let k = names.iter().position(|n| *n == b.source).unwrap();
+            let v = format!("(SELECT _partition, _offset, {} FROM memory.main.v_typed_{k} WHERE _err IS NULL)", cols_of(k));
+            conn.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT {} FROM {v}", b.input_table, cols_of(k)))?;
+        }
     }
     conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.v_expected AS {}", plan.batch_sql))?;
     // Floating-point sums merged across epochs add in a different order than one batch query, so
@@ -185,10 +210,10 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
 
     Ok(Report {
         job: job.into(),
-        from_epoch: base.map(|b| b.epoch),
+        from_epoch: base.map(|(epoch, _)| epoch),
         epoch: ckpt.epoch,
         watermark: crate::engine::fmt_us(ckpt.watermark_us),
-        kafka_rows: msgs.len(),
+        kafka_rows,
         expected_rows: count(conn, "SELECT * FROM memory.main.v_expected")?,
         sink_rows: count(conn, "SELECT * FROM memory.main.v_sink")?,
         missing_from_sink: count(conn, "SELECT * FROM memory.main.v_expected EXCEPT ALL SELECT * FROM memory.main.v_sink")?,

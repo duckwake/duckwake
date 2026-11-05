@@ -3,13 +3,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BIN=${BIN:-target/release/duckwake}
 TOPIC=${TOPIC:-clicks}
+# A second topic and source, read with clicks by the UNION ALL view all_events.
+TOPIC2=${TOPIC2:-${TOPIC}_purchases}
 PARTITIONS=${PARTITIONS:-3}
 OUT=${OUT:-.lake/run}
 # Tests get their own catalog database and data path, so they never touch the playground's lake.
 TEST_DB=${TEST_DB:-duckwake_test}
 export DUCKWAKE_CATALOG="postgres:dbname=$TEST_DB host=localhost port=55432 user=lake password=lake"
 export DUCKWAKE_DATA_PATH=".lake/test/data/"
-VIEWS=(clicks_per_window big_spend game_totals active_users)
+VIEWS=(clicks_per_window big_spend game_totals active_users all_events)
 # How the source decodes JSON: auto (Arrow where the column types allow), arrow or sql.
 export DECODE=${DECODE:-auto}
 # Extra flags for every worker the tests start, e.g. "--stage-threads 4 --pipeline --shared-readers".
@@ -21,6 +23,7 @@ log() { printf '\n== %s\n' "$*"; }
 reset_env() {
   docker compose up -d --wait >/dev/null
   docker compose exec -T redpanda rpk topic delete "$TOPIC" >/dev/null 2>&1 || true
+  docker compose exec -T redpanda rpk topic delete "$TOPIC2" >/dev/null 2>&1 || true
   rm -rf "$OUT"; mkdir -p "$OUT"
   reset_lake
 }
@@ -49,6 +52,13 @@ setup_views() {
   "$BIN" create-view analytics.game_totals --epoch-interval "$epoch" \
     --sql "SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
            FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5" | head -1
+  # UNION ALL of two sources: big clicks and every purchase.
+  "$BIN" create-source purchases --options "{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC2\",\"event_time\":\"ts\",
+    \"watermark_delay\":\"$delay\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
+    \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}" >/dev/null
+  "$BIN" create-view analytics.all_events --epoch-interval "$epoch" \
+    --sql "SELECT ts, game_id, user_id, amount, 'click' AS kind FROM clicks WHERE amount >= 80
+           UNION ALL SELECT ts, game_id, user_id, amount, 'purchase' FROM purchases" | head -1
   # DISTINCT: each pair once, the first time it is seen.
   "$BIN" create-view analytics.active_users --epoch-interval "$epoch" \
     --sql "SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50" | head -1
@@ -67,7 +77,25 @@ committed() {
 }
 
 topic_end() {
-  docker compose exec -T redpanda rpk topic describe "$TOPIC" -p 2>/dev/null | awk 'NR>1 {s+=$NF} END {print s+0}'
+  docker compose exec -T redpanda rpk topic describe "${1:-$TOPIC}" -p 2>/dev/null | awk 'NR>1 {s+=$NF} END {print s+0}'
+}
+
+# The produce command to both topics: the same arguments, a quarter of the rate and count to the second.
+produce() {
+  local args=("$@") i
+  for ((i = 0; i < ${#args[@]} - 1; i++)); do
+    [[ ${args[i]} == --rate || ${args[i]} == --count ]] && args[i+1]=$(( (args[i+1] + 3) / 4 ))
+  done
+  "$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" "$@" &
+  local first=$!
+  "$BIN" produce --topic "$TOPIC2" --partitions "$PARTITIONS" "${args[@]}" >/dev/null 2>&1
+  wait "$first"
+}
+
+# Whether view $1 has committed up to the given ends of both topics (all_events reads both).
+caught_up() {
+  [[ "$(committed "$1")" == "$2" ]] || return 1
+  [[ $1 != all_events ]] || [[ "$(committed "$1" purchases)" == "$3" ]]
 }
 
 # Runs a worker until every view has committed up to the end of the topic.
@@ -76,9 +104,10 @@ drain() {
   "$BIN" run $WORKER_FLAGS --worker "$worker" >>"$logf" 2>&1 &
   local pid=$!
   end=$(topic_end)
+  local end2; end2=$(topic_end "$TOPIC2")
   for _ in $(seq 1 120); do
     local done=1
-    for v in "${VIEWS[@]}"; do [[ "$(committed "$v")" == "$end" ]] || done=0; done
+    for v in "${VIEWS[@]}"; do caught_up "$v" "$end" "$end2" || done=0; done
     [[ $done == 1 ]] && break
     sleep 1
   done

@@ -4,11 +4,12 @@ use anyhow::Result;
 use std::fmt::Write;
 
 /// The circuit, how it was derived, and one epoch's SQL, as text (`duckwake explain`, `duckwake_explain`).
-pub fn explain(view: View, source_columns: &[(String, String)]) -> Result<String> {
+/// `sources` holds the columns of each source the view reads.
+pub fn explain(view: View, sources: &[(String, Vec<(String, String)>)]) -> Result<String> {
     let q = Circuit::query(&view);
     q.check(view.plan)?;
     let c = q.clone().incrementalize();
-    let x = EpochCtx::example(view, source_columns)?;
+    let x = EpochCtx::example(view, sources)?;
     let mut out = String::new();
     let _ = writeln!(out, "view {} ({}), table {}\n", view.id, view.plan.kind_name(), view.sink);
     let _ = writeln!(out, "Q: the view over whole collections\n{q}");

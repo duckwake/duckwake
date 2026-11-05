@@ -13,6 +13,7 @@ mod late_split;
 mod map;
 mod sink;
 mod source;
+mod union;
 mod window;
 
 pub use aggregate::{Aggregate, Grouping};
@@ -25,6 +26,7 @@ pub use late_split::LateSplit;
 pub use map::Map;
 pub use sink::{Sink, SinkKind};
 pub use source::Source;
+pub use union::Union;
 pub use window::Window;
 
 use crate::codegen::{Cx, Rel, Step};
@@ -91,6 +93,7 @@ pub enum Op {
     Map(Map),
     Aggregate(Aggregate),
     Distinct(Distinct),
+    Union(Union),
     Sink(Sink),
     Integrate(Integrate),
     Differentiate(Differentiate),
@@ -110,6 +113,7 @@ macro_rules! dispatch {
             Op::Map($o) => $e,
             Op::Aggregate($o) => $e,
             Op::Distinct($o) => $e,
+            Op::Union($o) => $e,
             Op::Sink($o) => $e,
             Op::Integrate($o) => $e,
             Op::Differentiate($o) => $e,

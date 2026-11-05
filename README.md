@@ -57,7 +57,7 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 
 ## Status
 
-A proof of concept. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, windowed and
-global aggregates (`count`, `sum`, `avg`, `min`, `max`). Every test checks the views against the same SQL run as
+A proof of concept. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
+across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`). Every test checks the views against the same SQL run as
 one batch query. Not yet: `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.

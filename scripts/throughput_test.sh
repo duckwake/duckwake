@@ -9,7 +9,7 @@ log "create source and views"; setup_views 10s "1 MINUTE" "5 seconds"; start_vie
 "$BIN" run $WORKER_FLAGS --worker w1 --flush-every 1m --merge-every 2m >"$OUT/worker.log" 2>&1 &
 W=$!
 log "produce $((RATE * DURATION)) events of ~1 KB at $RATE/s"
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) --pad-bytes 1000 2>&1 | tail -1
+produce --rate "$RATE" --count $((RATE * DURATION)) --pad-bytes 1000 2>&1 | tail -1
 sleep 12
 "$BIN" jobs
 kill -TERM "$W"; wait "$W" || true

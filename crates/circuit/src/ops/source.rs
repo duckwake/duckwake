@@ -1,6 +1,7 @@
 use super::{Class, Operator};
 use crate::codegen::{Cx, Rel};
 use crate::ir::Props;
+use crate::sql::ident;
 use anyhow::Result;
 
 /// The source's rows, each with its weight `__w`. In Q the whole collection; after incrementalization the epoch's
@@ -27,7 +28,8 @@ impl Operator for Source {
 
     fn stage(&self, cx: &mut Cx, _inputs: &[Rel]) -> Result<Vec<Rel>> {
         // Kafka rows are inserts: weight +1.
-        let (cols, typed) = (&cx.cols, &cx.x.typed);
-        Ok(vec![Rel::Sql(format!("(SELECT _partition, _offset, {cols}, 1::INTEGER AS __w FROM {typed} WHERE _err IS NULL)"))])
+        let input = cx.x.source(&self.name)?;
+        let cols = input.columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+        Ok(vec![Rel::Sql(format!("(SELECT _partition, _offset, {cols}, 1::INTEGER AS __w FROM {} WHERE _err IS NULL)", input.typed))])
     }
 }

@@ -46,7 +46,7 @@ impl<'a> Cx<'a> {
         Cx {
             x,
             plan: x.plan,
-            cols: x.source_columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", "),
+            cols: x.primary().columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", "),
             set: format!("{}_{}", x.job, x.parity),
             emits_final,
             steps: Vec::new(),
@@ -60,6 +60,14 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// A source of the view, as one epoch reads it.
+pub struct SourceInput<'a> {
+    pub name: &'a str,
+    pub columns: &'a [(String, String)],
+    /// The table with the epoch's decoded rows (staging only).
+    pub typed: String,
+}
+
 /// What one epoch's SQL needs to know.
 pub struct EpochCtx<'a> {
     pub job: &'a str,
@@ -67,9 +75,8 @@ pub struct EpochCtx<'a> {
     /// The view's table and its late-data table, quoted.
     pub sink: String,
     pub late_table: Option<String>,
-    pub source_columns: &'a [(String, String)],
-    /// The epoch's decoded rows of the view's source.
-    pub typed: String,
+    /// The sources the view reads, in `Plan::sources` order.
+    pub sources: Vec<SourceInput<'a>>,
     /// Which of the two table sets this epoch stages into, and the previous epoch's set when a global aggregate
     /// reads that epoch's new state before it has committed.
     pub parity: u64,
@@ -85,15 +92,30 @@ impl EpochCtx<'_> {
         Ok(GlobalTables::new(self.job, state_table(self.job), self.sink.clone(), self.plan, self.parity))
     }
 
-    /// A context with placeholders instead of values, for showing the SQL.
-    pub fn example<'a>(view: View<'a>, source_columns: &'a [(String, String)]) -> Result<EpochCtx<'a>> {
+    /// The source named `name`.
+    pub fn source(&self, name: &str) -> Result<&SourceInput<'_>> {
+        self.sources.iter().find(|s| s.name == name).ok_or_else(|| anyhow::anyhow!("source {name} is not one of the view's"))
+    }
+
+    /// The view's first source: a windowed view's only one.
+    pub fn primary(&self) -> &SourceInput<'_> {
+        &self.sources[0]
+    }
+
+    /// A context with placeholders instead of values, for showing the SQL. `sources` holds each source's
+    /// columns.
+    pub fn example<'a>(view: View<'a>, sources: &'a [(String, Vec<(String, String)>)]) -> Result<EpochCtx<'a>> {
+        let mut inputs = Vec::new();
+        for (k, name) in view.plan.sources().iter().enumerate() {
+            let (name, columns) = sources.iter().find(|(n, _)| n == name).ok_or_else(|| anyhow::anyhow!("source {name} is gone"))?;
+            inputs.push(SourceInput { name, columns, typed: staging("typed", &format!("g{k}")) });
+        }
         Ok(EpochCtx {
             job: view.id,
             plan: view.plan,
             sink: quote_table(view.sink)?,
             late_table: view.late_data.map(quote_table).transpose()?,
-            source_columns,
-            typed: staging("typed", "g0"),
+            sources: inputs,
             parity: 1,
             overlay: None,
             prev_watermark: "<previous watermark>".into(),

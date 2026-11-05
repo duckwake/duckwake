@@ -30,11 +30,16 @@ remote "CALL duckwake_create_view('analytics.big_spend', 'SELECT ts, game_id, us
 remote "CALL duckwake_create_view('analytics.game_totals',
   'SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
    FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5', epoch_interval := '2s')"
+remote "CALL duckwake_create_source('purchases', 'kafka', '{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC2\",\"event_time\":\"ts\",
+  \"watermark_delay\":\"5 seconds\",\"idle_timeout\":\"30 seconds\",
+  \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}')"
+remote "CALL duckwake_create_view('analytics.all_events', 'SELECT ts, game_id, user_id, amount, ''click'' AS kind FROM clicks WHERE amount >= 80
+   UNION ALL SELECT ts, game_id, user_id, amount, ''purchase'' FROM purchases', epoch_interval := '2s')"
 remote "CALL duckwake_create_view('analytics.active_users', 'SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50', epoch_interval := '2s')"
 for v in "${VIEWS[@]}"; do remote "CALL duckwake_start('$v')"; done
 
 log "produce $((RATE * DURATION)) events at $RATE/s"
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
+produce --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 sleep 10
@@ -46,10 +51,10 @@ remote "CALL duckwake_reset('analytics.big_spend', 1)"
 remote "CALL duckwake_start('big_spend')"
 wait "$PRODUCER"; tail -1 "$OUT/producer.log"
 
-end=$(topic_end)
+end=$(topic_end); end2=$(topic_end "$TOPIC2")
 for _ in $(seq 1 90); do
   done=1
-  for v in "${VIEWS[@]}"; do [[ "$(committed "$v")" == "$end" ]] || done=0; done
+  for v in "${VIEWS[@]}"; do caught_up "$v" "$end" "$end2" || done=0; done
   [[ $done == 1 ]] && break
   sleep 1
 done

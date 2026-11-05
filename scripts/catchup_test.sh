@@ -9,9 +9,9 @@ EVENTS=${EVENTS:-600000}
 MODES=${MODES:-sql arrow}
 
 log "fresh topic: $EVENTS events of ~1 KB"; reset_env
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate 100000 --count "$EVENTS" --pad-bytes 1000 \
+produce --rate 100000 --count "$EVENTS" --pad-bytes 1000 \
   --late-every 2000 --bad-every 5000 2>&1 | tail -1
-end=$(topic_end)
+end=$(topic_end); end2=$(topic_end "$TOPIC2")
 
 for mode in $MODES; do
   log "decode $mode"
@@ -23,7 +23,7 @@ for mode in $MODES; do
   T=$!
   for _ in $(seq 1 900); do
     done=1
-    for v in "${VIEWS[@]}"; do [[ "$(committed "$v")" == "$end" ]] || done=0; done
+    for v in "${VIEWS[@]}"; do caught_up "$v" "$end" "$end2" || done=0; done
     [[ $done == 1 ]] && break
     sleep 0.5
   done

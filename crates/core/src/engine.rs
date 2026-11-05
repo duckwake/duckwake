@@ -17,7 +17,7 @@
 //! and the epoch staged ahead is thrown away with it. Staging tables the commit reads come in two sets, by
 //! epoch parity, so staging the next epoch never overwrites them.
 use crate::catalog::{self, lease_table, state_table, Checkpoint};
-use crate::circuit::{Circuit, Cost, Counter, EpochCtx};
+use crate::circuit::{Circuit, Cost, Counter, EpochCtx, SourceInput};
 use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
@@ -59,21 +59,16 @@ struct JobRuntime {
     def: Arc<JobDef>,
     /// The view as an incremental circuit; its steps are the SQL each epoch runs.
     circuit: Arc<Circuit>,
-    source: Arc<SourceDef>,
     lease: i64,
-    /// The last epoch handed to the commit (with `pipeline`, possibly still committing) and the position
-    /// after it, which the next epoch starts from.
+    /// The last epoch handed to the commit (with `pipeline`, possibly still committing). Each input holds the
+    /// position after it, which the next epoch starts from.
     epoch: i64,
+    /// The view's watermark: the oldest of its sources', once every source has one.
     watermark_us: Option<i64>,
     max_event_time_us: Option<i64>,
-    offsets: BTreeMap<i32, i64>,
-    part_max_ts: HashMap<i32, i64>,
-    part_last_data: HashMap<i32, Instant>,
-    delay_us: i64,
-    idle_timeout: Duration,
     interval: Duration,
-    /// The group whose reader feeds this job.
-    group: u64,
+    /// The sources the view reads, in `Plan::sources` order.
+    inputs: Vec<Input>,
     /// The last round of epochs this job was part of. A global aggregate staged in the round right after it
     /// reads that round's new state, which may not have committed yet, through the overlay.
     last_round: Option<u64>,
@@ -81,6 +76,45 @@ struct JobRuntime {
     /// the table at start, then kept up to date from each epoch's partials and watermark. A window can close
     /// only when one of them is at or below the watermark.
     open_ends: Option<BTreeSet<i64>>,
+}
+
+/// A source as one job reads it: the reader group that feeds it, its position and its watermark.
+struct Input {
+    source: Arc<SourceDef>,
+    group: u64,
+    offsets: BTreeMap<i32, i64>,
+    part_max_ts: HashMap<i32, i64>,
+    part_last_data: HashMap<i32, Instant>,
+    watermark_us: Option<i64>,
+    delay_us: i64,
+    idle_timeout: Duration,
+}
+
+impl Input {
+    /// Takes in an epoch of this source and returns its watermark after it: the minimum over active
+    /// partitions of their newest event time, minus the delay. Partitions idle for longer than `idle_timeout`
+    /// are excluded; one that is active but has not reported yet holds it back.
+    fn advance(&mut self, src: &SourceStaged) -> Option<i64> {
+        let now = Instant::now();
+        for p in &src.active {
+            self.part_last_data.insert(*p, now);
+        }
+        for &(p, ts) in &src.part_max {
+            let e = self.part_max_ts.entry(p).or_insert(ts);
+            *e = (*e).max(ts);
+        }
+        let active: Vec<i32> =
+            self.part_last_data.iter().filter(|(_, at)| at.elapsed() < self.idle_timeout).map(|(p, _)| *p).collect();
+        let candidate = if active.is_empty() || active.iter().any(|p| !self.part_max_ts.contains_key(p)) {
+            None
+        } else {
+            active.iter().map(|p| self.part_max_ts[p]).min().map(|m| m - self.delay_us)
+        };
+        match (self.watermark_us, candidate) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// A reader and the jobs it feeds: one job, or with `shared_readers` every job of a source at the same
@@ -114,7 +148,8 @@ struct SourceStaged {
 
 #[derive(Default, Clone)]
 struct Staged {
-    offsets: BTreeMap<i32, i64>,
+    /// Per input: the position after this epoch, the source's watermark, its dead letters.
+    inputs: Vec<StagedInput>,
     watermark_us: Option<i64>,
     max_event_time_us: Option<i64>,
     rows_in: usize,
@@ -135,18 +170,25 @@ struct Staged {
     source_ms: u128,
 }
 
+#[derive(Default, Clone, Debug)]
+struct StagedInput {
+    offsets: BTreeMap<i32, i64>,
+    watermark_us: Option<i64>,
+    rows_dead: i64,
+}
+
 /// One job's epoch as the commit needs it. It owns everything, so it can go to the commit thread.
 struct CommitJob {
     id: String,
     lease: i64,
     epoch: i64,
     def: Arc<JobDef>,
-    source: Arc<SourceDef>,
     staged: Staged,
     circuit: Arc<Circuit>,
-    /// The table set this epoch staged into, and its group's dead letters.
+    /// The table set this epoch staged into.
     parity: u64,
-    dead: String,
+    /// Per input: the source and its group's dead letters of this epoch.
+    inputs: Vec<(Arc<SourceDef>, String)>,
     lag: i64,
 }
 
@@ -406,37 +448,51 @@ impl Worker {
         let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
         let (def, sources) = catalog::load_compiled(conn, id)?;
         catalog::set_sink_inlining(conn, &def)?;
-        let source = Arc::new(sources.get(&def.plan.source).context("source of job is gone")?.clone());
-        let ckpt = catalog::latest_checkpoint(conn, id, &source.name)?.unwrap_or_default();
-        let decoder = source.options.arrow_decoder()?.map(Arc::new);
-        let (reader, offsets) = Reader::start(&self.rt, &source.options, &ckpt.offsets, def.max_rows, decoder)?;
-        let joined = self
-            .groups
-            .iter()
-            .find(|(_, g)| self.cfg.shared_readers && g.source == source && g.offsets == offsets)
-            .map(|(gid, _)| *gid);
-        let group = match joined {
-            Some(gid) => {
-                // The group's reader is at the same position; this job's own is dropped unused.
-                let g = self.groups.get_mut(&gid).unwrap();
-                g.members.insert(id.to_string());
-                g.max_rows = g.max_rows.min(def.max_rows);
-                gid
-            }
-            None => {
-                let gid = self.next_group;
-                self.next_group += 1;
-                let g = Group {
-                    source: source.clone(),
-                    reader,
-                    offsets: offsets.clone(),
-                    members: BTreeSet::from([id.to_string()]),
-                    max_rows: def.max_rows,
-                };
-                self.groups.insert(gid, g);
-                gid
-            }
-        };
+        let names = def.plan.sources();
+        // One checkpoint row holds every source's offsets.
+        let ckpt = catalog::latest_checkpoint(conn, id, &names[0])?.unwrap_or_default();
+        let now = Instant::now();
+        let mut inputs = Vec::new();
+        for name in &names {
+            let source = Arc::new(sources.get(name).with_context(|| format!("source {name} of the view is gone"))?.clone());
+            let start = catalog::latest_checkpoint(conn, id, name)?.map(|c| c.offsets).unwrap_or_default();
+            let decoder = source.options.arrow_decoder()?.map(Arc::new);
+            let (reader, offsets) = Reader::start(&self.rt, &source.options, &start, def.max_rows, decoder)?;
+            let joined = self
+                .groups
+                .iter()
+                .find(|(_, g)| self.cfg.shared_readers && g.source == source && g.offsets == offsets)
+                .map(|(gid, _)| *gid);
+            let group = match joined {
+                Some(gid) => {
+                    // The group's reader is at the same position; this job's own is dropped unused.
+                    let g = self.groups.get_mut(&gid).unwrap();
+                    g.members.insert(id.to_string());
+                    g.max_rows = g.max_rows.min(def.max_rows);
+                    gid
+                }
+                None => {
+                    let gid = self.next_group;
+                    self.next_group += 1;
+                    let members = BTreeSet::from([id.to_string()]);
+                    let g = Group { source: source.clone(), reader, offsets: offsets.clone(), members, max_rows: def.max_rows };
+                    self.groups.insert(gid, g);
+                    gid
+                }
+            };
+            info!(job = %id, source = %name, offsets = ?offsets, group, "reading source");
+            inputs.push(Input {
+                delay_us: parse_duration(&source.options.watermark_delay)?.as_micros() as i64,
+                idle_timeout: parse_duration(&source.options.idle_timeout)?,
+                part_last_data: offsets.keys().map(|p| (*p, now)).collect(),
+                part_max_ts: HashMap::new(),
+                // The checkpoint keeps the view's watermark, at or below every source's: a safe start.
+                watermark_us: ckpt.watermark_us,
+                offsets,
+                source,
+                group,
+            });
+        }
         let circuit = Arc::new(Circuit::compile(&def.view())?);
         let open_ends = if self.cfg.lean_commit && circuit.emits_final() {
             let mut stmt = self.conns[0].prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", state_table(id)))?;
@@ -445,24 +501,17 @@ impl Worker {
         } else {
             None
         };
-        let now = Instant::now();
         let Checkpoint { epoch, watermark_us, max_event_time_us, .. } = ckpt;
-        info!(job = %id, lease, epoch, offsets = ?offsets, group, "job started");
+        info!(job = %id, lease, epoch, "job started");
         let j = JobRuntime {
-            delay_us: parse_duration(&source.options.watermark_delay)?.as_micros() as i64,
-            idle_timeout: parse_duration(&source.options.idle_timeout)?,
             interval: parse_duration(&def.epoch_interval)?,
-            part_last_data: offsets.keys().map(|p| (*p, now)).collect(),
-            part_max_ts: HashMap::new(),
-            offsets,
             def: Arc::new(def),
             circuit,
-            source,
             lease,
             epoch,
             watermark_us,
             max_event_time_us,
-            group,
+            inputs,
             last_round: None,
             open_ends,
         };
@@ -475,13 +524,15 @@ impl Worker {
         if let Some(m) = &self.cfg.metrics {
             m.forget(id);
         }
-        let Some(g) = self.groups.get_mut(&j.group) else { return };
-        g.members.remove(id);
-        if g.members.is_empty() {
-            self.groups.remove(&j.group);
-            self.drops.extend(group_tables(j.group));
-        } else {
-            g.max_rows = g.members.iter().map(|m| self.jobs[m].def.max_rows).min().unwrap();
+        for input in &j.inputs {
+            let Some(g) = self.groups.get_mut(&input.group) else { continue };
+            g.members.remove(id);
+            if g.members.is_empty() {
+                self.groups.remove(&input.group);
+                self.drops.extend(group_tables(input.group));
+            } else {
+                g.max_rows = g.members.iter().map(|m| self.jobs[m].def.max_rows).min().unwrap();
+            }
         }
     }
 
@@ -539,7 +590,7 @@ impl Worker {
                 writes_ms = c.timing.writes,
                 commit_call_ms = c.timing.commit,
                 attempts = c.attempts,
-                offsets = ?s.offsets,
+                offsets = ?s.inputs.iter().map(|i| &i.offsets).collect::<Vec<_>>(),
                 "epoch committed"
             );
         }
@@ -597,12 +648,12 @@ impl Worker {
             .iter_mut()
             .map(|(id, j)| {
                 let overlay = (cfg.pipeline && prev > 0 && j.last_round == Some(prev)).then_some(prev % 2);
-                let src = &sources[&j.group];
-                (id, j, src, overlay)
+                let srcs: Vec<&SourceStaged> = j.inputs.iter().map(|i| &sources[&i.group]).collect();
+                (id, j, srcs, overlay)
             })
             .collect();
-        let staged: Vec<Staged> = parallel(conns, items, |conn, (id, j, src, overlay)| {
-            stage_view(conn, id, j, src, parity, overlay).with_context(|| format!("job {id}: staging failed"))
+        let staged: Vec<Staged> = parallel(conns, items, |conn, (id, j, srcs, overlay)| {
+            stage_view(conn, id, j, &srcs, parity, overlay).with_context(|| format!("job {id}: staging failed"))
         })
         .into_iter()
         .collect::<Result<_>>()?;
@@ -621,7 +672,10 @@ impl Worker {
         let mut batch = Vec::new();
         for ((id, j), s) in jobs.iter_mut().zip(staged) {
             j.epoch += 1;
-            j.offsets = s.offsets.clone();
+            for (input, si) in j.inputs.iter_mut().zip(&s.inputs) {
+                input.offsets = si.offsets.clone();
+                input.watermark_us = si.watermark_us;
+            }
             j.watermark_us = s.watermark_us;
             j.max_event_time_us = s.max_event_time_us;
             j.last_round = Some(round);
@@ -631,11 +685,10 @@ impl Worker {
                 lease: j.lease,
                 epoch: j.epoch,
                 def: j.def.clone(),
-                source: j.source.clone(),
                 circuit: j.circuit.clone(),
                 parity,
-                dead: sources[&j.group].dead.clone(),
-                lag: groups[&j.group].reader.lag(&s.offsets),
+                inputs: j.inputs.iter().map(|i| (i.source.clone(), sources[&i.group].dead.clone())).collect(),
+                lag: j.inputs.iter().zip(&s.inputs).map(|(i, si)| groups[&i.group].reader.lag(&si.offsets)).sum(),
                 staged: s,
             });
         }
@@ -667,8 +720,8 @@ fn merge_groups(groups: &mut BTreeMap<u64, Group>, jobs: &mut BTreeMap<String, J
             }
             let gone = groups.remove(b).unwrap();
             for m in &gone.members {
-                if let Some(j) = jobs.get_mut(m) {
-                    j.group = *a;
+                for input in jobs.get_mut(m).into_iter().flat_map(|j| j.inputs.iter_mut()).filter(|i| i.group == *b) {
+                    input.group = *a;
                 }
             }
             let g = groups.get_mut(a).unwrap();
@@ -789,46 +842,32 @@ fn stage_source(
 /// Stages one job's view from its group's typed rows: the watermark, windows and late rows, then the epoch's
 /// sink rows (stateless) or partial aggregates. `overlay` is the table set of the previous epoch when that
 /// epoch may still be committing: a global aggregate reads the state of the groups it touched from there.
-fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, src: &SourceStaged, parity: u64, overlay: Option<u64>) -> Result<Staged> {
+fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, srcs: &[&SourceStaged], parity: u64, overlay: Option<u64>) -> Result<Staged> {
     let t = Instant::now();
     let def = j.def.clone();
     let plan = &def.plan;
 
-    // Watermark: min over active partitions of their max event time, minus the delay. Partitions idle for
-    // longer than idle_timeout are excluded; one that is active but has not reported yet holds it back.
-    let now = Instant::now();
-    for p in &src.active {
-        j.part_last_data.insert(*p, now);
-    }
-    for &(p, ts) in &src.part_max {
-        let e = j.part_max_ts.entry(p).or_insert(ts);
-        *e = (*e).max(ts);
-    }
-    let active: Vec<i32> = j
-        .part_last_data
-        .iter()
-        .filter(|(_, at)| at.elapsed() < j.idle_timeout)
-        .map(|(p, _)| *p)
-        .collect();
-    let candidate = if active.is_empty() || active.iter().any(|p| !j.part_max_ts.contains_key(p)) {
-        None
-    } else {
-        active.iter().map(|p| j.part_max_ts[p]).min().map(|m| m - j.delay_us)
-    };
+    // Each source's watermark, and the view's: the oldest of them once every source has one, never moving back.
+    let watermarks: Vec<Option<i64>> = j.inputs.iter_mut().zip(srcs).map(|(input, src)| input.advance(src)).collect();
+    let candidate = watermarks.iter().copied().collect::<Option<Vec<i64>>>().and_then(|w| w.into_iter().min());
     let watermark_us = match (j.watermark_us, candidate) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
     // Monotone across restarts (part_max_ts starts empty), so it bounds every event time read so far.
-    let max_event_time_us = j.part_max_ts.values().copied().chain(j.max_event_time_us).max();
+    let max_event_time_us = j.inputs.iter().flat_map(|i| i.part_max_ts.values().copied()).chain(j.max_event_time_us).max();
 
     let x = EpochCtx {
         job: id,
         plan,
         sink: quote_table(&def.sink)?,
         late_table: def.late_data.as_deref().map(quote_table).transpose()?,
-        source_columns: &j.source.options.columns,
-        typed: src.typed.clone(),
+        sources: j
+            .inputs
+            .iter()
+            .zip(srcs)
+            .map(|(i, src)| SourceInput { name: &i.source.name, columns: &i.source.options.columns, typed: src.typed.clone() })
+            .collect(),
         parity,
         overlay,
         // Late = assigned to a window that an earlier epoch already closed (window_end <= previous watermark).
@@ -861,14 +900,19 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, src: &SourceStage
         }
         open_ends = Some(ends);
     }
+    let inputs = srcs
+        .iter()
+        .zip(watermarks)
+        .map(|(src, w)| StagedInput { offsets: src.offsets.clone(), watermark_us: w, rows_dead: src.rows_dead })
+        .collect();
     Ok(Staged {
-        offsets: src.offsets.clone(),
+        inputs,
         watermark_us,
         max_event_time_us,
-        rows_in: src.rows_in,
-        rows_sql: src.rows_sql,
-        bisections: src.bisections,
-        rows_dead: src.rows_dead,
+        rows_in: srcs.iter().map(|s| s.rows_in).sum(),
+        rows_sql: srcs.iter().map(|s| s.rows_sql).sum(),
+        bisections: srcs.iter().map(|s| s.bisections).sum(),
+        rows_dead: srcs.iter().map(|s| s.rows_dead).sum(),
         rows_late,
         rows_out: 0,
         rows_staged,
@@ -876,7 +920,7 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, src: &SourceStage
         closes,
         open_ends,
         stage_ms: t.elapsed().as_millis(),
-        source_ms: src.stage_ms,
+        source_ms: srcs.iter().map(|s| s.stage_ms).max().unwrap_or(0),
     })
 }
 
@@ -1098,8 +1142,11 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 plan: &c.def.plan,
                 sink: quote_table(&c.def.sink)?,
                 late_table: c.def.late_data.as_deref().map(quote_table).transpose()?,
-                source_columns: &c.source.options.columns,
-                typed: String::new(),
+                sources: c
+                    .inputs
+                    .iter()
+                    .map(|(src, _)| SourceInput { name: &src.name, columns: &src.options.columns, typed: String::new() })
+                    .collect(),
                 parity: c.parity,
                 overlay: None,
                 prev_watermark: String::new(),
@@ -1131,15 +1178,21 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
             if upserts {
                 s.rows_out = s.rows_changed;
             }
-            let offsets = json!({ &c.source.name: s.offsets.iter().map(|(p, o)| (p.to_string(), json!(o))).collect::<serde_json::Map<_, _>>() });
+            // One checkpoint row with every source's offsets.
+            let offsets: serde_json::Map<String, serde_json::Value> = c
+                .inputs
+                .iter()
+                .zip(&s.inputs)
+                .map(|((src, _), si)| (src.name.clone(), json!(si.offsets.iter().map(|(p, o)| (p.to_string(), json!(o))).collect::<serde_json::Map<_, _>>())))
+                .collect();
+            let offsets = serde_json::Value::Object(offsets);
             let ts = |us: Option<i64>| us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
             if lean {
-                if s.rows_dead > 0 {
+                for ((src, dead), _) in c.inputs.iter().zip(&s.inputs).filter(|(_, si)| si.rows_dead > 0) {
                     dead_rows.push(format!(
-                        "SELECT {}, {epoch}, {}, _partition, _offset, payload, _err, now() FROM {}",
+                        "SELECT {}, {epoch}, {}, _partition, _offset, payload, _err, now() FROM {dead}",
                         lit(id),
-                        lit(&c.source.name),
-                        c.dead
+                        lit(&src.name)
                     ));
                 }
                 checkpoint_rows.push(format!(
@@ -1158,15 +1211,14 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 ));
                 continue;
             }
-            timed(&mut tm.dead, || {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {CTL}.dead_letter SELECT ?, ?, ?, _partition, _offset, payload, _err, now() FROM {}",
-                        c.dead
-                    ),
-                    duckdb::params![id, epoch, c.source.name],
-                )
-            })?;
+            for (src, dead) in &c.inputs {
+                timed(&mut tm.dead, || {
+                    conn.execute(
+                        &format!("INSERT INTO {CTL}.dead_letter SELECT ?, ?, ?, _partition, _offset, payload, _err, now() FROM {dead}"),
+                        duckdb::params![id, epoch, src.name],
+                    )
+                })?;
+            }
             timed(&mut tm.checkpoint, || {
                 conn.execute(
                     &format!(

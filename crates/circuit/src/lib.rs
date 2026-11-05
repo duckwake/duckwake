@@ -29,7 +29,7 @@ pub mod ops;
 pub mod passes;
 pub mod sql;
 
-pub use codegen::{staging, Cost, Counter, EpochCtx, Rel, Step};
+pub use codegen::{staging, Cost, Counter, EpochCtx, Rel, SourceInput, Step};
 pub use explain::explain;
 pub use frontend::{plan, SourceSchema};
 pub use ir::{Circuit, Node, Port, Props, View};

@@ -25,13 +25,16 @@ impl SourceSchema for TestSource {
     }
 }
 
-/// A connection with the lookup table the tests join, and the `clicks` source.
+/// A connection with the lookup table the tests join, and two sources: `clicks`, and `purchases` with a
+/// `price` where `clicks` has an `amount`.
 pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE games (game_id VARCHAR, studio VARCHAR)").unwrap();
-    let columns = [("ts", "TIMESTAMP"), ("game_id", "VARCHAR"), ("user_id", "VARCHAR"), ("amount", "DECIMAL(18,2)")];
-    let columns = columns.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect();
-    (conn, HashMap::from([("clicks".to_string(), TestSource { columns })]))
+    let source = |value: &str| {
+        let columns = [("ts", "TIMESTAMP"), ("game_id", "VARCHAR"), ("user_id", "VARCHAR"), (value, "DECIMAL(18,2)")];
+        TestSource { columns: columns.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect() }
+    };
+    (conn, HashMap::from([("clicks".to_string(), source("amount")), ("purchases".to_string(), source("price"))]))
 }
 
 struct Def {

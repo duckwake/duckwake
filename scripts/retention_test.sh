@@ -11,7 +11,7 @@ start_views w1
 "$BIN" run $WORKER_FLAGS --worker w1 >"$OUT/worker.log" 2>&1 &
 WORKER=$!
 log "produce $((RATE * DURATION)) events at $RATE/s while the worker runs"
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
+produce --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 >"$OUT/producer.log" 2>&1
 kill -TERM "$WORKER"; wait "$WORKER" || true
 drain w1 "$OUT/worker.log"

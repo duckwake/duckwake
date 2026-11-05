@@ -11,8 +11,8 @@ WORKER_FLAGS=${WORKER_FLAGS:---pipeline --stage-threads 4}
 log "reset lake and topic"; reset_env
 log "create source and views"; setup_views 2s "10 SECOND" "5 seconds" >/dev/null
 "$BIN" stop game_totals >/dev/null
-for v in clicks_per_window big_spend active_users; do "$BIN" start "$v" --worker w1 >/dev/null; done
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
+for v in clicks_per_window big_spend active_users all_events; do "$BIN" start "$v" --worker w1 >/dev/null; done
+produce --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 # shellcheck disable=SC2086
@@ -26,10 +26,10 @@ sleep 8
 log "rewind big_spend to epoch 2"
 "$BIN" pause big_spend; "$BIN" reset big_spend --to-epoch 2; "$BIN" start big_spend --worker w1
 wait "$PRODUCER"; tail -1 "$OUT/producer.log"
-end=$(topic_end)
+end=$(topic_end); end2=$(topic_end "$TOPIC2")
 for _ in $(seq 1 120); do
   done=1
-  for v in "${VIEWS[@]}"; do [[ "$(committed "$v")" == "$end" ]] || done=0; done
+  for v in "${VIEWS[@]}"; do caught_up "$v" "$end" "$end2" || done=0; done
   [[ $done == 1 ]] && break
   sleep 1
 done

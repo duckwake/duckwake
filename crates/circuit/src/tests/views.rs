@@ -23,6 +23,22 @@ fn distinct() {
 }
 
 #[test]
+fn union_all() {
+    // Two sources, with different column names, a lookup join and a filter in one branch.
+    let sql = "SELECT ts, game_id, amount AS value FROM clicks WHERE amount > 4
+               UNION ALL SELECT p.ts, g.studio, p.price FROM purchases p JOIN games g ON g.game_id = p.game_id";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    // Three branches, one source read twice.
+    check_view(
+        "SELECT ts, user_id FROM clicks WHERE amount > 8 UNION ALL SELECT ts, user_id FROM purchases
+         UNION ALL SELECT ts, game_id FROM clicks WHERE amount < 2",
+        &EPOCHS,
+        false,
+    );
+}
+
+#[test]
 fn windowed() {
     let tumble = "SELECT window_start, game_id, count(*) AS n, count(amount) AS n_amount, sum(amount) AS revenue,
                          avg(amount) AS mean, min(amount) AS lo, max(ts) AS last_ts

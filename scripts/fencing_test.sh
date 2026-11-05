@@ -7,7 +7,7 @@ RATE=${RATE:-1000}
 
 log "reset lake and topic"; reset_env
 log "create source and views"; setup_views 2s "10 SECOND" "5 seconds"; start_views w1
-"$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * 40)) --eos >"$OUT/producer.log" 2>&1 &
+produce --rate "$RATE" --count $((RATE * 40)) --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 
 log "w1 runs a few epochs, then stalls inside its commit transaction"

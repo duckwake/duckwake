@@ -63,9 +63,22 @@ pub struct Plan {
     /// The view in pieces, which the operator graph is built from.
     #[serde(default)]
     pub query: Query,
+    /// `UNION ALL` views: one branch per `SELECT`, each a plain view over one source. `source`, `input_table`
+    /// and `query` are then the first branch's.
+    #[serde(default)]
+    pub union: Vec<Branch>,
     /// Global (non-windowed) aggregate: the operator chain pre-aggregate -> aggregate -> post.
     #[serde(default)]
     pub global: Option<GlobalPlan>,
+}
+
+/// One branch of a `UNION ALL` view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Branch {
+    pub source: String,
+    /// The staging table the branch's SQL binds against, and that `verify` fills.
+    pub input_table: String,
+    pub query: Query,
 }
 
 /// The view in pieces, each SQL text in the view's own names.
@@ -162,6 +175,17 @@ impl Plan {
         self.global.is_some()
     }
 
+    /// The sources the view reads, each once, in the order the view names them.
+    pub fn sources(&self) -> Vec<String> {
+        let mut out = vec![self.source.clone()];
+        for b in &self.union {
+            if !out.contains(&b.source) {
+                out.push(b.source.clone());
+            }
+        }
+        out
+    }
+
     /// Whether the plan keeps a state table in `__duckwake`.
     pub fn has_state(&self) -> bool {
         self.is_windowed() || self.is_global() || self.distinct
@@ -183,6 +207,8 @@ impl Plan {
             "aggregate"
         } else if self.distinct {
             "distinct"
+        } else if !self.union.is_empty() {
+            "union"
         } else {
             "stateless"
         }
@@ -442,6 +468,9 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         bail!("a continuous view must be exactly one SELECT statement");
     }
     let mut stmt = stmts[0].clone();
+    if stmt["node"]["type"] == "SET_OPERATION_NODE" {
+        return compile_union(conn, job, &stmt, sources);
+    }
     let node = &mut stmt["node"];
     if node["type"] != "SELECT_NODE" {
         bail!("only plain SELECT is supported (got {}): UNION, VALUES and set operations are rejected", node["type"]);
@@ -516,6 +545,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         partials: vec![],
         distinct: false,
         query,
+        union: vec![],
         global: None,
     };
 
@@ -546,6 +576,56 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     }
     compile_windowed(conn, &mut stmt, &stream.alias, &aggs, &mut plan)?;
     Ok(plan)
+}
+
+/// `SELECT ... UNION ALL SELECT ...`: each branch compiled as a view of its own (staging table
+/// `in_<job>_<k>`), and the view their concatenation. Branches must be plain views for now.
+fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, sources: &HashMap<String, S>) -> Result<Plan> {
+    fn branches(node: &Value, out: &mut Vec<Value>) -> Result<()> {
+        if node["type"] != "SET_OPERATION_NODE" {
+            out.push(node.clone());
+            return Ok(());
+        }
+        if node["setop_type"] != "UNION" || node["setop_all"] != true {
+            bail!("of the set operations only UNION ALL is supported (UNION, EXCEPT and INTERSECT are not yet)");
+        }
+        if node["modifiers"].as_array().is_some_and(|m| !m.is_empty()) {
+            bail!("ORDER BY and LIMIT are not supported in continuous views");
+        }
+        node["children"].as_array().into_iter().flatten().try_for_each(|c| branches(c, out))
+    }
+    let mut nodes = Vec::new();
+    branches(&stmt["node"], &mut nodes)?;
+    let mut union = Vec::new();
+    for (k, node) in nodes.into_iter().enumerate() {
+        let mut branch = stmt.clone();
+        branch["node"] = node;
+        let sql = deserialize(conn, &branch)?;
+        let p = compile(conn, &format!("{job}_{k}"), &sql, sources).with_context(|| format!("branch {} of the UNION ALL", k + 1))?;
+        if p.window.is_some() || p.global.is_some() || p.distinct || !p.union.is_empty() {
+            bail!("each branch of a UNION ALL must be a plain view (no windows, aggregates or DISTINCT) for now");
+        }
+        union.push((p.batch_sql, Branch { source: p.source, input_table: p.input_table, query: p.query }));
+    }
+    let batch_sql = union.iter().map(|(b, _)| format!("({b})")).collect::<Vec<_>>().join(" UNION ALL ");
+    let sink_columns = describe(conn, &batch_sql).context("binding the UNION ALL (do the branches' columns line up?)")?;
+    let union: Vec<Branch> = union.into_iter().map(|(_, b)| b).collect();
+    Ok(Plan {
+        source: union[0].source.clone(),
+        window: None,
+        input_table: union[0].input_table.clone(),
+        batch_sql,
+        sink_columns,
+        state_columns: vec![],
+        key_columns: vec![],
+        merge_ops: vec![],
+        final_select: String::new(),
+        partials: vec![],
+        distinct: false,
+        query: union[0].query.clone(),
+        union,
+        global: None,
+    })
 }
 
 fn compile_windowed(

@@ -1,6 +1,7 @@
 //! The compiled plan as Q, a graph of operators over whole collections.
 use crate::ir::{Circuit, Port, View};
-use crate::ops::{Aggregate, Distinct, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Window};
+use crate::ops::{Aggregate, Distinct, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Union, Window};
+use crate::plan::Query;
 
 impl Circuit {
     /// Q: the view as a query over whole collections, built from the compiled plan.
@@ -9,9 +10,18 @@ impl Circuit {
     /// - windowed: Source → Window → LateSplit → From → Filter → Map → Aggregate → Sink(append), late rows to
     ///   Sink(late data)
     /// - global aggregate: Source → From → Filter → Map → Aggregate → Filter(HAVING) → Map → Sink(upsert)
+    /// - UNION ALL: a stateless chain per branch, each from its own source, into Union → Sink(append)
     pub fn query(view: &View) -> Circuit {
         let (plan, q) = (view.plan, &view.plan.query);
         let mut c = Circuit::default();
+        if !plan.union.is_empty() {
+            // UNION ALL: Source → From → Filter → Map per branch, then Union → Sink(append).
+            let branches: Vec<Port> = plan.union.iter().map(|b| c.branch(&b.source, &b.query, "select")).collect();
+            let union = c.add(Op::Union(Union), branches);
+            c.add(Op::Sink(Sink { kind: SinkKind::Append }), vec![union]);
+            c.analyze();
+            return c;
+        }
         // Kafka without CDC: every message is an insert.
         let src = c.add(Op::Source(Source { name: plan.source.clone(), append_only: true }), vec![]);
         let (stream, split) = match &plan.window {
@@ -52,5 +62,17 @@ impl Circuit {
         }
         c.analyze();
         c
+    }
+
+    /// A plain view over one source: Source → From → Filter → Map.
+    fn branch(&mut self, source: &str, q: &Query, label: &str) -> Port {
+        // Kafka without CDC: every message is an insert.
+        let src = self.add(Op::Source(Source { name: source.into(), append_only: true }), vec![]);
+        let from = Op::From(From { alias: q.alias.clone(), from: q.from.clone(), columns: q.columns.clone(), lookups: q.lookups.clone() });
+        let mut last = self.add(from, vec![src]);
+        if let Some(pred) = &q.filter {
+            last = self.add(Op::Filter(Filter { pred: pred.clone() }), vec![last]);
+        }
+        self.add(Op::Map(Map { label: label.into(), items: q.project.clone() }), vec![last])
     }
 }

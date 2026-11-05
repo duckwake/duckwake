@@ -56,6 +56,11 @@ The tests in `crates/circuit/src/tests/` run each view kind epoch by epoch throu
 against an in-memory lake, and compare the view's table with the batch query after every epoch, with epochs
 staged in order and pipelined.
 
+A view may read several sources (`UNION ALL` today, joins next). The worker keeps one input per source, each
+with its reader group, position and watermark; the view's watermark is the oldest of its sources'. One epoch
+stages every source, and its checkpoint row holds all their offsets, so recovery seeks each reader to the
+same epoch. With `--shared-readers`, each input joins the group of its source at its position.
+
 Each operator is a file in `crates/circuit/src/ops/` implementing `Operator`: its class (source, sink, linear,
 non-linear), output properties, input checks, and its stage and commit SQL; a non-linear one also implements
 `Stateful`, its incremental form. The rewrite rules read only the class, so a new operator is a new file, a
@@ -130,7 +135,8 @@ operator's semantics and a test oracle, not a dependency.
 - **Operators.** Filter, project and lookup joins (any lake table in `FROM`; a lookup table is read whole each
   epoch, so a change to it reaches only rows that arrive later). TUMBLE/HOP windows and
   global `GROUP BY` (with `HAVING` and expressions over aggregates) with `count`, `sum`, `min`, `max`
-  and `avg`. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
+  and `avg`. `UNION ALL` of plain views, each branch over any source: the view reads every source in one
+  epoch and commits all their offsets in one checkpoint row. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
   row is written the first time its count turns positive. `HAVING` in windowed views, `DISTINCT` over
   windows and aggregates, `DISTINCT ON`, `count(DISTINCT ...)`, `approx_count_distinct` and stream-stream
   joins are rejected at create time. `min`/`max` in global aggregates and `DISTINCT` assume append-only

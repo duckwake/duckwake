@@ -86,7 +86,7 @@ impl Operator for Sink {
             }
             SinkKind::Late => {
                 let Some(late) = &x.late_table else { return Ok(steps) };
-                let cols = x.source_columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+                let cols = x.primary().columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
                 let sql = format!(
                     "INSERT INTO {late} ({cols}, window_start, window_end, _source_partition, _source_offset, _duckwake_epoch)
                                  SELECT {cols}, window_start, window_end, _partition, _offset, {} FROM {}",
