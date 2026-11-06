@@ -110,6 +110,23 @@ p { margin: 0 0 14px; }
 .footer-links a:hover { background: rgba(247, 248, 245, 0.08); color: var(--paper); }
 .footer-note { width: 100%; margin: 0; font-size: 14px; }
 
+/* about page */
+.page-hero { padding-bottom: 72px; }
+.page-hero .hero-body { padding-top: 48px; }
+.nav-links a[aria-current="page"] { color: var(--paper); }
+.story { max-width: 760px; }
+.story p { font-size: 18px; line-height: 1.7; margin-bottom: 20px; }
+.story h2 { font-size: clamp(26px, 3.4vw, 32px); margin: 48px 0 16px; }
+.story .story-lead { font-size: 22px; line-height: 1.55; color: var(--ink); }
+.pull { margin: 36px 0; padding: 24px 28px; background: var(--ink); color: var(--paper); border-radius: 14px; font-family: var(--display); font-weight: 700; font-size: clamp(22px, 3vw, 28px); line-height: 1.25; letter-spacing: -0.01em; }
+.commitments { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 14px; }
+.commitments li { padding: 18px 22px; background: var(--white); border: 1px solid var(--line); border-left: 4px solid var(--amber); border-radius: 0 12px 12px 0; font-size: 17px; line-height: 1.6; }
+.commitments strong { color: var(--ink); }
+.story .story-end { font-size: 15px; color: var(--mist); margin-top: 36px; }
+.story-actions { margin-top: 28px; }
+.btn-outline { color: var(--ink); border: 1px solid var(--ink); }
+.btn-outline:hover { background: var(--ink); color: var(--paper); }
+
 /* responsive */
 @media (max-width: 900px) {
   .intro { grid-template-columns: minmax(0, 1fr); gap: 28px; }
