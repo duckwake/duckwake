@@ -4,7 +4,7 @@
 cargo build --release
 target/release/duckwaked --worker w1 --quack-token secret      # Quack on quack:localhost:9494, metrics on :9464
 # or the published image (each v* release; amd64 and arm64):
-docker pull ghcr.io/harrydevforlife/duckwake:latest
+docker pull ghcr.io/duckwake/duckwake:latest
 # or in Docker, with its own catalog database and data volume:
 docker compose --profile server up -d --build                 # token: duckwake-dev-token
 ```
