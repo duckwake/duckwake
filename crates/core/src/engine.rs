@@ -17,6 +17,7 @@
 //! and the epoch staged ahead is thrown away with it. Staging tables the commit reads come in two sets, by
 //! epoch parity, so staging the next epoch never overwrites them.
 use crate::catalog::{self, lease_table, state_table, Checkpoint};
+use crate::failover;
 use crate::circuit::{Circuit, Cost, Counter, EpochCtx, SourceInput};
 use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
@@ -41,6 +42,9 @@ pub struct WorkerConfig {
     pub max_epochs: Option<u64>,
     /// How often to look for newly assigned / paused jobs.
     pub refresh_every: Duration,
+    /// Failover: a worker whose heartbeat has not moved for this long is dead, and its views move to the live
+    /// workers. None: this worker heartbeats but never claims another's views.
+    pub lease_timeout: Option<Duration>,
     /// Threads that stage in parallel, each with its own connection; 1 stages everything on the scheduler
     /// thread, 0 means half the cores.
     pub stage_threads: usize,
@@ -304,6 +308,7 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
     let conn = cfg.lake.open()?;
     crate::lake::bootstrap(&conn)?;
     catalog::set_control_inlining(&conn)?;
+    failover::register(&conn, &cfg.worker_id)?;
     if let Some(m) = &cfg.metrics {
         m.set_worker(&cfg.worker_id);
         m.set_up(true);
@@ -327,9 +332,13 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         pipeline = cfg.pipeline,
         shared_readers = cfg.shared_readers,
         lean_commit = cfg.lean_commit,
+        lease_timeout_s = cfg.lease_timeout.map(|t| t.as_secs_f64()),
         "worker started"
     );
+    let liveness = failover::Liveness::new(cfg.lease_timeout.unwrap_or(Duration::MAX));
     let mut w = Worker {
+        liveness,
+        last_heartbeat: Instant::now(),
         cfg,
         rt,
         conns,
@@ -342,6 +351,8 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         drops: Vec::new(),
     };
     w.run(&shutdown)?;
+    // The others take this worker's views over at once instead of after the lease timeout.
+    failover::deregister(&w.conns[0], &w.cfg.worker_id)?;
     info!(worker = %w.cfg.worker_id, "worker stopped");
     Ok(())
 }
@@ -389,6 +400,15 @@ struct Worker {
     committed: u64,
     /// Staging tables to drop once the next epoch has committed.
     drops: Vec<String>,
+    /// The other workers' heartbeats as this one has seen them.
+    liveness: failover::Liveness,
+    last_heartbeat: Instant,
+}
+
+/// How often a worker heartbeats: well inside the lease timeout, and at least every 5 s so workers with a
+/// shorter timeout than this one's still see it alive.
+fn heartbeat_every(lease_timeout: Option<Duration>) -> Duration {
+    lease_timeout.map_or(Duration::from_secs(5), |t| (t / 5).clamp(Duration::from_millis(500), Duration::from_secs(5)))
 }
 
 impl Worker {
@@ -399,6 +419,10 @@ impl Worker {
             if let Some(c) = self.committer.try_finish()? {
                 self.apply(c);
                 continue;
+            }
+            if self.last_heartbeat.elapsed() >= heartbeat_every(self.cfg.lease_timeout) {
+                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len())?;
+                self.last_heartbeat = Instant::now();
             }
             if last_refresh.elapsed() >= self.cfg.refresh_every {
                 self.refresh()?;
@@ -454,9 +478,13 @@ impl Worker {
         self.cfg.max_epochs.is_some_and(|m| self.committed >= m)
     }
 
-    /// Picks up jobs newly assigned to this worker and drops ones paused, stopped or taken over.
+    /// Picks up jobs newly assigned to this worker and drops ones paused, stopped or taken over. With
+    /// failover, first claims this worker's share of the views whose owner is dead or unassigned.
     fn refresh(&mut self) -> Result<()> {
-        let running = catalog::running_jobs(&self.conns[0])?;
+        let mut running = catalog::running_jobs(&self.conns[0])?;
+        if self.cfg.lease_timeout.is_some() && self.claim_orphans(&running)? {
+            running = catalog::running_jobs(&self.conns[0])?;
+        }
         let mine: BTreeMap<String, i64> = running
             .into_iter()
             .filter(|(_, owner, _)| owner.as_deref() == Some(self.cfg.worker_id.as_str()))
@@ -488,6 +516,35 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Claims this worker's share of the orphaned views (see `failover`); true when it claimed any.
+    fn claim_orphans(&mut self, running: &[(String, Option<String>, i64)]) -> Result<bool> {
+        let conn = &self.conns[0];
+        let me = self.cfg.worker_id.as_str();
+        let beats = failover::beats(conn)?;
+        let now = Instant::now();
+        let owners = running.iter().filter_map(|(_, o, _)| o.clone()).filter(|o| o != failover::ANY_WORKER);
+        self.liveness.observe(&beats, owners, now);
+        let mut live = self.liveness.live(now);
+        if !live.iter().any(|w| w == me) {
+            live.push(me.to_string());
+            live.sort();
+        }
+        let mut claimed = false;
+        for (job, from, lease) in failover::plan(me, running, &live, |w| self.liveness.dead(w, now)) {
+            match failover::claim(conn, &job, from.as_deref(), lease, me) {
+                Ok(true) => {
+                    info!(job = %job, from = from.as_deref().unwrap_or("unassigned"), "claimed orphaned view");
+                    claimed = true;
+                }
+                Ok(false) => {}
+                // Another worker claimed it first.
+                Err(e) if crate::lake::is_conflict(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(claimed)
     }
 
     /// Recovery: take the lease, read the latest checkpoint, seek each partition to its offset. State needs no

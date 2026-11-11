@@ -107,6 +107,7 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     action::<Wait>(conn, api)?;
     query::<Explain>(conn, api)?;
     query::<Jobs>(conn, api)?;
+    query::<Workers>(conn, api)?;
     query::<Checkpoints>(conn, api)?;
     query::<Sources>(conn, api)?;
     query::<MetricsFn>(conn, api)?;
@@ -343,7 +344,8 @@ impl Spec for CreateView {
     }
 }
 
-/// `duckwake_start(view, worker :=)`: without a worker, the server's own.
+/// `duckwake_start(view, worker :=)`: without a worker, the server's own; `worker := 'any'` leaves the view to
+/// whichever live worker claims it.
 struct Start;
 impl Spec for Start {
     const NAME: &'static str = "duckwake_start";
@@ -528,6 +530,18 @@ impl Spec for Jobs {
     }
 }
 
+/// `duckwake_workers()`: every worker that ran on this lake, its state, views and last heartbeat.
+struct Workers;
+impl Spec for Workers {
+    const NAME: &'static str = "duckwake_workers";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![]
+    }
+    fn run(api: &Api, _: &Args) -> Result<Out> {
+        Ok(Out::Query(api.with(api::workers_sql)?))
+    }
+}
+
 /// `duckwake_checkpoints(view, n := 10)`: the newest n checkpoints.
 struct Checkpoints;
 impl Spec for Checkpoints {
@@ -643,6 +657,7 @@ impl Spec for WorkerStart {
                 maintenance: crate::maintenance::MaintenanceConfig::default(),
                 max_epochs: None,
                 refresh_every: std::time::Duration::from_secs(1),
+                lease_timeout: Some(std::time::Duration::from_secs(30)),
                 stage_threads,
                 pipeline,
                 shared_readers,

@@ -23,8 +23,9 @@ that must pass before the next starts. The same plan is in the design doc's
 
 ## P2. Runs in a real environment
 
-- [ ] **Automatic failover.** When a worker dies, its views stop until someone runs `start --worker` elsewhere.
-      Add worker heartbeats, lease expiry and reassignment of orphaned views to live workers.
+- [x] **Automatic failover.** Workers heartbeat into the lake; a view whose worker dies, freezes or stops
+      moves to the live workers within the lease timeout and continues from its checkpoint
+      (`scripts/failover_test.sh`). Still to come: rebalancing onto workers that join later.
 - [ ] **Kafka SASL and TLS.** Only plaintext brokers work today; most production clusters require auth.
 - [ ] **Object storage.** Data files on S3 or GCS, tested against MinIO. Every test so far used local disk.
 - [ ] **Secrets.** Catalog passwords live in connection strings, env vars and stored definitions; read them from

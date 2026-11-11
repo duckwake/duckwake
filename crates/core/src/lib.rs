@@ -5,6 +5,7 @@ pub mod api;
 pub mod catalog;
 pub mod decode;
 pub mod engine;
+pub mod failover;
 pub mod kafka;
 pub mod lake;
 pub mod maintenance;

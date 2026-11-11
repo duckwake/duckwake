@@ -10,7 +10,8 @@
 | JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
 | Views as DBSP circuits: operator graph, incrementalization, SQL per operator | the `duckwake_circuit` crate (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
-| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>` |
+| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>`; `failover.rs`: `worker_<id>` |
+| Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
 
@@ -205,6 +206,22 @@ operator's semantics and a test oracle, not a dependency.
    - `reset` of a view restores an upsert or counted table with time travel (delete all, insert the old
      version), which its retracting readers see as ordinary deletes and inserts: they follow the reset
      through the change feed. A windowed reader of an append-only view stops instead (F3 cascades reset).
+12. **Failover needs heartbeats in tables of their own, and dead workers judged on the observer's clock.**
+   A shared `workers` table would conflict the way `jobs` would (finding 1), so each worker owns
+   `__duckwake.worker_<id>`, one row it updates every `lease_timeout / 5` (at most every 5 s), inlined in the
+   catalog. A worker is dead when its `beat` counter has not moved for `--lease-timeout` (default 30 s) as
+   timed by the worker watching it, so clocks need not agree; a worker that stops cleanly marks itself
+   `stopped` and is dead at once. In each refresh (every 2 s) a worker reads the heartbeats and the
+   running views' leases, and claims its share of the orphans: views unassigned (`start` without a worker)
+   or owned by a dead worker. Each orphan goes, in job order, to the live worker with the fewest views, so
+   every worker computes the same plan. A claim is `UPDATE lease SET owner_worker = me, lease_epoch =
+   lease_epoch + 1 WHERE owner_worker = <old> AND lease_epoch = <read>`; two workers claiming one view
+   conflict and the first committer wins. The new owner starts from the last checkpoint as after any
+   restart, and the bumped lease fences the old owner if it was only stalled (`scripts/failover_test.sh`
+   freezes one with SIGSTOP and thaws it: its in-flight commit is rejected and it lets go). The heartbeat
+   runs on the scheduler thread, so a worker whose epoch loop is stuck looks dead too; a commit that takes
+   longer than the timeout moves views needlessly but never breaks exactly-once. Each heartbeat is one
+   catalog snapshot (17,280 a day per worker at the default 5 s), expired with the epochs' snapshots.
 
 ## Simplifications and gaps
 
@@ -241,6 +258,9 @@ operator's semantics and a test oracle, not a dependency.
   later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`, so it
   compares with Kafka event times. A view reading a lake table polls its change feed every epoch even when
   the table is idle; views on one table should share that read (F4).
+- **Failover.** Views move only away from dead workers: nothing rebalances views onto a worker that joins
+  later, and a view's owner is never chosen by load beyond the count of views. Every worker that ever ran
+  keeps its `worker_<id>` table (state `stopped` after a clean stop); nothing drops old ones yet.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark
   holds at the checkpointed value until every active partition reports again.
 
@@ -255,5 +275,5 @@ crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and exte
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
-scripts/         crash, chain, retract, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
+scripts/         crash, chain, retract, fencing, failover, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

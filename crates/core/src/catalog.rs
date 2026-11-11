@@ -462,7 +462,8 @@ pub fn retry_conflicts<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
-/// `start` assigns the job to `worker` and bumps the lease, which fences the previous owner's next commit.
+/// `start` assigns the job to `worker` (`any`: to whichever live worker claims it) and bumps the lease, which
+/// fences the previous owner's next commit.
 pub fn set_status(conn: &Connection, job: &str, status: JobStatus, worker: Option<&str>) -> Result<()> {
     job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
     retry_conflicts(|| set_status_once(conn, job, status, worker))
@@ -476,9 +477,11 @@ fn set_status_once(conn: &Connection, job: &str, status: JobStatus, worker: Opti
             [status.as_str(), job],
         )?;
         if let Some(w) = worker {
+            // `any` leaves the view unassigned, for any live worker to claim (see `failover`).
+            let owner = (w != crate::failover::ANY_WORKER).then_some(w);
             conn.execute(
                 &format!("UPDATE {} SET owner_worker = ?, lease_epoch = lease_epoch + 1", lease_table(job)),
-                [w],
+                [owner],
             )?;
         }
         Ok(())

@@ -66,11 +66,20 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
     Ok((def, msg))
 }
 
-/// Assigns the view to `worker` and bumps its lease, which fences the previous owner's next commit.
+/// Assigns the view to `worker` and bumps its lease, which fences the previous owner's next commit. With
+/// `any`, the view is left for whichever live worker claims it first.
 pub fn start(conn: &Connection, name: &str, worker: &str) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
     catalog::set_status(conn, &job, JobStatus::Running, Some(worker))?;
+    if worker == crate::failover::ANY_WORKER {
+        return Ok(format!("{job}: running on the next live worker to claim it"));
+    }
     Ok(format!("{job}: running on {worker}"))
+}
+
+/// The query behind `duckwake_workers()`.
+pub fn workers_sql(conn: &Connection) -> Result<String> {
+    crate::failover::workers_query(conn)
 }
 
 pub fn pause(conn: &Connection, name: &str) -> Result<String> {

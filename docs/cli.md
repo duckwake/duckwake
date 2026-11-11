@@ -40,6 +40,16 @@ can't decode.
 
 `run`, `serve` and `playground` take the worker flags described in [performance.md](performance.md).
 
+## Workers and failover
+
+Every worker heartbeats into the lake. When one dies, its views move to the live workers once its heartbeat
+has not moved for `--lease-timeout` (default `30s`), and they continue from their last checkpoint; a worker
+stopped with Ctrl-C or SIGTERM hands its views over at once. `start NAME` without `--worker` leaves the view
+to whichever live worker claims it, and the workers spread such views by count. `workers` lists every worker
+with its state, views and last heartbeat. `--lease-timeout off` keeps a worker from taking over other
+workers' views. Nothing rebalances views onto a worker that joins later: start the workers before the views,
+or move a view with `start NAME --worker W`.
+
 ## Playground
 
 ```sh

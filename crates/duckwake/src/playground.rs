@@ -206,6 +206,7 @@ fn spawn_worker(app: Shared) -> std::thread::JoinHandle<()> {
                 },
                 max_epochs: None,
                 refresh_every: Duration::from_secs(1),
+                lease_timeout: Some(Duration::from_secs(30)),
                 stage_threads: app.opts.stage_threads,
                 pipeline: app.opts.pipeline,
                 shared_readers: app.opts.shared_readers,

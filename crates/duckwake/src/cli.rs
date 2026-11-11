@@ -69,7 +69,8 @@ enum Cmd {
     /// duckwake_start(view): assign to a worker (bumps the lease, fencing the previous owner).
     Start {
         name: String,
-        #[arg(long)]
+        /// The worker to run it on; `any` (the default) leaves it to whichever live worker claims it.
+        #[arg(long, default_value = "any")]
         worker: String,
     },
     /// duckwake_pause(view)
@@ -91,6 +92,8 @@ enum Cmd {
     },
     /// duckwake_jobs(): status, epoch, watermark, freshness, lag.
     Jobs,
+    /// duckwake_workers(): every worker that ran on this lake, its state, views and last heartbeat.
+    Workers,
     /// duckwake_checkpoints(view)
     Checkpoints {
         name: String,
@@ -204,6 +207,10 @@ pub struct WorkerArgs {
     pub prune_every: String,
     #[arg(long, default_value_t = 1000)]
     pub keep_checkpoints: i64,
+    /// Failover: a worker whose heartbeat has not moved for this long is dead and its views move to live
+    /// workers; `off` keeps this worker from taking over others' views.
+    #[arg(long, default_value = "30s", env = "DUCKWAKE_LEASE_TIMEOUT")]
+    pub lease_timeout: String,
     /// Stage views in parallel on this many threads, each with its own connection (0 = half the cores).
     #[arg(long, default_value_t = 1, env = "DUCKWAKE_STAGE_THREADS")]
     pub stage_threads: usize,
@@ -235,6 +242,10 @@ impl WorkerArgs {
             },
             max_epochs: self.max_epochs,
             refresh_every: Duration::from_secs(2),
+            lease_timeout: match self.lease_timeout.as_str() {
+                "off" | "0" => None,
+                t => Some(parse_duration(t)?),
+            },
             stage_threads: self.stage_threads,
             pipeline: self.pipeline,
             shared_readers: self.shared_readers,
@@ -314,6 +325,10 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 Some(sql) => print_query(&conn, &sql)?,
                 None => println!("no views"),
             }
+        }
+        Cmd::Workers => {
+            let conn = open()?;
+            print_query(&conn, &api::workers_sql(&conn)?)?;
         }
         Cmd::Checkpoints { name, limit } => {
             let conn = open()?;

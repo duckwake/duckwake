@@ -51,6 +51,7 @@ jobs:
           # The reset test replays the lake the crash test leaves behind.
           - { name: crash+reset, run: "scripts/crash_test.sh && scripts/reset_test.sh" }
           - { name: fencing, run: scripts/fencing_test.sh }
+          - { name: failover, run: scripts/failover_test.sh }
           - { name: chain, run: scripts/chain_test.sh }
           - { name: retract, run: scripts/retract_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
@@ -62,6 +63,7 @@ jobs:
           - { name: composed, run: scripts/composed_test.sh, duckdb_cli: true }
           # The suites that kill workers mid-epoch, again with the four parallel-processing flags.
           - { name: crash pipelined, run: scripts/crash_test.sh, flags: true }
+          - { name: failover pipelined, run: scripts/failover_test.sh, flags: true }
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
     name: suite (${{ matrix.name }})
