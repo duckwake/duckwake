@@ -391,7 +391,7 @@ fn produce_hostile(brokers: &str, topic: &str, n: usize, seed: u64) -> Result<()
     use rskafka::record::Record;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let c = duckwake_core::kafka::client(brokers).await?;
+        let c = duckwake_core::kafka::plain_client(brokers).await?;
         duckwake_core::kafka::ensure_topic(&c, topic, PARTITIONS as i32).await?;
         for (p, msgs) in hostile_corpus(n, seed).into_iter().enumerate() {
             let pc = c.partition_client(topic, p as i32, UnknownTopicHandling::Retry).await?;

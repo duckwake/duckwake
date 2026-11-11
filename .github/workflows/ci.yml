@@ -52,6 +52,8 @@ jobs:
           - { name: crash+reset, run: "scripts/crash_test.sh && scripts/reset_test.sh" }
           - { name: fencing, run: scripts/fencing_test.sh }
           - { name: failover, run: scripts/failover_test.sh }
+          - { name: kafka-auth, run: scripts/kafka_auth_test.sh }
+          - { name: crash sasl_ssl, run: KAFKA_AUTH=sasl_ssl scripts/crash_test.sh }
           - { name: chain, run: scripts/chain_test.sh }
           - { name: retract, run: scripts/retract_test.sh }
           - { name: retention, run: scripts/retention_test.sh }

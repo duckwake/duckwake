@@ -13,20 +13,26 @@ services:
       interval: 2s
       retries: 30
 
+  # Listeners in docker/kafka/redpanda.yaml: 19092 open (rpk, producers, plaintext sources), 19093 SASL,
+  # 19094 SASL over TLS, 19095 TLS with client certificates (test-only certs in docker/kafka). The SCRAM user
+  # duckwake / duckwake-dev is created once the cluster is up.
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:latest
-    command:
-      - redpanda
-      - start
-      - --mode=dev-container
-      - --smp=1
-      - --memory=1G
-      # internal: rpk inside the container; external: the worker and tools on the host.
-      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://localhost:9092,external://localhost:19092
-    ports: ["19092:19092"]
+    entrypoint:
+      - bash
+      - -c
+      - |
+        cp /etc/redpanda-dev/redpanda.yaml /etc/redpanda/
+        # SASL on for the listeners that ask for it (the others stay open); no ACLs, so any user may do anything.
+        (until rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true'; do sleep 1; done
+         rpk cluster config set enable_sasl=true kafka_enable_authorization=false
+         rpk security user list 2>/dev/null | grep -qw duckwake ||
+           rpk security user create duckwake -p duckwake-dev --mechanism SCRAM-SHA-256) &
+        exec /entrypoint.sh redpanda start --mode=dev-container --smp=1 --memory=1G
+    volumes: ["./docker/kafka:/etc/redpanda-dev:ro"]
+    ports: ["19092:19092", "19093:19093", "19094:19094", "19095:19095"]
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true' && rpk security user list | grep -qw duckwake && rpk cluster config get enable_sasl | grep -q true"]
       interval: 2s
       retries: 30
 

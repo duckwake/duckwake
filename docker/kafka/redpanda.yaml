@@ -1,0 +1,39 @@
+# The local Redpanda's listeners. internal (rpk in the container) and external (the tests' producers and
+# plaintext sources) need no auth, as before. The other three are for sources that authenticate:
+#   sasl      localhost:19093  SASL_PLAINTEXT, SCRAM user duckwake / duckwake-dev (made at start)
+#   sasl_tls  localhost:19094  SASL_SSL, the same user, broker certificate from ca.crt
+#   mtls      localhost:19095  SSL with a client certificate (client.crt) signed by ca.crt
+redpanda:
+  data_directory: /var/lib/redpanda/data
+  seed_servers: []
+  rpc_server: { address: 0.0.0.0, port: 33145 }
+  advertised_rpc_api: { address: 127.0.0.1, port: 33145 }
+  admin: [{ address: 0.0.0.0, port: 9644 }]
+  kafka_api:
+    - { name: internal, address: 0.0.0.0, port: 9092, authentication_method: none }
+    - { name: external, address: 0.0.0.0, port: 19092, authentication_method: none }
+    - { name: sasl, address: 0.0.0.0, port: 19093, authentication_method: sasl }
+    - { name: sasl_tls, address: 0.0.0.0, port: 19094, authentication_method: sasl }
+    - { name: mtls, address: 0.0.0.0, port: 19095, authentication_method: none }
+  advertised_kafka_api:
+    - { name: internal, address: localhost, port: 9092 }
+    - { name: external, address: localhost, port: 19092 }
+    - { name: sasl, address: localhost, port: 19093 }
+    - { name: sasl_tls, address: localhost, port: 19094 }
+    - { name: mtls, address: localhost, port: 19095 }
+  kafka_api_tls:
+    - name: sasl_tls
+      enabled: true
+      cert_file: /etc/redpanda-dev/broker.crt
+      key_file: /etc/redpanda-dev/broker.key
+      truststore_file: /etc/redpanda-dev/ca.crt
+    - name: mtls
+      enabled: true
+      require_client_auth: true
+      cert_file: /etc/redpanda-dev/broker.crt
+      key_file: /etc/redpanda-dev/broker.key
+      truststore_file: /etc/redpanda-dev/ca.crt
+  developer_mode: true
+rpk:
+  overprovisioned: true
+  coredump_dir: /var/lib/redpanda/coredump

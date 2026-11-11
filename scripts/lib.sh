@@ -16,6 +16,19 @@ VIEWS=(clicks_per_window big_spend game_totals active_users all_events)
 export DECODE=${DECODE:-auto}
 # Extra flags for every worker the tests start, e.g. "--stage-threads 4 --pipeline --shared-readers".
 WORKER_FLAGS=${WORKER_FLAGS:-}
+# How the test sources reach Redpanda (docker/kafka/redpanda.yaml): unset for the open listener, or sasl_plaintext,
+# sasl_ssl or mtls for the authenticated ones. Producers and rpk always use the open listener.
+KAFKA_AUTH=${KAFKA_AUTH:-}
+export DUCKWAKE_TEST_KAFKA_PASSWORD=duckwake-dev
+CERTS=$PWD/docker/kafka
+SCRAM='"security_protocol":"%s","sasl_mechanism":"SCRAM-SHA-256","sasl_username":"duckwake","sasl_password":"env:DUCKWAKE_TEST_KAFKA_PASSWORD"'
+case $KAFKA_AUTH in
+  "") KAFKA='"brokers":"localhost:19092"' ;;
+  sasl_plaintext) KAFKA="\"brokers\":\"localhost:19093\",$(printf "$SCRAM" sasl_plaintext)" ;;
+  sasl_ssl) KAFKA="\"brokers\":\"localhost:19094\",$(printf "$SCRAM" sasl_ssl),\"ssl_ca_location\":\"$CERTS/ca.crt\"" ;;
+  mtls) KAFKA="\"brokers\":\"localhost:19095\",\"security_protocol\":\"ssl\",\"ssl_ca_location\":\"$CERTS/ca.crt\",\"ssl_certificate_location\":\"$CERTS/client.crt\",\"ssl_key_location\":\"$CERTS/client.key\"" ;;
+  *) echo "KAFKA_AUTH must be sasl_plaintext, sasl_ssl or mtls"; exit 1 ;;
+esac
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -39,7 +52,7 @@ reset_lake() {
 # Source plus the views used by the tests: a windowed aggregate (with late-data table) and a filter.
 setup_views() {
   local epoch=${1:-2s} window=${2:-10 SECOND} delay=${3:-5 seconds}
-  "$BIN" create-source clicks --options "{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC\",\"event_time\":\"ts\",
+  "$BIN" create-source clicks --options "{$KAFKA,\"topic\":\"$TOPIC\",\"event_time\":\"ts\",
     \"watermark_delay\":\"$delay\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
     \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}"
   "$BIN" create-view analytics.clicks_per_window --late-data lake.analytics.clicks_late \
@@ -53,7 +66,7 @@ setup_views() {
     --sql "SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
            FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5" | head -1
   # UNION ALL of two sources: big clicks and every purchase.
-  "$BIN" create-source purchases --options "{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC2\",\"event_time\":\"ts\",
+  "$BIN" create-source purchases --options "{$KAFKA,\"topic\":\"$TOPIC2\",\"event_time\":\"ts\",
     \"watermark_delay\":\"$delay\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
     \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}" >/dev/null
   "$BIN" create-view analytics.all_events --epoch-interval "$epoch" \

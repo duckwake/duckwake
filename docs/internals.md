@@ -222,12 +222,23 @@ operator's semantics and a test oracle, not a dependency.
    runs on the scheduler thread, so a worker whose epoch loop is stuck looks dead too; a commit that takes
    longer than the timeout moves views needlessly but never breaks exactly-once. Each heartbeat is one
    catalog snapshot (17,280 a day per worker at the default 5 s), expired with the epochs' snapshots.
+13. **Kafka credentials stay out of the lake.** Source definitions live in `__duckwake.sources`, readable by
+   anyone who can read the lake, so `sasl_password` must be `env:NAME` or `file:/path` (`secrets.rs`),
+   resolved by each worker when it connects. TLS uses rustls with ring, the same stack rskafka uses, with the
+   Mozilla roots unless `ssl_ca_location` names CAs. rskafka retries a failed connection forever, a refused
+   SASL handshake included, so the first connection of a source is bounded (10 s): without it, one source
+   with a wrong password hung its worker and every view on it. `scripts/kafka_auth_test.sh` runs the test
+   views over SCRAM in plaintext, SCRAM over TLS and TLS with a client certificate against the local
+   Redpanda's authenticated listeners (`docker/kafka`), and checks the refusals.
 
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
   parser hooks, so it needs a C++ shim. The extension is unsigned and built per platform. The server's Quack token is one shared secret; there are no users or roles.
-- **Sources.** Kafka only, JSON only, with declared columns. Unknown fields are dropped; there is no
+- **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
+  certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
+  view is marked failed, so a view starting while its brokers are down needs `start` again; once
+  connected, readers retry through broker restarts. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
   across workers. Without `--shared-readers` each job has its own readers: two jobs on one source read it
@@ -269,11 +280,12 @@ operator's semantics and a test oracle, not a dependency.
 ```
 crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
                  operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
-crates/core      duckwake_core: engine, catalog, Kafka, decode, maintenance, verify
+crates/core      duckwake_core: engine, catalog, failover, Kafka, secrets, decode, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
-scripts/         crash, chain, retract, fencing, failover, reset, retention, decode, shared-reader, server and extension tests; benchmark
+docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
+scripts/         crash, chain, retract, fencing, failover, kafka auth, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

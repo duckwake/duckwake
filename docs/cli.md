@@ -38,6 +38,22 @@ functions would goes through the SQL decode instead, so the rows and dead letter
 `"decode": "sql"` decodes everything in SQL; `"decode": "arrow"` refuses a source whose column types Arrow
 can't decode.
 
+A source reaches its brokers in plaintext unless its options say otherwise, with the names Kafka clients use:
+`security_protocol` (`plaintext`, `ssl`, `sasl_plaintext` or `sasl_ssl`), `sasl_mechanism` (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`), `sasl_username` and `sasl_password`, and with TLS `ssl_ca_location`
+(a PEM file of CAs; the public roots otherwise) and, for brokers that want client certificates,
+`ssl_certificate_location` and `ssl_key_location`. The password is never stored in the lake: it must be
+`env:NAME` or `file:/path`, read by each worker when it connects, so every worker that may run the view needs
+that variable or file, and so do the paths. A source whose brokers cannot be reached within 10 s when a view
+starts (a wrong password or certificate, or the wrong address) marks the view `failed`, with the reason;
+`start` it again once fixed.
+
+```sh
+$B create-source clicks --options '{"brokers":"kafka-1:9094","topic":"clicks","event_time":"ts",
+  "security_protocol":"sasl_ssl","sasl_mechanism":"SCRAM-SHA-512","sasl_username":"duckwake",
+  "sasl_password":"env:KAFKA_PASSWORD","columns":{"ts":"TIMESTAMP","game_id":"VARCHAR"}}'
+```
+
 `run`, `serve` and `playground` take the worker flags described in [performance.md](performance.md).
 
 ## Workers and failover

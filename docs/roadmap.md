@@ -26,7 +26,8 @@ that must pass before the next starts. The same plan is in the design doc's
 - [x] **Automatic failover.** Workers heartbeat into the lake; a view whose worker dies, freezes or stops
       moves to the live workers within the lease timeout and continues from its checkpoint
       (`scripts/failover_test.sh`). Still to come: rebalancing onto workers that join later.
-- [ ] **Kafka SASL and TLS.** Only plaintext brokers work today; most production clusters require auth.
+- [x] **Kafka SASL and TLS.** SASL PLAIN and SCRAM, TLS with custom CAs and client certificates; passwords
+      are `env:` or `file:` references (`scripts/kafka_auth_test.sh`). OAUTHBEARER and Kerberos are not built.
 - [ ] **Object storage.** Data files on S3 or GCS, tested against MinIO. Every test so far used local disk.
 - [ ] **Secrets.** Catalog passwords live in connection strings, env vars and stored definitions; read them from
       a secret store or file instead. Quack has one shared token and no TLS of its own (use a TLS proxy).

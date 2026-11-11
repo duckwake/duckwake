@@ -438,7 +438,7 @@ async fn create_source(State(app): State<Shared>, Json(r): Json<CreateSourceReq>
     let parts = r.partitions.unwrap_or(3);
     app.rt
         .spawn(async move {
-            let c = kafka::client(&brokers).await?;
+            let c = kafka::plain_client(&brokers).await?;
             kafka::ensure_topic(&c, &t2, parts).await
         })
         .await
@@ -483,7 +483,7 @@ async fn source_detail(State(app): State<Shared>, Path(name): Path<String>) -> A
     let offsets = app
         .rt
         .spawn(async move {
-            let c = kafka::client(&opts.brokers).await?;
+            let c = kafka::client(&opts).await?;
             let mut out = Vec::new();
             for p in kafka::partitions(&c, &opts.topic).await? {
                 let pc = c.partition_client(&opts.topic, p, rskafka::client::partition::UnknownTopicHandling::Retry).await?;
@@ -565,7 +565,7 @@ fn fake_event(opts: &SourceOptions, late: bool) -> Value {
 
 async fn generate(opts: SourceOptions, rate: u64, late_pct: f64, bad_pct: f64, produced: Arc<AtomicU64>) {
     let run = async {
-        let c = kafka::client(&opts.brokers).await?;
+        let c = kafka::client(&opts).await?;
         let parts = kafka::partitions(&c, &opts.topic).await?;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut carry = 0.0;
@@ -626,7 +626,7 @@ async fn send_events(State(app): State<Shared>, Path(name): Path<String>, Json(r
     let n = payloads.len();
     app.rt
         .spawn(async move {
-            let c = kafka::client(&opts.brokers).await?;
+            let c = kafka::client(&opts).await?;
             let parts = kafka::partitions(&c, &opts.topic).await?;
             let mut by_part: Vec<Vec<Vec<u8>>> = vec![Vec::new(); parts.len()];
             for (i, p) in payloads.into_iter().enumerate() {

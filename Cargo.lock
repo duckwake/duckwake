@@ -744,10 +744,13 @@ dependencies = [
  "duckwake_circuit",
  "rand 0.9.5",
  "rskafka",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1740,9 +1743,11 @@ dependencies = [
  "parking_lot",
  "rand 0.8.8",
  "rsasl",
+ "rustls",
  "snap",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "zstd",
 ]
@@ -2161,6 +2166,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

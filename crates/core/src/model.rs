@@ -31,6 +31,26 @@ pub struct SourceOptions {
     /// `auto` (Arrow when every column type has an Arrow decoder, else SQL), `arrow` or `sql`.
     #[serde(default = "default_decode")]
     pub decode: String,
+    /// How to reach the brokers, named as Kafka clients name it: `plaintext` (default), `ssl`,
+    /// `sasl_plaintext` or `sasl_ssl`.
+    #[serde(default = "default_security_protocol")]
+    pub security_protocol: String,
+    /// With SASL: `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_mechanism: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_username: Option<String>,
+    /// `env:NAME` or `file:/path`, resolved by the worker when it connects (`secrets`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_password: Option<String>,
+    /// With TLS: a PEM file of CA certificates to trust instead of the public roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_ca_location: Option<String>,
+    /// With TLS and a broker that wants client certificates: PEM files of the certificate chain and its key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_certificate_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_key_location: Option<String>,
 }
 
 fn default_format() -> String {
@@ -47,6 +67,47 @@ fn default_start() -> String {
 }
 fn default_decode() -> String {
     "auto".into()
+}
+fn default_security_protocol() -> String {
+    "plaintext".into()
+}
+
+impl SourceOptions {
+    /// Checks the connection settings: protocol and mechanism names, credentials with SASL, a password given
+    /// as a reference, files only with TLS.
+    fn check_security(&self) -> Result<()> {
+        let (tls, sasl) = match self.security_protocol.to_ascii_lowercase().as_str() {
+            "plaintext" => (false, false),
+            "ssl" => (true, false),
+            "sasl_plaintext" => (false, true),
+            "sasl_ssl" => (true, true),
+            p => bail!("security_protocol must be plaintext, ssl, sasl_plaintext or sasl_ssl, not {p:?}"),
+        };
+        if sasl {
+            match self.sasl_mechanism.as_deref().map(str::to_ascii_uppercase).as_deref() {
+                Some("PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512") => {}
+                Some(m) => bail!("sasl_mechanism must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512, not {m:?}"),
+                None => bail!("security_protocol {} needs sasl_mechanism", self.security_protocol),
+            }
+            if self.sasl_username.as_deref().is_none_or(str::is_empty) {
+                bail!("security_protocol {} needs sasl_username", self.security_protocol);
+            }
+            let Some(p) = &self.sasl_password else {
+                bail!("security_protocol {} needs sasl_password (env:NAME or file:/path)", self.security_protocol)
+            };
+            crate::secrets::check_reference("sasl_password", p)?;
+        } else if self.sasl_mechanism.is_some() || self.sasl_username.is_some() || self.sasl_password.is_some() {
+            bail!("sasl_* options need security_protocol sasl_plaintext or sasl_ssl");
+        }
+        let files = [&self.ssl_ca_location, &self.ssl_certificate_location, &self.ssl_key_location];
+        if !tls && files.iter().any(|f| f.is_some()) {
+            bail!("ssl_* options need security_protocol ssl or sasl_ssl");
+        }
+        if self.ssl_certificate_location.is_some() != self.ssl_key_location.is_some() {
+            bail!("ssl_certificate_location and ssl_key_location go together");
+        }
+        Ok(())
+    }
 }
 
 impl SourceOptions {
@@ -93,6 +154,7 @@ impl SourceOptions {
             "arrow" => {}
             d => bail!("decode must be 'auto', 'arrow' or 'sql', not {d:?}"),
         }
+        o.check_security()?;
         Ok(o)
     }
 }

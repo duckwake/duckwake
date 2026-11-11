@@ -62,6 +62,6 @@ across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `m
 another view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with
 nothing to declare; when that table's rows are updated or deleted, the view retracts them (windowed views
 need it insert-only). Workers heartbeat into the lake, and the views of a worker that dies move to the live
-ones. Every test checks the views against the same SQL run as one batch query. Not yet:
+ones. Sources connect with SASL (PLAIN, SCRAM) and TLS, with passwords kept out of the lake. Every test checks the views against the same SQL run as one batch query. Not yet:
 `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.

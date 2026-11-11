@@ -477,7 +477,7 @@ async fn produce(
     eos: bool,
 ) -> Result<()> {
     use rand::Rng;
-    let client = kafka::client(brokers).await?;
+    let client = kafka::plain_client(brokers).await?;
     kafka::ensure_topic(&client, topic, partitions).await?;
     let parts = kafka::partitions(&client, topic).await?;
     let tick = Duration::from_millis(100);
