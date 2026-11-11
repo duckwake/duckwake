@@ -9,7 +9,10 @@ SEED=${SEED:-7}
 VIEWS=(all_sql all_arrow)
 
 log "fresh lake and topic"; reset_env
-cargo run -q --release -p duckwake_core --example phase_a_arrow_decode -- produce localhost:19092 "$TOPIC" "$MESSAGES" "$SEED"
+# The generator is an example of duckwake_core; CI ships it prebuilt next to the binaries.
+GEN=target/release/examples/phase_a_arrow_decode
+[[ -x $GEN ]] || cargo build -q --release -p duckwake_core --example phase_a_arrow_decode
+"$GEN" produce localhost:19092 "$TOPIC" "$MESSAGES" "$SEED"
 
 for d in sql arrow; do
   "$BIN" create-source "src_$d" --options "{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC\",\"event_time\":\"ts\",

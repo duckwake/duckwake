@@ -1,0 +1,101 @@
+# CI: clippy and the unit tests, then every integration suite against the docker-compose stack (PostgreSQL
+# catalog, Redpanda), each in its own job from one release build. The suites are the gates in docs/testing.md;
+# each verifies its views against a batch recomputation and exits non-zero when anything differs.
+# `ci-passed` is the one check to require before merging.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The bundled DuckDB takes ~15 min to compile cold; the cache keeps it.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release --bins --examples
+      - run: bash scripts/build_extension.sh
+      - run: |
+          tar -cf binaries.tar target/release/duckwake target/release/duckwaked \
+            target/release/duckwake.duckdb_extension target/release/examples/phase_a_arrow_decode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: binaries.tar
+          retention-days: 3
+
+  suite:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The reset test replays the lake the crash test leaves behind.
+          - { name: crash+reset, run: "scripts/crash_test.sh && scripts/reset_test.sh" }
+          - { name: fencing, run: scripts/fencing_test.sh }
+          - { name: chain, run: scripts/chain_test.sh }
+          - { name: retract, run: scripts/retract_test.sh }
+          - { name: retention, run: scripts/retention_test.sh }
+          - { name: decode, run: scripts/decode_test.sh }
+          - { name: catchup, run: EVENTS=100000 scripts/catchup_test.sh }
+          - { name: shared-reader, run: scripts/shared_reader_test.sh }
+          - { name: serve, run: scripts/serve_test.sh }
+          - { name: extension, run: scripts/extension_test.sh }
+          - { name: composed, run: scripts/composed_test.sh, duckdb_cli: true }
+          # The suites that kill workers mid-epoch, again with the four parallel-processing flags.
+          - { name: crash pipelined, run: scripts/crash_test.sh, flags: true }
+          - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
+          - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
+    name: suite (${{ matrix.name }})
+    env:
+      WORKER_FLAGS: ${{ matrix.flags && '--stage-threads 4 --pipeline --shared-readers --lean-commit' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+      - run: tar -xf binaries.tar
+      - if: matrix.duckdb_cli
+        run: |
+          mkdir -p "$RUNNER_TEMP/duckdb"
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/duckdb/duckdb" --version
+      - run: docker compose up -d --wait
+      - run: ${{ matrix.run }}
+      - if: failure()
+        run: docker compose logs --tail 200
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ strategy.job-index }}
+          path: |
+            .lake/**/*.log
+            .lake/**/*.txt
+          retention-days: 7
+
+  # One check for branch protection: green only when the build and every suite are.
+  ci-passed:
+    if: always()
+    needs: [build, suite]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success ]]'

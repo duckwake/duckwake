@@ -23,6 +23,14 @@ Not measured: the 4 vCPU / 16 GB reference box, the 24 h soak, and recovery time
 
 ## Running the tests
 
+CI (`.github/workflows/ci.yml`) runs on every pull request and every push to `main`. One job runs clippy
+(warnings fail it) and the unit tests and builds the binaries and the extension once. Every suite below then
+runs in its own job against the same `docker-compose.yml` stack on Linux: crash then reset, fencing, chain,
+retract, retention, decode, catch-up (100k events), shared readers, server, extension and composed, and
+crash, chain and retract again with all four worker flags. A failed job uploads the worker logs. `ci-passed`
+is green only when every job is. The throughput test, the scale benchmark and the soak only measure, so
+they stay out of CI.
+
 The test scripts reset the lake and the topic themselves:
 `scripts/crash_test.sh`, `scripts/fencing_test.sh`, `scripts/throughput_test.sh`, then `scripts/reset_test.sh`.
 `scripts/chain_test.sh` and `scripts/retract_test.sh` are standalone.

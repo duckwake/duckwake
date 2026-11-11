@@ -1274,7 +1274,9 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
 }
 
 /// Runs the epoch commits: inline on the scheduler's connection, or with `pipeline` on a thread and
-/// connection of its own, which also runs maintenance between commits.
+/// connection of its own, which also runs maintenance between commits. A worker has one, so the size of the
+/// inline variant does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Committer {
     Inline {
         maint: Maintenance,

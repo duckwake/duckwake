@@ -271,20 +271,6 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration("30 seconds").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("1 minute").unwrap(), Duration::from_secs(60));
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert!(parse_duration("1 fortnight").is_err());
-    }
-}
-
 impl JobDef {
     /// The view as the circuit compiler needs it.
     pub fn view(&self) -> crate::circuit::View<'_> {
@@ -298,5 +284,19 @@ impl crate::circuit::SourceSchema for SourceDef {
     }
     fn columns(&self) -> &[(String, String)] {
         &self.options.columns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("30 seconds").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("1 minute").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert!(parse_duration("1 fortnight").is_err());
     }
 }

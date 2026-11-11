@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// What the reader thread reports: its final position, polls, gaps, the changes it saw, and duplicates.
+type ReaderOut = (i64, usize, usize, HashSet<(i64, i64, i64)>, i64);
+
 fn open() -> Result<Connection> {
     let c = Connection::open_in_memory()?;
     c.execute_batch("INSTALL ducklake; INSTALL postgres; INSTALL icu; LOAD ducklake; LOAD postgres; LOAD icu; SET TimeZone='UTC';")?;
@@ -66,7 +69,7 @@ fn concurrent_writers() -> Result<()> {
     // The reader: position P, each poll reads the changes in (P, M] for the newest visible snapshot M.
     let reader = {
         let done = done.clone();
-        std::thread::spawn(move || -> Result<(i64, usize, usize, HashSet<(i64, i64, i64)>, i64)> {
+        std::thread::spawn(move || -> Result<ReaderOut> {
             let c = open()?;
             let (mut p, mut seen, mut polls, mut gaps, mut dupes) = (start, HashSet::new(), 0usize, 0usize, 0i64);
             loop {
