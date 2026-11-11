@@ -68,7 +68,9 @@ default.
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`) and over tables whose rows change (F2, `scripts/retract_test.sh`) are done;
   backfill, retention and reset cascade (F3), and shared and fused reads (F4) remain. Windows over tables
-  whose rows change need windows that stay open for `lateness` (C4).
+  whose rows change need an upsert window sink that keeps state for `lateness`, as Flink and Feldera do;
+  what arrives later goes to the late-data table (C4), and bulk reruns are the partition-overwrite refresh
+  below.
 - **Partition-overwrite refresh**, right after F2's weights, for lake tables whose recent partitions are
   rerun to correct data (for example, the last 3 days rewritten with delete + insert or `INSERT OVERWRITE`).
   A view whose table is partitioned like its input (its output carries the input's partition column, such as
