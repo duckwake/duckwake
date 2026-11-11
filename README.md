@@ -59,6 +59,8 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 
 A proof of concept. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
 across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`). The operators also take
-sources that delete and update rows, ready for CDC; no such source exists yet. Every test checks the views
-against the same SQL run as one batch query. Not yet: `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
+sources that delete and update rows, ready for CDC; no such source exists yet. A view can also read another
+view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with nothing
+to declare, as long as that table's rows are only inserted. Every test checks the views against the same SQL
+run as one batch query. Not yet: `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.

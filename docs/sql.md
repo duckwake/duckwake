@@ -4,6 +4,15 @@ The same functions exist in the server (`duckwaked`, also over Quack) and in the
 DuckLake table it maintains (`analytics.clicks_per_min`); functions take that name or the bare table name, which
 is the view's job id. Actions return `(view, result)` rows.
 
+A view's `FROM` names a Kafka source, or reads a lake table or another view's table through its DuckLake
+change feed: `SELECT game, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game` needs no source. A lake
+table joined to a Kafka source is a lookup instead, read as it is when each event is processed;
+`duckwake_explain` shows `ChangeFeed(...)` or `Lookup(...)` for each. Every lake input gets a `_commit_ts`
+column, the commit time of the change. Windows over a lake input use `_commit_ts`, or a windowed view's
+`window_start` or `window_end`, and get an exact watermark. Until retracting inputs come, a view reads only
+tables whose rows are inserted, never updated or deleted: an update or delete stops it. A view reads the
+changes after it was created, and dropping a view that another view reads is refused.
+
 | Function | Does |
 | --- | --- |
 | `duckwake_create_source(name, kind, options_json)` | register a Kafka source |

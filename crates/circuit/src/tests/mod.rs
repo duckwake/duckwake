@@ -15,6 +15,8 @@ const SINK: &str = "lake.analytics.v";
 pub(crate) struct TestSource {
     pub columns: Vec<(String, String)>,
     pub append_only: bool,
+    /// A lake table or view read through its change feed, with the columns a window over it may use.
+    pub lake: Option<Vec<String>>,
 }
 
 impl SourceSchema for TestSource {
@@ -27,16 +29,45 @@ impl SourceSchema for TestSource {
     fn append_only(&self) -> bool {
         self.append_only
     }
+    fn is_lake(&self) -> bool {
+        self.lake.is_some()
+    }
+    fn time_columns(&self) -> Vec<String> {
+        self.lake.clone().unwrap_or_else(|| vec!["ts".into()])
+    }
 }
 
 /// A connection with the lookup table the tests join, and three sources: `clicks`, `purchases` with a
 /// `price` where `clicks` has an `amount`, and `changes`, shaped like `clicks` but deleting and updating rows.
+/// Two lake inputs too: the lake table `shop.orders`, and `per_min`, a windowed view's table.
 pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE games (game_id VARCHAR, studio VARCHAR)").unwrap();
-    let source = |value: &str, append_only: bool| {
-        let columns = [("ts", "TIMESTAMP"), ("game_id", "VARCHAR"), ("user_id", "VARCHAR"), (value, "DECIMAL(18,2)")];
-        TestSource { columns: columns.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect(), append_only }
+    conn.execute_batch(
+        "CREATE TABLE games (game_id VARCHAR, studio VARCHAR);
+         CREATE SCHEMA shop; CREATE TABLE shop.orders (id INTEGER, game_id VARCHAR, amount DOUBLE);",
+    )
+    .unwrap();
+    let cols = |cs: &[(&str, &str)]| cs.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect::<Vec<_>>();
+    let source = |value: &str, append_only: bool| TestSource {
+        columns: cols(&[("ts", "TIMESTAMP"), ("game_id", "VARCHAR"), ("user_id", "VARCHAR"), (value, "DECIMAL(18,2)")]),
+        append_only,
+        lake: None,
+    };
+    let orders = TestSource {
+        columns: cols(&[("id", "INTEGER"), ("game_id", "VARCHAR"), ("amount", "DOUBLE"), ("_commit_ts", "TIMESTAMP")]),
+        append_only: true,
+        lake: Some(vec!["_commit_ts".into()]),
+    };
+    let per_min = TestSource {
+        columns: cols(&[
+            ("window_start", "TIMESTAMP"),
+            ("window_end", "TIMESTAMP"),
+            ("game_id", "VARCHAR"),
+            ("n", "BIGINT"),
+            ("_commit_ts", "TIMESTAMP"),
+        ]),
+        append_only: true,
+        lake: Some(vec!["_commit_ts".into(), "window_start".into(), "window_end".into()]),
     };
     (
         conn,
@@ -44,6 +75,8 @@ pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
             ("clicks".to_string(), source("amount", true)),
             ("purchases".to_string(), source("price", true)),
             ("changes".to_string(), source("amount", false)),
+            ("shop.orders".to_string(), orders),
+            ("per_min".to_string(), per_min),
         ]),
     )
 }

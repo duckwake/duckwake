@@ -9,6 +9,7 @@ catalog and Redpanda, all from `docker-compose.yml`.
 | --- | --- | --- |
 | Commit is atomic (Phase 0) | `examples/phase0_*.rs` | One transaction over sink, state, lease and checkpoint tables = one snapshot. A zombie commit is rejected. Time travel to an epoch's snapshot works. |
 | `kill -9` at any point, no duplicates or gaps | `scripts/crash_test.sh` | 120k events with late and malformed rows. 12–16 crashes: external `kill -9` and aborts injected at poll, transaction begin, mid-transaction, before and after COMMIT, and maintenance. Sinks match a batch recomputation exactly. |
+| Views over views and lake tables (F1) | `scripts/chain_test.sh` | A chain of three views: stateless over Kafka, windowed over its table on `_commit_ts`, windowed again over that table's `window_end`. 40k events, 8 crashes (`kill -9` and aborts at every epoch step); after every crash all three verify, Kafka for the first and time travel for the others, and again after draining (20k lake rows into the second view, 20–40 closed 30 s windows in the third). Passes in order and with all four worker flags (pipelined). Dropping a view another view reads is refused; an update to an insert-only lake table fails the view that reads it while the chain and the worker run on. |
 | Zombie worker after failover | `scripts/fencing_test.sh` | w1 commits epochs 1–3, then stalls 15 s with its epoch-4 transaction open. The views move to w2, which continues from epoch 4. w1's commit is rejected. The result verifies exactly. |
 | 5k events/s, p95 latency < 30 s | `scripts/throughput_test.sh` | 600k events of ~1 KB at 5,000/s, 10 s epochs. Per epoch (~50k rows): ~0.45 s poll+stage, ~0.15 s commit. Lag stays ~0. An event is committed at most one epoch interval plus ~0.6 s after it arrives; windowed results also wait for the window to close plus the watermark delay. |
 | Matches batch SQL | `verify` in every script | Multiset equality of each sink with the view run as one batch query over everything committed. Late rows and dead letters are also checked. |
@@ -23,6 +24,7 @@ Not measured: the 4 vCPU / 16 GB reference box, the 24 h soak, and recovery time
 
 The test scripts reset the lake and the topic themselves:
 `scripts/crash_test.sh`, `scripts/fencing_test.sh`, `scripts/throughput_test.sh`, then `scripts/reset_test.sh`.
+`scripts/chain_test.sh` is standalone.
 `scripts/retention_test.sh`, `scripts/decode_test.sh` and `scripts/catchup_test.sh` are standalone.
 `DECODE=sql|arrow|auto` picks the source's decode for every script that uses the `clicks` source
 (default `auto`).

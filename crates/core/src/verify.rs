@@ -9,7 +9,12 @@
 //! at the oldest checkpoint whose offsets are all retained and compares only sink rows that depend on events
 //! read after it (append sinks: later epochs; windowed sinks: windows starting after every event time the
 //! job had seen by then). Global aggregates fold in all history, so they need the whole topic.
+//!
+//! A lake input (a lake table or another view's table, read through its change feed) needs no retention:
+//! its batch input is the table as of the snapshot in the latest checkpoint (`AT (VERSION => P)`), the rows
+//! written after the view was created, with `_commit_ts` computed as the job computes it.
 use crate::catalog::{self, state_table};
+use crate::model::{LakeInput, SourceDef, COMMIT_TS};
 use crate::kafka;
 use crate::lake::{ident, lit, quote_table, CTL};
 use crate::decode::{decode_sql, IS_JSON_OBJECT};
@@ -25,6 +30,8 @@ pub struct Report {
     pub epoch: i64,
     pub watermark: String,
     pub kafka_rows: usize,
+    /// Rows of the view's lake inputs (lake tables and views) the batch read.
+    pub lake_rows: i64,
     pub expected_rows: i64,
     pub sink_rows: i64,
     pub missing_from_sink: i64,
@@ -37,6 +44,15 @@ pub struct Report {
 }
 
 impl Report {
+    /// What the batch recomputation read: `12000 events`, `340 lake rows`, or both.
+    pub fn inputs(&self) -> String {
+        match (self.kafka_rows, self.lake_rows) {
+            (k, 0) => format!("{k} events"),
+            (0, l) => format!("{l} lake rows"),
+            (k, l) => format!("{k} events and {l} lake rows"),
+        }
+    }
+
     pub fn ok(&self) -> bool {
         self.missing_from_sink == 0
             && self.unexpected_in_sink == 0
@@ -53,18 +69,27 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::load_sources(conn)?;
-    let plan = crate::plan::compile(conn, job, &def.sql, &sources)?;
-    if plan.is_windowed() && def.late_data.is_none() {
+    let plan = catalog::compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
+    // The view's inputs, the first holding a windowed view's only stream: Kafka sources or lake inputs.
+    let names = plan.sources();
+    let lakes: Vec<Option<&LakeInput>> = names.iter().map(|n| def.lake_inputs.iter().find(|l| &l.name == n)).collect();
+    let srcs: Vec<Option<&SourceDef>> = names
+        .iter()
+        .zip(&lakes)
+        .map(|(n, l)| if l.is_some() { Ok(None) } else { sources.get(n).map(Some).with_context(|| format!("source {n} is gone")) })
+        .collect::<Result<_>>()?;
+    // A windowed view over a lake input has an exact watermark, so it has no late rows to reconstruct.
+    if plan.is_windowed() && def.late_data.is_none() && lakes[0].is_none() {
         bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
     }
-    // The view's sources, the first holding a windowed view's only stream.
-    let names = plan.sources();
-    let srcs = names.iter().map(|n| sources.get(n).with_context(|| format!("source {n} is gone"))).collect::<Result<Vec<_>>>()?;
 
-    let earliest = srcs.iter().map(|s| rt.block_on(kafka::earliest_offsets(&s.options))).collect::<Result<Vec<_>>>()?;
+    let earliest = srcs
+        .iter()
+        .map(|s| s.map_or(Ok(Default::default()), |s| rt.block_on(kafka::earliest_offsets(&s.options))))
+        .collect::<Result<Vec<_>>>()?;
     let truncated = earliest.iter().any(|e| e.values().any(|&o| o > 0));
     if truncated && plan.needs_whole_topic() {
-        let topics: Vec<&str> = srcs.iter().map(|s| s.options.topic.as_str()).collect();
+        let topics: Vec<&str> = srcs.iter().flatten().map(|s| s.options.topic.as_str()).collect();
         bail!("retention has deleted the oldest events of {topics:?}, and a {} view depends on all of them", plan.kind_name());
     }
 
@@ -105,6 +130,8 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
             "CREATE OR REPLACE TABLE memory.main.v_late AS SELECT _source_partition AS _partition, _source_offset AS _offset, window_start FROM {}",
             quote_table(late)?
         ))?;
+    } else {
+        conn.execute_batch("CREATE OR REPLACE TABLE memory.main.v_late (_partition INTEGER, _offset BIGINT, window_start TIMESTAMP)")?;
     }
     if plan.is_windowed() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.v_state AS SELECT __ws, __we FROM {}", state_table(job)))?;
@@ -125,9 +152,38 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
             conn.execute_batch(&format!("DELETE FROM memory.main.v_late WHERE NOT ({})", in_range(0)))?;
         }
     }
-    let mut kafka_rows = 0;
-    let mut dead_expected = Vec::new();
+    let (mut kafka_rows, mut lake_rows) = (0, 0);
+    let mut dead_expected = vec!["SELECT NULL::VARCHAR AS source, NULL::INTEGER AS _partition, NULL::BIGINT AS _offset WHERE false".to_string()];
     for (k, src) in srcs.iter().enumerate() {
+        let Some(src) = src else {
+            // A lake input: the table as of the checkpoint's snapshot, rows written after the view's start.
+            let l = lakes[k].unwrap();
+            let p = ends[k].get(&0).copied().or(def.start_snapshot).context("lake input without a position")?;
+            let s0 = def.start_snapshot.context("lake input without a start snapshot")?;
+            let (schema, table) = crate::lake::table_by_id(conn, l.table_id)?.with_context(|| format!("{} was dropped", l.table))?;
+            let select: Vec<String> = l
+                .columns
+                .iter()
+                .filter(|(c, _)| c != COMMIT_TS)
+                .map(|(c, ty)| format!("CAST(t.{} AS {ty}) AS {}", ident(c), ident(c)))
+                .collect();
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE memory.main.v_typed_{k} AS
+                   WITH snaps AS (
+                     SELECT snapshot_id, max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id) AS ts
+                     FROM ducklake_snapshots({lake}) WHERE snapshot_id <= {p})
+                   SELECT t.snapshot_id::INTEGER AS _partition, t.rowid::BIGINT AS _offset, {select}, s.ts AS {ct},
+                          NULL::VARCHAR AS _err
+                   FROM {tbl} AS t AT (VERSION => {p}) JOIN snaps s USING (snapshot_id)
+                   WHERE t.snapshot_id > {s0}",
+                lake = lit(crate::lake::LAKE),
+                select = select.join(", "),
+                ct = ident(COMMIT_TS),
+                tbl = quote_table(&format!("{}.{schema}.{table}", crate::lake::LAKE))?,
+            ))?;
+            lake_rows += count(conn, &format!("SELECT * FROM memory.main.v_typed_{k}"))?;
+            continue;
+        };
         let msgs = rt.block_on(kafka::read_between(&src.options, &from[k], &ends[k]))?;
         kafka_rows += msgs.len();
         let raw = format!("v_raw_{k}");
@@ -156,7 +212,21 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         + count(conn, &format!("(SELECT * FROM memory.main.v_dead) EXCEPT ALL ({dead_expected})"))?;
 
     // The valid rows of source k, and its columns.
-    let cols_of = |k: usize| srcs[k].options.columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+    let columns_of = |k: usize| -> &[(String, String)] {
+        match (srcs[k], lakes[k]) {
+            (Some(s), _) => &s.options.columns,
+            (None, Some(l)) => &l.columns,
+            (None, None) => &[],
+        }
+    };
+    let cols_of = |k: usize| columns_of(k).iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+    // A window's columns replace any the stream has (a windowed view's table, read by another).
+    let stream_cols = columns_of(0)
+        .iter()
+        .filter(|(c, _)| !(plan.is_windowed() && crate::circuit::codegen::is_window_column(c)))
+        .map(|(c, _)| ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let valid = |k: usize| format!("(SELECT _partition, _offset, {} FROM memory.main.v_typed_{k} WHERE _err IS NULL)", cols_of(k));
     let (cols, valid0) = (cols_of(0), valid(0));
     let valid = &valid0;
@@ -165,7 +235,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         let wm = ckpt.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE {input} AS
-               SELECT {cols}, window_start, window_end FROM ({w}) x
+               SELECT {stream_cols}, window_start, window_end FROM ({w}) x
                WHERE window_end <= {wm} AND {sink_filter}
                  AND NOT EXISTS (SELECT 1 FROM memory.main.v_late l
                                  WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start)",
@@ -214,6 +284,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         epoch: ckpt.epoch,
         watermark: crate::engine::fmt_us(ckpt.watermark_us),
         kafka_rows,
+        lake_rows,
         expected_rows: count(conn, "SELECT * FROM memory.main.v_expected")?,
         sink_rows: count(conn, "SELECT * FROM memory.main.v_sink")?,
         missing_from_sink: count(conn, "SELECT * FROM memory.main.v_expected EXCEPT ALL SELECT * FROM memory.main.v_sink")?,

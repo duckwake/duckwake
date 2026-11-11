@@ -21,7 +21,7 @@ use crate::circuit::{Circuit, Cost, Counter, EpochCtx, SourceInput};
 use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
-use crate::model::{parse_duration, JobDef, SourceDef};
+use crate::model::{parse_duration, JobDef, LakeInput, SourceDef, COMMIT_TS};
 use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
@@ -78,10 +78,21 @@ struct JobRuntime {
     open_ends: Option<BTreeSet<i64>>,
 }
 
-/// A source as one job reads it: the reader group that feeds it, its position and its watermark.
+/// Where an input's rows come from.
+enum Feed {
+    /// A Kafka source, read by a reader group.
+    Kafka { group: u64 },
+    /// A lake table or view, read through its change feed by the job itself. Its position is the last
+    /// snapshot read, kept as partition 0 of the input's offsets; `commit_us` is `_commit_ts` at that
+    /// snapshot, carried so the running maximum continues across epochs.
+    Lake { lake: Arc<LakeInput>, commit_us: Option<i64> },
+}
+
+/// A source as one job reads it: where it comes from, its position and its watermark.
 struct Input {
-    source: Arc<SourceDef>,
-    group: u64,
+    name: String,
+    columns: Arc<Vec<(String, String)>>,
+    feed: Feed,
     offsets: BTreeMap<i32, i64>,
     part_max_ts: HashMap<i32, i64>,
     part_last_data: HashMap<i32, Instant>,
@@ -91,6 +102,14 @@ struct Input {
 }
 
 impl Input {
+    /// The reader group of a Kafka input.
+    fn group(&self) -> Option<u64> {
+        match self.feed {
+            Feed::Kafka { group, .. } => Some(group),
+            Feed::Lake { .. } => None,
+        }
+    }
+
     /// Takes in an epoch of this source and returns its watermark after it: the minimum over active
     /// partitions of their newest event time, minus the delay. Partitions idle for longer than `idle_timeout`
     /// are excluded; one that is active but has not reported yet holds it back.
@@ -175,6 +194,30 @@ struct StagedInput {
     offsets: BTreeMap<i32, i64>,
     watermark_us: Option<i64>,
     rows_dead: i64,
+    /// Lake inputs: `_commit_ts` at the snapshot read up to, and how many snapshots the lake is ahead of it.
+    commit_us: Option<i64>,
+    snapshots_behind: i64,
+}
+
+/// A view input broke what the view relies on, such as an insert-only table that had rows updated or
+/// deleted: the view stops (status `failed`), the worker and its other views go on.
+#[derive(Debug)]
+struct StopJob(String);
+
+impl std::fmt::Display for StopJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StopJob {}
+
+/// Snapshots one epoch of a lake input reads at most, so a view far behind catches up in bounded steps.
+const MAX_SNAPSHOTS: i64 = 1000;
+
+/// A job's staging table for the changes of its `k`-th input, a lake input.
+fn lake_typed(job: &str, k: usize) -> String {
+    mem("typed", &format!("l{job}_{k}"))
 }
 
 /// One job's epoch as the commit needs it. It owns everything, so it can go to the commit thread.
@@ -187,9 +230,15 @@ struct CommitJob {
     circuit: Arc<Circuit>,
     /// The table set this epoch staged into.
     parity: u64,
-    /// Per input: the source and its group's dead letters of this epoch.
-    inputs: Vec<(Arc<SourceDef>, String)>,
+    /// Per input: its name, columns and, for a Kafka source, its group's dead letters of this epoch.
+    inputs: Vec<CommitInput>,
     lag: i64,
+}
+
+struct CommitInput {
+    name: String,
+    columns: Arc<Vec<(String, String)>>,
+    dead: Option<String>,
 }
 
 /// One epoch of every job of the worker: one DuckLake transaction.
@@ -455,8 +504,30 @@ impl Worker {
         let now = Instant::now();
         let mut inputs = Vec::new();
         for name in &names {
-            let source = Arc::new(sources.get(name).with_context(|| format!("source {name} of the view is gone"))?.clone());
             let start = catalog::latest_checkpoint(conn, id, name)?.map(|c| c.offsets).unwrap_or_default();
+            if let Some(lake) = def.lake_inputs.iter().find(|l| &l.name == name) {
+                // The last snapshot read, or the one current when the view was created.
+                let position = start.get(&0).copied().or(def.start_snapshot).context("lake input without a start snapshot")?;
+                let commit_us: Option<i64> = conn.query_row(
+                    &format!("SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id <= ?", lit(LAKE)),
+                    [position],
+                    |r| r.get(0),
+                )?;
+                info!(job = %id, input = %name, table = %lake.table, snapshot = position, "reading change feed");
+                inputs.push(Input {
+                    name: name.clone(),
+                    columns: Arc::new(lake.columns.clone()),
+                    feed: Feed::Lake { lake: Arc::new(lake.clone()), commit_us },
+                    offsets: BTreeMap::from([(0, position)]),
+                    part_max_ts: HashMap::new(),
+                    part_last_data: HashMap::new(),
+                    watermark_us: ckpt.watermark_us,
+                    delay_us: 0,
+                    idle_timeout: Duration::MAX,
+                });
+                continue;
+            }
+            let source = Arc::new(sources.get(name).with_context(|| format!("source {name} of the view is gone"))?.clone());
             let decoder = source.options.arrow_decoder()?.map(Arc::new);
             let (reader, offsets) = Reader::start(&self.rt, &source.options, &start, def.max_rows, decoder)?;
             let joined = self
@@ -483,6 +554,8 @@ impl Worker {
             };
             info!(job = %id, source = %name, offsets = ?offsets, group, "reading source");
             inputs.push(Input {
+                name: name.clone(),
+                columns: Arc::new(source.options.columns.clone()),
                 delay_us: parse_duration(&source.options.watermark_delay)?.as_micros() as i64,
                 idle_timeout: parse_duration(&source.options.idle_timeout)?,
                 part_last_data: offsets.keys().map(|p| (*p, now)).collect(),
@@ -490,12 +563,13 @@ impl Worker {
                 // The checkpoint keeps the view's watermark, at or below every source's: a safe start.
                 watermark_us: ckpt.watermark_us,
                 offsets,
-                source,
-                group,
+                feed: Feed::Kafka { group },
             });
         }
         let circuit = Arc::new(Circuit::compile(&def.view())?);
-        let open_ends = if self.cfg.lean_commit && circuit.emits_final() {
+        // Kept with `lean_commit`, and always for views with lake inputs: their watermark moves with every
+        // snapshot, so only a window that closes makes an epoch without rows worth committing.
+        let open_ends = if (self.cfg.lean_commit || !def.lake_inputs.is_empty()) && circuit.emits_final() {
             let mut stmt = self.conns[0].prepare(&format!("SELECT DISTINCT epoch_us(__we) FROM {}", state_table(id)))?;
             let ends = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<duckdb::Result<BTreeSet<_>>>()?;
             Some(ends)
@@ -525,12 +599,16 @@ impl Worker {
         if let Some(m) = &self.cfg.metrics {
             m.forget(id);
         }
-        for input in &j.inputs {
-            let Some(g) = self.groups.get_mut(&input.group) else { continue };
+        for (k, input) in j.inputs.iter().enumerate() {
+            let Some(gid) = input.group() else {
+                self.drops.push(lake_typed(id, k));
+                continue;
+            };
+            let Some(g) = self.groups.get_mut(&gid) else { continue };
             g.members.remove(id);
             if g.members.is_empty() {
-                self.groups.remove(&input.group);
-                self.drops.extend(group_tables(input.group));
+                self.groups.remove(&gid);
+                self.drops.extend(group_tables(gid));
             } else {
                 g.max_rows = g.members.iter().map(|m| self.jobs[m].def.max_rows).min().unwrap();
             }
@@ -649,17 +727,41 @@ impl Worker {
             .iter_mut()
             .map(|(id, j)| {
                 let overlay = (cfg.pipeline && prev > 0 && j.last_round == Some(prev)).then_some(prev % 2);
-                let srcs: Vec<&SourceStaged> = j.inputs.iter().map(|i| &sources[&i.group]).collect();
+                let srcs: Vec<Option<&SourceStaged>> = j.inputs.iter().map(|i| i.group().map(|g| &sources[&g])).collect();
                 (id, j, srcs, overlay)
             })
             .collect();
-        let staged: Vec<Staged> = parallel(conns, items, |conn, (id, j, srcs, overlay)| {
+        let results = parallel(conns, items, |conn, (id, j, srcs, overlay)| {
             stage_view(conn, id, j, &srcs, parity, overlay).with_context(|| format!("job {id}: staging failed"))
-        })
-        .into_iter()
-        .collect::<Result<_>>()?;
-        if !jobs.values().zip(&staged).any(|(j, s)| s.rows_in > 0 || s.watermark_us != j.watermark_us) {
-            // Nothing new and no window can close: skip the commit instead of writing an empty snapshot.
+        });
+        // A view whose input broke a promise it relies on stops alone; any other failure fails the worker.
+        let mut staged = Vec::new();
+        let mut stopped = Vec::new();
+        for (id, r) in jobs.keys().zip(results) {
+            match r {
+                Ok(s) => staged.push(s),
+                Err(e) if e.downcast_ref::<StopJob>().is_some() => stopped.push((id.clone(), format!("{e:#}"))),
+                Err(e) => return Err(e),
+            }
+        }
+        if !stopped.is_empty() {
+            for (id, why) in &stopped {
+                warn!(job = %id, error = %why, "view stopped: marking it failed");
+                catalog::set_status(&conns[0], id, crate::model::JobStatus::Failed, None)?;
+            }
+            for (id, _) in &stopped {
+                self.remove_job(id);
+            }
+            return Ok(None);
+        }
+        // Nothing new and no window can close: skip the commit instead of writing an empty snapshot. A view
+        // with lake inputs sees its watermark move with every snapshot, its own commits' included, so for it
+        // only rows or a closing window count.
+        let worth = |j: &JobRuntime, s: &Staged| {
+            s.rows_in > 0
+                || (s.watermark_us != j.watermark_us && (j.def.lake_inputs.is_empty() || (j.def.plan.is_windowed() && s.closes)))
+        };
+        if !jobs.values().zip(&staged).any(|(j, s)| worth(j, s)) {
             return Ok(None);
         }
 
@@ -676,6 +778,9 @@ impl Worker {
             for (input, si) in j.inputs.iter_mut().zip(&s.inputs) {
                 input.offsets = si.offsets.clone();
                 input.watermark_us = si.watermark_us;
+                if let Feed::Lake { commit_us, .. } = &mut input.feed {
+                    *commit_us = si.commit_us.or(*commit_us);
+                }
             }
             j.watermark_us = s.watermark_us;
             j.max_event_time_us = s.max_event_time_us;
@@ -688,8 +793,21 @@ impl Worker {
                 def: j.def.clone(),
                 circuit: j.circuit.clone(),
                 parity,
-                inputs: j.inputs.iter().map(|i| (i.source.clone(), sources[&i.group].dead.clone())).collect(),
-                lag: j.inputs.iter().zip(&s.inputs).map(|(i, si)| groups[&i.group].reader.lag(&si.offsets)).sum(),
+                inputs: j
+                    .inputs
+                    .iter()
+                    .map(|i| CommitInput { name: i.name.clone(), columns: i.columns.clone(), dead: i.group().map(|g| sources[&g].dead.clone()) })
+                    .collect(),
+                // Kafka messages behind, plus snapshots behind for lake inputs.
+                lag: j
+                    .inputs
+                    .iter()
+                    .zip(&s.inputs)
+                    .map(|(i, si)| match i.group() {
+                        Some(g) => groups[&g].reader.lag(&si.offsets),
+                        None => si.snapshots_behind,
+                    })
+                    .sum(),
                 staged: s,
             });
         }
@@ -721,8 +839,12 @@ fn merge_groups(groups: &mut BTreeMap<u64, Group>, jobs: &mut BTreeMap<String, J
             }
             let gone = groups.remove(b).unwrap();
             for m in &gone.members {
-                for input in jobs.get_mut(m).into_iter().flat_map(|j| j.inputs.iter_mut()).filter(|i| i.group == *b) {
-                    input.group = *a;
+                for input in jobs.get_mut(m).into_iter().flat_map(|j| j.inputs.iter_mut()) {
+                    if let Feed::Kafka { group, .. } = &mut input.feed {
+                        if *group == *b {
+                            *group = *a;
+                        }
+                    }
                 }
             }
             let g = groups.get_mut(a).unwrap();
@@ -840,16 +962,148 @@ fn stage_source(
     })
 }
 
+/// Stages the changes of a job's `k`-th input, a lake input, in snapshots `(from, to]`: rows in the layout of a
+/// Kafka group's typed table (`_partition` the snapshot, `_offset` the rowid), with `_commit_ts` the running
+/// maximum of `snapshot_time` from `carried` on. Reads the lake and writes only the memory catalog. Until
+/// retracting inputs (F2), every input must be insert-only: an update or delete stops the view. Returns the
+/// staged input and `_commit_ts` at `to`.
+fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i64, to: i64, carried: Option<i64>) -> Result<(SourceStaged, Option<i64>)> {
+    let t = Instant::now();
+    let typed = lake_typed(job, k);
+    let cols: Vec<&(String, String)> = lake.columns.iter().filter(|(c, _)| c != COMMIT_TS).collect();
+    let defs: Vec<String> = lake.columns.iter().map(|(c, ty)| format!("{} {ty}", ident(c))).collect();
+    let staged = |rows_in: usize| SourceStaged {
+        typed: typed.clone(),
+        dead: String::new(),
+        offsets: BTreeMap::from([(0, to.max(from))]),
+        active: vec![],
+        part_max: vec![],
+        rows_in,
+        rows_sql: 0,
+        bisections: 0,
+        rows_dead: 0,
+        stage_ms: t.elapsed().as_millis(),
+    };
+    if to <= from {
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {typed} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _change VARCHAR, {}, _err VARCHAR)",
+            defs.join(", ")
+        ))?;
+        return Ok((staged(0), carried));
+    }
+    // By id, so a renamed table keeps working; a dropped one (even if recreated under its name) stops the view.
+    let (schema, table) = crate::lake::table_by_id(conn, lake.table_id)?
+        .ok_or_else(|| StopJob(format!("{} (DuckLake table id {}) was dropped", lake.table, lake.table_id)))?;
+    let carried_sql = carried.map(|us| format!("make_timestamp({us})")).unwrap_or("NULL".into());
+    let select: Vec<String> = cols.iter().map(|(c, ty)| format!("CAST(c.{} AS {ty}) AS {}", ident(c), ident(c))).collect();
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE {typed} AS
+           WITH snaps AS (
+             SELECT snapshot_id, max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id) AS ts
+             FROM ducklake_snapshots({lake_lit}) WHERE snapshot_id > {from} AND snapshot_id <= {to})
+           SELECT c.snapshot_id::INTEGER AS _partition, c.rowid::BIGINT AS _offset, NULL::VARCHAR AS payload,
+                  c.change_type AS _change, {select}, greatest(s.ts, coalesce({carried_sql}, s.ts)) AS {commit_ts},
+                  NULL::VARCHAR AS _err
+           FROM ducklake_table_changes({lake_lit}, {schema_lit}, {table_lit}, {next}, {to}) c JOIN snaps s USING (snapshot_id)",
+        lake_lit = lit(LAKE),
+        schema_lit = lit(&schema),
+        table_lit = lit(&table),
+        next = from + 1,
+        select = select.join(", "),
+        commit_ts = ident(COMMIT_TS),
+    ))
+    .with_context(|| format!("reading the changes of {} in snapshots ({from}, {to}]", lake.table))?;
+    let (rows_in, retracted, at): (i64, i64, Option<i64>) = conn.query_row(
+        &format!("SELECT count(*), count(*) FILTER (WHERE _change <> 'insert'), min(_partition) FILTER (WHERE _change <> 'insert') FROM {typed}"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if retracted > 0 {
+        return Err(StopJob(format!(
+            "view {job} needs {} to be insert-only, but snapshot {} updated or deleted rows of it ({retracted} changes; \
+             views over tables whose rows change come with retracting inputs, F2)",
+            lake.name,
+            at.unwrap_or(0)
+        ))
+        .into());
+    }
+    let newest: Option<i64> = conn.query_row(
+        &format!(
+            "SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id > {from} AND snapshot_id <= {to}",
+            lit(LAKE)
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    let commit_us = match (carried, newest) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    Ok((staged(rows_in as usize), commit_us))
+}
+
+/// The watermark of view `job` as of snapshot `at`: the one its newest checkpoint up to then recorded.
+fn watermark_at(conn: &Connection, job: &str, at: i64) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT epoch_us(watermark) FROM {CTL}.checkpoints AT (VERSION => {at}) WHERE job_id = ? ORDER BY epoch DESC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query([job])?;
+    Ok(rows.next()?.map(|r| r.get::<_, Option<i64>>(0)).transpose()?.flatten())
+}
+
 /// Stages one job's view from its group's typed rows: the watermark, windows and late rows, then the epoch's
 /// sink rows (stateless) or partial aggregates. `overlay` is the table set of the previous epoch when that
 /// epoch may still be committing: a global aggregate reads the state of the groups it touched from there.
-fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, srcs: &[&SourceStaged], parity: u64, overlay: Option<u64>) -> Result<Staged> {
+fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&SourceStaged>], parity: u64, overlay: Option<u64>) -> Result<Staged> {
     let t = Instant::now();
     let def = j.def.clone();
     let plan = &def.plan;
 
+    // Lake inputs, read to one snapshot S for all of them: a transaction that changed two of their tables
+    // upstream is seen whole or not at all.
+    let mut lakes: Vec<Option<(SourceStaged, Option<i64>, i64)>> = (0..j.inputs.len()).map(|_| None).collect();
+    if j.inputs.iter().any(|i| i.group().is_none()) {
+        let current = crate::lake::current_snapshot(conn)?;
+        let from = j.inputs.iter().filter(|i| i.group().is_none()).map(|i| i.offsets[&0]).min().unwrap();
+        let to = current.min(from + MAX_SNAPSHOTS).max(from);
+        for (k, input) in j.inputs.iter().enumerate() {
+            if let Feed::Lake { lake, commit_us } = &input.feed {
+                let (s, commit) = stage_lake(conn, id, k, lake, input.offsets[&0], to, *commit_us)?;
+                lakes[k] = Some((s, commit, current - to));
+            }
+        }
+    }
+    let srcs: Vec<&SourceStaged> = kafka.iter().zip(&lakes).map(|(k, l)| k.or(l.as_ref().map(|(s, _, _)| s)).unwrap()).collect();
+
     // Each source's watermark, and the view's: the oldest of them once every source has one, never moving back.
-    let watermarks: Vec<Option<i64>> = j.inputs.iter_mut().zip(srcs).map(|(input, src)| input.advance(src)).collect();
+    // A lake input's is exact: `_commit_ts` at S for windows on it (and for views without windows), or for
+    // windows on a windowed view's window columns that view's watermark at S, which every row it writes later
+    // has its `window_end` above.
+    let window_col = plan.window.as_ref().map(|w| (plan.source.clone(), w.time_col.clone()));
+    let mut watermarks: Vec<Option<i64>> = Vec::new();
+    for (input, (src, lake)) in j.inputs.iter_mut().zip(srcs.iter().zip(&lakes)) {
+        let Some((_, commit_us, _)) = lake else {
+            watermarks.push(input.advance(src));
+            continue;
+        };
+        let Feed::Lake { lake: l, .. } = &input.feed else { unreachable!() };
+        let candidate = match window_col.as_ref().filter(|(s, _)| *s == input.name).map(|(_, c)| c.as_str()) {
+            Some(c @ ("window_start" | "window_end")) => {
+                let up = l.view.as_deref().context("window columns of a lake input without a view")?;
+                let w = watermark_at(conn, up, src.offsets[&0])?;
+                if c == "window_end" { w } else { w.map(|w| w - l.window_size_us.unwrap_or(0)) }
+            }
+            _ => *commit_us,
+        };
+        if let Some(c) = commit_us {
+            input.part_max_ts.insert(0, *c);
+        }
+        let w = match (input.watermark_us, candidate) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        watermarks.push(w);
+    }
     let candidate = watermarks.iter().copied().collect::<Option<Vec<i64>>>().and_then(|w| w.into_iter().min());
     let watermark_us = match (j.watermark_us, candidate) {
         (Some(a), Some(b)) => Some(a.max(b)),
@@ -866,8 +1120,8 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, srcs: &[&SourceSt
         sources: j
             .inputs
             .iter()
-            .zip(srcs)
-            .map(|(i, src)| SourceInput { name: &i.source.name, columns: &i.source.options.columns, typed: src.typed.clone() })
+            .zip(&srcs)
+            .map(|(i, src)| SourceInput { name: &i.name, columns: &i.columns, typed: src.typed.clone() })
             .collect(),
         parity,
         overlay,
@@ -904,7 +1158,14 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, srcs: &[&SourceSt
     let inputs = srcs
         .iter()
         .zip(watermarks)
-        .map(|(src, w)| StagedInput { offsets: src.offsets.clone(), watermark_us: w, rows_dead: src.rows_dead })
+        .zip(&lakes)
+        .map(|((src, w), l)| StagedInput {
+            offsets: src.offsets.clone(),
+            watermark_us: w,
+            rows_dead: src.rows_dead,
+            commit_us: l.as_ref().and_then(|(_, c, _)| *c),
+            snapshots_behind: l.as_ref().map_or(0, |(_, _, b)| *b),
+        })
         .collect();
     Ok(Staged {
         inputs,
@@ -1146,7 +1407,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 sources: c
                     .inputs
                     .iter()
-                    .map(|(src, _)| SourceInput { name: &src.name, columns: &src.options.columns, typed: String::new() })
+                    .map(|i| SourceInput { name: &i.name, columns: &i.columns, typed: String::new() })
                     .collect(),
                 parity: c.parity,
                 overlay: None,
@@ -1184,16 +1445,17 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 .inputs
                 .iter()
                 .zip(&s.inputs)
-                .map(|((src, _), si)| (src.name.clone(), json!(si.offsets.iter().map(|(p, o)| (p.to_string(), json!(o))).collect::<serde_json::Map<_, _>>())))
+                .map(|(i, si)| (i.name.clone(), json!(si.offsets.iter().map(|(p, o)| (p.to_string(), json!(o))).collect::<serde_json::Map<_, _>>())))
                 .collect();
             let offsets = serde_json::Value::Object(offsets);
             let ts = |us: Option<i64>| us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
             if lean {
-                for ((src, dead), _) in c.inputs.iter().zip(&s.inputs).filter(|(_, si)| si.rows_dead > 0) {
+                for (i, _) in c.inputs.iter().zip(&s.inputs).filter(|(_, si)| si.rows_dead > 0) {
+                    let Some(dead) = &i.dead else { continue };
                     dead_rows.push(format!(
                         "SELECT {}, {epoch}, {}, _partition, _offset, payload, _err, now() FROM {dead}",
                         lit(id),
-                        lit(&src.name)
+                        lit(&i.name)
                     ));
                 }
                 checkpoint_rows.push(format!(
@@ -1212,7 +1474,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 ));
                 continue;
             }
-            for (src, dead) in &c.inputs {
+            for (src, dead) in c.inputs.iter().filter_map(|i| i.dead.as_ref().map(|d| (i, d))) {
                 timed(&mut tm.dead, || {
                     conn.execute(
                         &format!("INSERT INTO {CTL}.dead_letter SELECT ?, ?, ?, _partition, _offset, payload, _err, now() FROM {dead}"),

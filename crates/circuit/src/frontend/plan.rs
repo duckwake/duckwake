@@ -73,6 +73,9 @@ pub struct Plan {
     /// The sources the view reads that can retract rows: their staged rows carry a weight `__w`.
     #[serde(default)]
     pub retracting: Vec<String>,
+    /// The inputs the view reads through a DuckLake change feed (lake tables and views), not from Kafka.
+    #[serde(default)]
+    pub change_feeds: Vec<String>,
 }
 
 /// One branch of a `UNION ALL` view.
@@ -240,14 +243,15 @@ impl Plan {
         let tc = ident(&w.time_col);
         let size = format!("to_microseconds({})", w.size_us);
         match w.kind {
+            // The window's columns replace any the input has (a windowed view's table, read by another).
             WindowKind::Tumble => format!(
-                "SELECT *, time_bucket({size}, {tc}) AS window_start, time_bucket({size}, {tc}) + {size} AS window_end FROM {input}"
+                "SELECT {KEEP}, time_bucket({size}, {tc}) AS window_start, time_bucket({size}, {tc}) + {size} AS window_end FROM {input}"
             ),
             WindowKind::Hop => {
                 let slide = format!("to_microseconds({})", w.slide_us);
                 format!(
                     "SELECT *, window_start + {size} AS window_end FROM (
-                       SELECT *, unnest(generate_series(time_bucket({slide}, {tc}) - {size} + {slide},
+                       SELECT {KEEP}, unnest(generate_series(time_bucket({slide}, {tc}) - {size} + {slide},
                                                         time_bucket({slide}, {tc}), {slide})) AS window_start
                        FROM {input})"
                 )
@@ -597,21 +601,32 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     reject_unsupported(node)?;
     let aggs = aggregate_names(conn)?;
 
-    // Find the single stream reference in FROM and point it at the staging table.
+    // Find the single stream reference in FROM and point it at the staging table. A Kafka source is the
+    // stream when there is one, and lake tables joined to it are lookups; otherwise the one lake table or
+    // view the SELECT reads is, through its change feed.
     let input_table = format!("memory.main.{}", ident(&format!("in_{job}")));
     let mut found = Vec::new();
-    rewrite_from(&mut node["from_table"], sources, &mut found)?;
+    rewrite_from(&mut node["from_table"], sources, false, &mut found)?;
+    if found.is_empty() {
+        rewrite_from(&mut node["from_table"], sources, true, &mut found)?;
+        if found.len() > 1 {
+            bail!("a view reads one lake table or view through its change feed; joins of two of them are not supported yet");
+        }
+    }
     let stream = match found.as_slice() {
         [one] => one.clone(),
-        [] => bail!("the view must read from a registered source (FROM <source> or FROM TUMBLE/HOP(<source>, ...))"),
+        [] => bail!(
+            "the view must read from a registered source, a lake table or another view (FROM <name> or FROM TUMBLE/HOP(<name>, ...))"
+        ),
         _ => bail!("only one stream reference per view is supported (stream-stream joins are phase 3)"),
     };
     let src = &sources[&stream.source];
     let window = match &stream.window {
         None => None,
         Some((kind, time_col, size, slide)) => {
-            if time_col != &src.event_time() {
-                bail!("windows must use the source's event_time column {:?}, not {time_col:?}", src.event_time());
+            let allowed = src.time_columns();
+            if !allowed.iter().any(|c| c == time_col) {
+                bail!("windows over {} must use {}, not {time_col:?}", stream.source, allowed.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" or "));
             }
             let size_us = interval_us(conn, size)?;
             let slide_us = match slide {
@@ -628,7 +643,10 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     *stream_slot(&mut node["from_table"]).ok_or_else(|| anyhow!("lost stream reference"))? = table_ref.clone();
 
     // The view in pieces: the FROM with a placeholder where the stream goes, the WHERE, the stream's columns.
-    let mut columns: Vec<String> = src.columns().iter().map(|(c, _)| ident(c)).collect();
+    // A window's columns replace any the source has.
+    let src_cols: Vec<&(String, String)> =
+        src.columns().iter().filter(|(c, _)| !(window.is_some() && crate::codegen::is_window_column(c))).collect();
+    let mut columns: Vec<String> = src_cols.iter().map(|(c, _)| ident(c)).collect();
     if window.is_some() {
         columns.extend(["window_start".into(), "window_end".into()]);
     }
@@ -642,7 +660,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     };
 
     // Staging table with the source columns (+ window columns) so the rewritten SQL binds.
-    let mut cols: Vec<String> = src.columns().iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+    let mut cols: Vec<String> = src_cols.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
     if window.is_some() {
         cols.push("window_start TIMESTAMP".into());
         cols.push("window_end TIMESTAMP".into());
@@ -667,6 +685,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         union: vec![],
         global: None,
         retracting: if src.append_only() { vec![] } else { vec![stream.source.clone()] },
+        change_feeds: if src.is_lake() { vec![stream.source.clone()] } else { vec![] },
     };
 
     let node = &mut stmt["node"];
@@ -727,7 +746,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
     }
     let mut nodes = Vec::new();
     branches(&stmt["node"], &mut nodes)?;
-    let (mut union, mut retracting) = (Vec::new(), Vec::new());
+    let (mut union, mut retracting, mut change_feeds) = (Vec::new(), Vec::new(), Vec::new());
     for (k, node) in nodes.into_iter().enumerate() {
         let mut branch = stmt.clone();
         branch["node"] = node;
@@ -739,6 +758,11 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         for s in p.retracting {
             if !retracting.contains(&s) {
                 retracting.push(s);
+            }
+        }
+        for s in p.change_feeds {
+            if !change_feeds.contains(&s) {
+                change_feeds.push(s);
             }
         }
         union.push((p.batch_sql, Branch { source: p.source, input_table: p.input_table, query: p.query }));
@@ -762,6 +786,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         union,
         global: None,
         retracting,
+        change_feeds,
     })
 }
 
@@ -940,6 +965,9 @@ fn compile_windowed(
 
 /// The state column holding a window and group's total weight, when the view's input can retract.
 pub const WINDOW_WEIGHT: &str = "__pw";
+
+/// Every column of a row but `window_start` and `window_end`, which a window then adds.
+const KEEP: &str = "COLUMNS(lambda c: c NOT IN ('window_start', 'window_end'))";
 
 /// `x` times the row's weight; written out for ±1 so an integer `x` keeps its type and cannot overflow.
 fn signed(x: &str) -> String {
@@ -1218,14 +1246,25 @@ fn reject_unsupported(node: &Value) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_from<S>(t: &mut Value, sources: &HashMap<String, S>, found: &mut Vec<StreamRef>) -> Result<()> {
+/// The name a FROM item uses for a table, as written: `t`, `schema.t` or `catalog.schema.t`.
+fn table_key(t: &Value) -> String {
+    ["catalog_name", "schema_name", "table_name"]
+        .iter()
+        .filter_map(|k| t[*k].as_str().filter(|s| !s.is_empty()))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Marks the stream references in FROM: names of Kafka sources, or with `lake` of lake tables and views.
+fn rewrite_from<S: SourceSchema>(t: &mut Value, sources: &HashMap<String, S>, lake: bool, found: &mut Vec<StreamRef>) -> Result<()> {
+    let wanted = |name: &str| sources.get(name).is_some_and(|s| s.is_lake() == lake);
     match t["type"].as_str().unwrap_or("") {
         "BASE_TABLE" => {
-            let name = t["table_name"].as_str().unwrap_or("");
-            let unqualified = t["schema_name"] == "" && t["catalog_name"] == "";
-            if unqualified && sources.contains_key(name) {
+            let key = table_key(t);
+            if wanted(&key) {
+                let name = t["table_name"].as_str().unwrap_or("");
                 let alias = t["alias"].as_str().filter(|a| !a.is_empty()).unwrap_or(name).to_string();
-                found.push(StreamRef { source: name.to_string(), alias, window: None });
+                found.push(StreamRef { source: key, alias, window: None });
                 t["__stream"] = json!(true);
             }
             Ok(())
@@ -1254,9 +1293,17 @@ fn rewrite_from<S>(t: &mut Value, sources: &HashMap<String, S>, found: &mut Vec<
                     .flatten()
                     .ok_or_else(|| anyhow!("{fname}(): first two arguments must be a source name and a column"))
             };
-            let source = col(&args[0])?;
+            // The first argument names the stream as written: `clicks`, `shop.orders` or `lake.shop.orders`.
+            let source = (args[0]["class"] == "COLUMN_REF")
+                .then(|| args[0]["column_names"].as_array())
+                .flatten()
+                .map(|n| n.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join("."))
+                .ok_or_else(|| anyhow!("{fname}(): first two arguments must be a source name and a column"))?;
             if !sources.contains_key(&source) {
-                bail!("{fname}(): unknown source {source:?}");
+                bail!("{fname}(): unknown source, lake table or view {source:?}");
+            }
+            if !wanted(&source) {
+                return Ok(());
             }
             let time_col = col(&args[1])?;
             let alias = t["alias"].as_str().filter(|a| !a.is_empty()).unwrap_or(&fname).to_string();
@@ -1266,13 +1313,54 @@ fn rewrite_from<S>(t: &mut Value, sources: &HashMap<String, S>, found: &mut Vec<
             Ok(())
         }
         "JOIN" => {
-            rewrite_from(&mut t["left"], sources, found)?;
-            rewrite_from(&mut t["right"], sources, found)
+            rewrite_from(&mut t["left"], sources, lake, found)?;
+            rewrite_from(&mut t["right"], sources, lake, found)
         }
         "SUBQUERY" => bail!("subqueries in FROM are not supported in continuous views"),
         "EMPTY" => Ok(()),
         other => bail!("unsupported FROM item {other}"),
     }
+}
+
+/// Every table name the view's FROM clauses use, as written (`t`, `schema.t`, `catalog.schema.t`), including
+/// the stream argument of TUMBLE and HOP, in every branch of a UNION ALL. The caller resolves each to a Kafka
+/// source, a view or a lake table before compiling.
+pub fn table_names(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    fn from(t: &Value, out: &mut Vec<String>) {
+        match t["type"].as_str().unwrap_or("") {
+            "BASE_TABLE" => out.push(table_key(t)),
+            "TABLE_FUNCTION" => {
+                let f = &t["function"];
+                let fname = f["function_name"].as_str().unwrap_or("").to_ascii_lowercase();
+                if fname == "tumble" || fname == "hop" {
+                    let arg = f["arguments"].as_array().and_then(|a| a.first()).map(|a| a.get("expression").unwrap_or(a));
+                    if let Some(names) = arg.filter(|a| a["class"] == "COLUMN_REF").and_then(|a| a["column_names"].as_array()) {
+                        out.push(names.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join("."));
+                    }
+                }
+            }
+            "JOIN" => {
+                from(&t["left"], out);
+                from(&t["right"], out);
+            }
+            _ => {}
+        }
+    }
+    fn node(n: &Value, out: &mut Vec<String>) {
+        if n["type"] == "SET_OPERATION_NODE" {
+            n["children"].as_array().into_iter().flatten().for_each(|c| node(c, out));
+        } else {
+            from(&n["from_table"], out);
+        }
+    }
+    let ast = serialize(conn, sql)?;
+    let mut out = Vec::new();
+    for s in ast["statements"].as_array().into_iter().flatten() {
+        node(&s["node"], &mut out);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// The table ref marked by `rewrite_from`.

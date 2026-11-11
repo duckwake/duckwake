@@ -82,5 +82,9 @@ impl Circuit {
 
 /// A source of the view: Kafka without CDC only ever inserts.
 fn source_op(plan: &Plan, name: &str) -> Op {
-    Op::Source(Source { name: name.into(), append_only: !plan.retracting.iter().any(|s| s == name) })
+    Op::Source(Source {
+        name: name.into(),
+        append_only: !plan.retracting.iter().any(|s| s == name),
+        change_feed: plan.change_feeds.iter().any(|s| s == name),
+    })
 }

@@ -5,7 +5,7 @@
 //! in DuckLake, an UPDATE of one row in a table conflicts with a concurrent UPDATE of any other row of the
 //! same table, so per-epoch fencing on `jobs` would make every worker conflict with every other one.
 use crate::lake::{ident, lit, quote_table, CTL, LAKE};
-use crate::model::{parse_duration, JobDef, JobStatus, SourceDef, SourceOptions};
+use crate::model::{parse_duration, Input, JobDef, JobStatus, LakeInput, SourceDef, SourceOptions, COMMIT_TS};
 use crate::plan;
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
@@ -22,7 +22,7 @@ pub use duckwake_circuit::sql::state_table;
 pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<String, SourceDef>)> {
     let (mut def, _) = load_job(conn, job)?;
     let sources = load_sources(conn)?;
-    let plan = plan::compile(conn, job, &def.sql, &sources)?;
+    let plan = compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
     if plan.state_columns != def.plan.state_columns || plan.sink_columns != def.plan.sink_columns {
         bail!(
             "view {job} was created by a DuckWake version whose state or table layout differs from this one's; \
@@ -31,6 +31,106 @@ pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<St
     }
     def.plan = plan;
     Ok((def, sources))
+}
+
+/// Compiles a view whose FROM names Kafka sources, and lake tables and views resolved to `lakes`.
+pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &[LakeInput]) -> Result<plan::Plan> {
+    let mut inputs: HashMap<String, Input> = sources.iter().map(|(n, s)| (n.clone(), Input::Kafka(s))).collect();
+    inputs.extend(lakes.iter().map(|l| (l.name.clone(), Input::Lake(l))));
+    plan::compile(conn, job, sql, &inputs)
+}
+
+/// The columns of a view input named `name`: a Kafka source's or a lake input's.
+pub fn input_columns<'a>(name: &str, sources: &'a HashMap<String, SourceDef>, lakes: &'a [LakeInput]) -> Result<&'a [(String, String)]> {
+    if let Some(s) = sources.get(name) {
+        return Ok(&s.options.columns);
+    }
+    lakes.iter().find(|l| l.name == name).map(|l| l.columns.as_slice()).with_context(|| format!("input {name} of the view is gone"))
+}
+
+/// Resolves the names a view's FROM uses that are not Kafka sources: first to a view (by job id, or by the
+/// table it writes), then to a lake table. Names that are neither are left to DuckDB, which binds them or
+/// fails. Every such table becomes a lake input of the view; the compiler decides which of them it reads as
+/// a change feed and which it joins as a lookup.
+fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>) -> Result<Vec<LakeInput>> {
+    let mut out = Vec::new();
+    for name in plan::table_names(conn, sql)? {
+        if sources.contains_key(&name) {
+            continue;
+        }
+        let upstream = if name.contains('.') { resolve_view(conn, &name).ok() } else { job_status(conn, &name)?.map(|_| name.clone()) };
+        if let Some(up) = upstream {
+            if up == job || reads_transitively(conn, &up, job)? {
+                bail!("view {job} would read itself through {name}: cycles between views are not allowed");
+            }
+            let (def, _) = load_job(conn, &up)?;
+            if def.plan.sink_columns.iter().any(|(c, _)| c == COMMIT_TS) {
+                bail!("view {up} has a column named {COMMIT_TS}, which DuckWake adds to every lake input; rename it in {up}");
+            }
+            let (_, schema, table) = crate::lake::qualified_table(&def.sink)?;
+            let table_id = crate::lake::table_id(conn, &schema, &table)?.with_context(|| format!("the table of view {up} is missing"))?;
+            let windowed = def.plan.window.as_ref().filter(|_| {
+                ["window_start", "window_end"].iter().all(|w| def.plan.sink_columns.iter().any(|(c, _)| c == w))
+            });
+            out.push(LakeInput {
+                name,
+                table: def.sink.clone(),
+                table_id,
+                columns: def.plan.sink_columns.iter().cloned().chain([(COMMIT_TS.to_string(), "TIMESTAMP".to_string())]).collect(),
+                view: Some(up),
+                window_size_us: windowed.map(|w| w.size_us),
+            });
+            continue;
+        }
+        let (catalog, schema, table) = match name.split('.').collect::<Vec<_>>().as_slice() {
+            [t] => (LAKE.to_string(), "main".to_string(), t.to_string()),
+            _ => match crate::lake::qualified_table(&name) {
+                Ok(parts) => parts,
+                Err(_) => continue,
+            },
+        };
+        if schema == CTL.rsplit('.').next().unwrap_or(CTL) {
+            bail!("views cannot read DuckWake's control tables ({name})");
+        }
+        let Some(table_id) = crate::lake::table_id(conn, &schema, &table)? else { continue };
+        let qualified = format!("{catalog}.{schema}.{table}");
+        let mut columns = crate::lake::describe(conn, &quote_table(&qualified)?)?;
+        if columns.iter().any(|(c, _)| c == COMMIT_TS) {
+            bail!("{name} has a column named {COMMIT_TS}, which DuckWake adds to every lake input");
+        }
+        columns.push((COMMIT_TS.to_string(), "TIMESTAMP".to_string()));
+        out.push(LakeInput { name, table: qualified, table_id, columns, view: None, window_size_us: None });
+    }
+    Ok(out)
+}
+
+/// Whether view `from` reads view `to`, directly or through other views.
+fn reads_transitively(conn: &Connection, from: &str, to: &str) -> Result<bool> {
+    let mut stack = vec![from.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v.clone()) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!("SELECT upstream_job FROM {CTL}.dependencies WHERE job_id = ? AND upstream_job IS NOT NULL"))?;
+        for up in stmt.query_map([&v], |r| r.get::<_, String>(0))? {
+            let up = up?;
+            if up == to {
+                return Ok(true);
+            }
+            stack.push(up);
+        }
+    }
+    Ok(false)
+}
+
+/// The views that read `job`'s table.
+pub fn readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT job_id FROM {CTL}.dependencies WHERE upstream_job = ? AND job_id <> ? ORDER BY job_id"
+    ))?;
+    let rows = stmt.query_map([job, job], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<duckdb::Result<Vec<_>>>()?)
 }
 
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_json::Value) -> Result<SourceDef> {
@@ -117,11 +217,31 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         bail!("view {:?} already exists", v.job_id);
     }
     let sources = load_sources(conn)?;
-    let plan = plan::compile(conn, v.job_id, v.sql, &sources)?;
+    let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
+    let plan = compile(conn, v.job_id, v.sql, &sources, &lake_inputs)?;
     if v.late_data.is_some() && !plan.is_windowed() {
         bail!("only windowed views have late data; drop --late-data for a {} view", plan.kind_name());
     }
-    let src = &sources[&plan.source];
+    // Tables the view joins to a Kafka source are lookups, read whole every epoch; only the streams are inputs.
+    let streams = plan.sources();
+    lake_inputs.retain(|l| streams.contains(&l.name));
+    for l in &lake_inputs {
+        // Until retracting inputs (F2), a view reads only tables whose rows are never updated or deleted:
+        // another view's append-only table, or a lake table checked to be insert-only every epoch.
+        if let Some(up) = &l.view {
+            let (up_def, _) = load_job(conn, up)?;
+            if up_def.plan.sink_mode() != plan::SinkMode::Append || up_def.plan.retracts() {
+                bail!(
+                    "{} is the table of the {} view {up}, whose rows are replaced or removed as they change; \
+                     views over such tables come with retracting inputs (F2)",
+                    l.name,
+                    up_def.plan.kind_name()
+                );
+            }
+        }
+    }
+    let start_snapshot = (!lake_inputs.is_empty()).then(|| crate::lake::current_snapshot(conn)).transpose()?;
+    let src_columns = input_columns(&plan.source, &sources, &lake_inputs)?.to_vec();
     let def = JobDef {
         job_id: v.job_id.into(),
         sql: v.sql.into(),
@@ -132,6 +252,8 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         max_rows: v.max_rows,
         inline_row_limit: v.inline_row_limit,
         plan,
+        lake_inputs,
+        start_snapshot,
     };
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
     let circuit = crate::circuit::Circuit::compile(&def.view())?;
@@ -158,7 +280,11 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
             let (_, ls, lt) = crate::lake::qualified_table(late)?;
             conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&ls)))?;
             if !table_exists(conn, &ls, &lt)? {
-                let mut cols: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+                let mut cols: Vec<String> = src_columns
+                    .iter()
+                    .filter(|(c, _)| !crate::circuit::codegen::is_window_column(c))
+                    .map(|(c, t)| format!("{} {t}", ident(c)))
+                    .collect();
                 cols.extend(
                     ["window_start TIMESTAMP", "window_end TIMESTAMP", "_source_partition INTEGER", "_source_offset BIGINT", "_duckwake_epoch BIGINT"]
                         .map(String::from),
@@ -179,6 +305,12 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
             &format!("INSERT INTO {CTL}.jobs VALUES (?, ?, 1, 'created', now(), now())"),
             [v.job_id, &serde_json::to_string(&def)?],
         )?;
+        for l in &def.lake_inputs {
+            conn.execute(
+                &format!("INSERT INTO {CTL}.dependencies VALUES (?, ?, ?, ?)"),
+                duckdb::params![v.job_id, l.name, l.table_id, l.view],
+            )?;
+        }
         Ok(())
     })();
     finish(conn, res)?;
@@ -444,6 +576,10 @@ pub fn drop_view(conn: &Connection, job: &str, keep_table: bool) -> Result<()> {
     if status == JobStatus::Running {
         bail!("stop {job:?} before dropping it");
     }
+    let readers = readers(conn, job)?;
+    if !readers.is_empty() {
+        bail!("view {job} is read by {}; drop those views first", readers.join(", "));
+    }
     // Like `reset`, its deletes from the shared control tables can lose to a running job's inserts.
     retry_conflicts(|| drop_view_once(conn, job, &def, keep_table))
 }
@@ -454,6 +590,7 @@ fn drop_view_once(conn: &Connection, job: &str, def: &JobDef, keep_table: bool) 
         conn.execute(&format!("DELETE FROM {CTL}.jobs WHERE job_id = ?"), [job])?;
         conn.execute(&format!("DELETE FROM {CTL}.checkpoints WHERE job_id = ?"), [job])?;
         conn.execute(&format!("DELETE FROM {CTL}.dead_letter WHERE job_id = ?"), [job])?;
+        conn.execute(&format!("DELETE FROM {CTL}.dependencies WHERE job_id = ?"), [job])?;
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};", lease_table(job), state_table(job)))?;
         if !keep_table {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_table(&def.sink)?))?;

@@ -4,7 +4,7 @@
 use crate::catalog;
 use crate::lake::{lit, CTL};
 use crate::model::{JobDef, JobStatus};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use duckdb::Connection;
 
 /// Options of `duckwake_create_view`; `None` takes the default.
@@ -116,7 +116,7 @@ pub fn explain(conn: &Connection, name: &str) -> Result<String> {
         .plan
         .sources()
         .into_iter()
-        .map(|n| Ok((n.clone(), sources.get(&n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))?.options.columns.clone())))
+        .map(|n| Ok((n.clone(), catalog::input_columns(&n, &sources, &def.lake_inputs)?.to_vec())))
         .collect::<Result<_>>()?;
     crate::circuit::explain(def.view(), &columns)
 }

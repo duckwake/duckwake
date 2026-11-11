@@ -64,8 +64,24 @@ default.
 - `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL (needs a C++ parser shim; DuckDB's C API has no parser hooks)
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
 - `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
-  stream–stream joins, DuckLake tables and other views as sources (every operator but windowed `MIN`/`MAX`
-  already takes retracting input)
+  stream–stream joins
+- DuckLake tables and other views as sources: views over insert-only tables and append-only views are done
+  (F1, `scripts/chain_test.sh`); tables whose rows change (F2), backfill and retention (F3), and shared and
+  fused reads (F4) remain. Every operator but windowed `MIN`/`MAX` already takes retracting input.
+- **Partition-overwrite refresh**, right after F2's weights, for lake tables whose recent partitions are
+  rerun to correct data (for example, the last 3 days rewritten with delete + insert or `INSERT OVERWRITE`).
+  A view whose table is partitioned like its input (its output carries the input's partition column, such as
+  `date`) is refreshed by partition instead of incrementally:
+  1. From the change feed in (P, S], find the partition values the epoch touched.
+  2. In the epoch transaction, delete those partitions from the view's table and insert the view's batch
+     query over the input `AT (VERSION => S)`, restricted to those partitions; the checkpoint moves to S.
+
+  It runs any SQL the batch query can (window functions, any join), needs no window state kept for
+  `lateness`, and stays exactly-once through the same snapshot position. It costs one batch query over the
+  rerun partitions per rerun. A view picks it at create time; `create_view` refuses it when the view's
+  output does not carry the input's partition column. **Gate:** a generator reruns the last 3 days of a
+  partitioned table with changed, removed and added rows; after every rerun, through crashes, the view's
+  table equals its batch query over the table at the checkpoint's snapshot.
 - Avro and Protobuf with a schema registry; Kafka keys and headers
 - Splitting one topic's partitions across workers
 - A Windows build

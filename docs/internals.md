@@ -166,6 +166,21 @@ operator's semantics and a test oracle, not a dependency.
      views reading the same table should read its range once (F4).
    - `snapshot_time` never ran backwards against snapshot ids (0 of 599 pairs). Writers on other machines
      may still disagree on the clock, so the change time stays a running maximum.
+10. **Views over lake tables and other views (F1)** need a few more DuckLake details, checked on the
+   Postgres catalog:
+   - `ducklake_table_changes(lake, schema, table, from, to)` fails when `to` is not a snapshot ("No snapshot
+     found at version 99") and when `from > to`, so a job reads the current snapshot S first and skips an
+     empty range (P = S) instead of querying it.
+   - `ducklake_merge_adjacent_files` keeps every row's `snapshot_id`, and its own snapshot has no changes:
+     3 files merged into 1, the change feed over the old range returned the same 4 inserts, and over the
+     merge's snapshot none. Maintenance does not disturb a change feed.
+   - Table ids come from `__ducklake_metadata_lake.ducklake_table` (joined to `ducklake_schema`, rows with
+     `end_snapshot IS NULL`); `ducklake_table_info` has the id but no schema name.
+   - A table alias goes before the version: `FROM t AS x AT (VERSION => n)`.
+   - A view's own commits add snapshots that move every lake input's watermark (`_commit_ts`). Committing
+     every time it moved would keep a worker writing an empty snapshot every epoch forever, so a view with
+     lake inputs commits only for new rows or a window that closes. When the whole lake is idle no snapshot
+     comes, the watermark stands, and the last window stays open, as for an idle Kafka partition.
 
 ## Simplifications and gaps
 
@@ -187,6 +202,17 @@ operator's semantics and a test oracle, not a dependency.
   `MIN`/`MAX` in windows and late-data tables; no source kind retracts yet.
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
+- **Lake inputs (F1).** A view reads a lake table, or another view's table, through its change feed when no
+  Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. Inputs must be insert-only
+  until retracting inputs (F2): an update or delete stops the view (status `failed`), and a view over an
+  aggregate's or `DISTINCT`'s table is refused at create time. A view reads the changes after the snapshot
+  current when it was created (`start: latest`); backfill of existing rows (`earliest`) is F3. Retention does
+  not yet keep the oldest position (P_min, F3): maintenance can expire snapshots a paused view still needs.
+  `reset` does not cascade to the views that read the reset view (F3). Windows over a lake input use
+  `_commit_ts`, or a windowed view's `window_start`/`window_end`; windows on another column of a lake input
+  are not supported yet. Joins of two lake inputs, and fused chains on one worker (one hop per epoch now),
+  come later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`,
+  so it compares with Kafka event times.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark
   holds at the checkpointed value until every active partition reports again.
 
@@ -201,5 +227,5 @@ crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and exte
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
-scripts/         crash, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
+scripts/         crash, chain, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

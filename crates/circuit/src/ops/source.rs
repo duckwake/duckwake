@@ -11,11 +11,13 @@ pub struct Source {
     pub name: String,
     /// Whether its rows are only ever inserted (Kafka without CDC). Otherwise each staged row has its weight.
     pub append_only: bool,
+    /// Read through a DuckLake change feed (a lake table or view) rather than from Kafka.
+    pub change_feed: bool,
 }
 
 impl Operator for Source {
     fn name(&self) -> String {
-        format!("Source({})", self.name)
+        if self.change_feed { format!("ChangeFeed({})", self.name) } else { format!("Source({})", self.name) }
     }
 
     fn class(&self) -> Class {

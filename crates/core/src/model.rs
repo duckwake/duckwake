@@ -110,6 +110,94 @@ pub struct JobDef {
     #[serde(default = "default_inline_row_limit")]
     pub inline_row_limit: usize,
     pub plan: crate::plan::Plan,
+    /// The lake tables and views the view reads through their change feeds (not lookups), in the order
+    /// `create_view` resolved them.
+    #[serde(default)]
+    pub lake_inputs: Vec<LakeInput>,
+    /// With lake inputs: the snapshot current when the view was created. The view reads the changes after it
+    /// (`start: latest`); its first checkpoint starts from here.
+    #[serde(default)]
+    pub start_snapshot: Option<i64>,
+}
+
+/// The column every lake input adds: the commit time of the change, as the running maximum of
+/// `snapshot_time` by snapshot id, in UTC. Monotone in commit order, so it gives an exact watermark.
+pub const COMMIT_TS: &str = "_commit_ts";
+
+/// A lake table, or another view's table, that a view reads through its DuckLake change feed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LakeInput {
+    /// The name the view's SQL uses for it, and its key in the checkpoint's offsets.
+    pub name: String,
+    /// `lake.schema.table` when the view was created.
+    pub table: String,
+    /// DuckLake table id: a renamed table keeps working, and a dropped and recreated one has a new id and
+    /// fails the job.
+    pub table_id: i64,
+    /// Its columns when the view was created, then `_commit_ts`.
+    pub columns: Vec<(String, String)>,
+    /// The view whose table this is, if any.
+    pub view: Option<String>,
+    /// A windowed view's table: its window size. Windows over its `window_start` or `window_end` then get
+    /// an exact watermark from the view's own.
+    pub window_size_us: Option<i64>,
+}
+
+impl LakeInput {
+    /// The time column a window over this input may use, and the watermark source it implies.
+    pub fn window_columns(&self) -> Vec<String> {
+        let mut out = vec![COMMIT_TS.to_string()];
+        if self.window_size_us.is_some() {
+            out.extend(["window_start".into(), "window_end".into()]);
+        }
+        out
+    }
+}
+
+impl crate::circuit::SourceSchema for LakeInput {
+    fn event_time(&self) -> &str {
+        COMMIT_TS
+    }
+    fn columns(&self) -> &[(String, String)] {
+        &self.columns
+    }
+    fn is_lake(&self) -> bool {
+        true
+    }
+    fn time_columns(&self) -> Vec<String> {
+        self.window_columns()
+    }
+}
+
+/// Anything a view names in FROM that the compiler treats as a stream: a declared Kafka source, or a lake
+/// table or view read through its change feed.
+pub enum Input<'a> {
+    Kafka(&'a SourceDef),
+    Lake(&'a LakeInput),
+}
+
+impl crate::circuit::SourceSchema for Input<'_> {
+    fn event_time(&self) -> &str {
+        match self {
+            Input::Kafka(s) => s.event_time(),
+            Input::Lake(l) => l.event_time(),
+        }
+    }
+    fn columns(&self) -> &[(String, String)] {
+        match self {
+            Input::Kafka(s) => s.columns(),
+            Input::Lake(l) => l.columns(),
+        }
+    }
+    fn is_lake(&self) -> bool {
+        matches!(self, Input::Lake(_))
+    }
+    fn time_columns(&self) -> Vec<String> {
+        match self {
+            Input::Kafka(s) => s.time_columns(),
+            Input::Lake(l) => l.time_columns(),
+        }
+    }
 }
 
 fn default_inline_row_limit() -> usize {

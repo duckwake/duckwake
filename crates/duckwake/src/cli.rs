@@ -341,8 +341,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 bail!("VERIFY FAILED for {name}");
             }
             let scope = match r.from_epoch {
-                Some(e) => format!("the {} retained events (output after epoch {e})", r.kafka_rows),
-                None => format!("all {} events", r.kafka_rows),
+                Some(e) => format!("the retained {} (output after epoch {e})", r.inputs()),
+                None => format!("all {}", r.inputs()),
             };
             println!("VERIFY OK: {name} output matches batch recomputation over {scope} (epoch {}, watermark {})", r.epoch, r.watermark);
         }

@@ -74,7 +74,9 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
            max_event_time TIMESTAMP, lag BIGINT, worker VARCHAR, committed_at TIMESTAMPTZ, rows_sql BIGINT);
          CREATE TABLE IF NOT EXISTS {CTL}.dead_letter (
            job_id VARCHAR, epoch BIGINT, source VARCHAR, source_partition INTEGER, source_offset BIGINT,
-           payload VARCHAR, error VARCHAR, failed_at TIMESTAMPTZ);"
+           payload VARCHAR, error VARCHAR, failed_at TIMESTAMPTZ);
+         CREATE TABLE IF NOT EXISTS {CTL}.dependencies (
+           job_id VARCHAR, input VARCHAR, table_id BIGINT, upstream_job VARCHAR);"
     ))
     .context("bootstrapping __duckwake schema")?;
     // Lakes bootstrapped before the Arrow decode lack `rows_sql` (messages decoded in SQL per epoch).
@@ -170,6 +172,39 @@ pub fn check_name(kind: &str, name: &str) -> Result<()> {
 /// Runs a single-value query and returns it as a string (NULL becomes None).
 pub fn query_opt_string(conn: &Connection, sql: &str) -> Result<Option<String>> {
     Ok(conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0))?)
+}
+
+/// The lake's newest committed snapshot id. Cheaper than `max(snapshot_id)` over `ducklake_snapshots`, and
+/// it always shows what other processes have just committed (F0, internals item 9).
+pub fn current_snapshot(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(&format!("SELECT id FROM ducklake_current_snapshot({})", lit(LAKE)), [], |r| r.get(0))?)
+}
+
+/// The DuckLake metadata schema of the lake, which holds `ducklake_table` and `ducklake_schema`.
+fn metadata() -> String {
+    format!("__ducklake_metadata_{LAKE}")
+}
+
+/// The id of a live lake table, or None when there is no such table.
+pub fn table_id(conn: &Connection, schema: &str, table: &str) -> Result<Option<i64>> {
+    let m = metadata();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.table_id FROM {m}.ducklake_table t JOIN {m}.ducklake_schema s USING (schema_id)
+         WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL AND s.schema_name = ? AND t.table_name = ?"
+    ))?;
+    let mut rows = stmt.query([schema, table])?;
+    Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+}
+
+/// The current schema and name of a live lake table by id, or None once it has been dropped.
+pub fn table_by_id(conn: &Connection, id: i64) -> Result<Option<(String, String)>> {
+    let m = metadata();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.schema_name, t.table_name FROM {m}.ducklake_table t JOIN {m}.ducklake_schema s USING (schema_id)
+         WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL AND t.table_id = ?"
+    ))?;
+    let mut rows = stmt.query([id])?;
+    Ok(rows.next()?.map(|r| Ok::<_, duckdb::Error>((r.get(0)?, r.get(1)?))).transpose()?)
 }
 
 /// True when a DuckLake commit failed because another transaction touched the same table.
