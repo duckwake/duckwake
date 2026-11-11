@@ -31,7 +31,14 @@ caught_up() {
 }
 wait_for() {
   local at; at=$(snapshot)
-  for _ in $(seq 1 120); do caught_up "$@" "$at" && return 0; sleep 1; done
+  for _ in $(seq 1 120); do
+    caught_up "$@" "$at" && return 0
+    # A worker that died will not catch up: say why instead of waiting it out.
+    if [[ -n ${pid:-} ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "$1 did not catch up: the worker exited"; grep -m1 -A4 '^Error' "$OUT/worker.log" || true; return 1
+    fi
+    sleep 1
+  done
   echo "$1 did not catch up to snapshot $at"; return 1
 }
 verify_views() {
@@ -72,7 +79,7 @@ log "reset lake"; reset_env
 log "create the table, its first rows, and the views"
 sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.accounts (id INTEGER, game_id VARCHAR, amount DECIMAL(18,2));
      INSERT INTO lake.shop.accounts SELECT i, $GAMES, $AMOUNT FROM range(1, 401) t(i)" >/dev/null
-create() { "$BIN" create-view "analytics.$1" --epoch-interval "$EPOCH" --sql "$2" | head -1; }
+create() { "$BIN" create-view "analytics.$1" --epoch-interval "$EPOCH" --sql "$2" | sed -n 1p; }
 create acc_rich "SELECT id, game_id, amount, _commit_ts FROM shop.accounts WHERE amount >= 50"
 create acc_by_game "SELECT game_id, count(*) AS n, sum(amount) AS total, avg(amount) AS mean, min(amount) AS lo, max(amount) AS hi
                     FROM shop.accounts GROUP BY game_id"
@@ -125,7 +132,7 @@ log "reset a view another view reads: the reader follows it through the change f
 # Stopping does not fence: wait for the worker to let the view go before rewinding it.
 for _ in $(seq 1 30); do grep -q 'job released.*job=acc_by_game' "$OUT/worker.log" && break; sleep 1; done
 to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'acc_by_game'") / 2 ))
-"$BIN" reset acc_by_game --to-epoch "$to" | head -1
+"$BIN" reset acc_by_game --to-epoch "$to" | sed -n 1p
 "$BIN" start acc_by_game --worker w1 >/dev/null
 wait_for acc_by_game shop accounts || failed=1
 wait_for acc_busy_games analytics acc_by_game || failed=1

@@ -32,13 +32,13 @@ log "create the source and the chain"
   \"watermark_delay\":\"5 seconds\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
   \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}"
 "$BIN" create-view analytics.chain_big --epoch-interval "$EPOCH" \
-  --sql "SELECT ts, game_id, user_id, amount FROM clicks WHERE amount >= 50" | head -1
+  --sql "SELECT ts, game_id, user_id, amount FROM clicks WHERE amount >= 50" | sed -n 1p
 "$BIN" create-view analytics.chain_per_10s --epoch-interval "$EPOCH" \
   --sql "SELECT window_start, window_end, game_id, count(*) AS n, sum(amount) AS revenue
-         FROM TUMBLE(analytics.chain_big, _commit_ts, INTERVAL 10 SECOND) GROUP BY ALL" | head -1
+         FROM TUMBLE(analytics.chain_big, _commit_ts, INTERVAL 10 SECOND) GROUP BY ALL" | sed -n 1p
 "$BIN" create-view analytics.chain_per_30s --epoch-interval "$EPOCH" \
   --sql "SELECT window_start, game_id, sum(n) AS n, sum(revenue) AS revenue
-         FROM TUMBLE(analytics.chain_per_10s, window_end, INTERVAL 30 SECOND) GROUP BY ALL" | head -1
+         FROM TUMBLE(analytics.chain_per_10s, window_end, INTERVAL 30 SECOND) GROUP BY ALL" | sed -n 1p
 for v in "${CHAIN[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 
 log "produce $((RATE * DURATION)) events at $RATE/s (every 997th 5 min late, every 1499th malformed)"
@@ -78,19 +78,19 @@ echo "chain_per_30s: $rows closed 30 s windows verified"
 log "dropping a view another view reads is refused"
 "$BIN" stop chain_per_10s >/dev/null
 if out=$("$BIN" drop chain_per_10s 2>&1); then echo "drop of chain_per_10s was not refused"; failed=1
-elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | head -1
+elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | sed -n 1p
 else echo "drop of chain_per_10s failed for another reason: $out"; failed=1; fi
 "$BIN" start chain_per_10s --worker w1 >/dev/null
 
 log "an update to a lake table a windowed view reads stops that view, and only that view"
 "$BIN" sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.orders (id INTEGER, amount DOUBLE)" >/dev/null
 "$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --sql "SELECT window_start, count(*) AS n, sum(amount) AS total
-  FROM TUMBLE(shop.orders, _commit_ts, INTERVAL 10 SECOND) WHERE amount > 5 GROUP BY ALL" | head -1
+  FROM TUMBLE(shop.orders, _commit_ts, INTERVAL 10 SECOND) WHERE amount > 5 GROUP BY ALL" | sed -n 1p
 "$BIN" start orders_big --worker w1 >/dev/null
 "$BIN" sql "INSERT INTO lake.shop.orders SELECT i, i FROM range(20) t(i)" >/dev/null; sleep 6
 "$BIN" sql "UPDATE lake.shop.orders SET amount = 0 WHERE id = 10" >/dev/null; sleep 6
 status() { "$BIN" sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'" --csv 2>/dev/null | tail -1; }
-grep -o "view orders_big needs.*" "$OUT/worker.log" | head -1
+grep -o "view orders_big needs.*" "$OUT/worker.log" | sed -n 1p
 [[ $(status orders_big) == failed ]] && echo "orders_big: failed, as it must" || { echo "orders_big is $(status orders_big), not failed"; failed=1; }
 for v in "${CHAIN[@]}"; do [[ $(status "$v") == running ]] || { echo "$v is $(status "$v"), not running"; failed=1; }; done
 kill -0 "$pid" 2>/dev/null && echo "worker still running; the chain is still running" || { echo "the worker died"; failed=1; }

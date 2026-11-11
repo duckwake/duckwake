@@ -41,6 +41,10 @@ certificate, so clients must use that address over TLS. To reach the server from
 localhost and put a TLS reverse proxy in front, as [Quack's security notes](https://duckdb.org/docs/2.0/quack/security.html)
 recommend; the image and the compose profile bind Quack and metrics to localhost.
 
+`--quack-token` (or `DUCKWAKE_QUACK_TOKEN`) also takes `file:/run/secrets/quack` or `env:NAME`, so the token
+stays out of process listings. Credentials for the catalog and the data files are covered in
+[cli.md](cli.md#storage-and-credentials).
+
 ## Metrics and supervision
 
 `GET :9464/metrics` serves per-view freshness, watermark delay, lag, epoch,

@@ -19,7 +19,7 @@ for d in sql arrow; do
     \"decode\":\"$d\",\"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}"
   # A small max_rows makes many epochs, so chunk boundaries and partial drains are exercised too.
   "$BIN" create-view "analytics.all_$d" --epoch-interval 1s --max-rows 5000 \
-    --sql "SELECT ts, game_id, user_id, amount FROM src_$d" | head -1
+    --sql "SELECT ts, game_id, user_id, amount FROM src_$d" | sed -n 1p
   "$BIN" start "all_$d" --worker w1
 done
 

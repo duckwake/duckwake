@@ -222,6 +222,16 @@ operator's semantics and a test oracle, not a dependency.
    runs on the scheduler thread, so a worker whose epoch loop is stuck looks dead too; a commit that takes
    longer than the timeout moves views needlessly but never breaks exactly-once. Each heartbeat is one
    catalog snapshot (17,280 a day per worker at the default 5 s), expired with the epochs' snapshots.
+   A frozen worker can block more than its own views: every DuckLake commit on PostgreSQL inserts the next
+   `snapshot_id`, so a worker stopped inside its commit holds a row lock that every other commit waits on,
+   claims and heartbeats included, for as long as it stays frozen (seen under load in CI: 16 minutes). A
+   worker therefore adds `options='-c idle_in_transaction_session_timeout=<lease timeout>'` to its catalog
+   connection (unless the string already passes `options`): PostgreSQL ends the stalled session, which rolls
+   its commit back, and the lake moves again within the lease timeout. Thawed, that worker's commit fails and
+   it exits (`duckwaked` restarts it). Workers that start together also race on `set_option` (each sets
+   inlining on the shared checkpoint table, one catalog row): DuckLake reports the losers' failures as
+   plain errors, not conflicts, and the worker died. A worker now skips an option its connection already
+   sees, and retries the idempotent write.
 13. **Kafka credentials stay out of the lake.** Source definitions live in `__duckwake.sources`, readable by
    anyone who can read the lake, so `sasl_password` must be `env:NAME` or `file:/path` (`secrets.rs`),
    resolved by each worker when it connects. TLS uses rustls with ring, the same stack rskafka uses, with the
@@ -230,6 +240,12 @@ operator's semantics and a test oracle, not a dependency.
    with a wrong password hung its worker and every view on it. `scripts/kafka_auth_test.sh` runs the test
    views over SCRAM in plaintext, SCRAM over TLS and TLS with a client certificate against the local
    Redpanda's authenticated listeners (`docker/kafka`), and checks the refusals.
+14. **Object storage needs only an S3 secret.** DuckLake writes, reads, time-travels, merges and deletes data
+   files through DuckDB's httpfs, so a data path of `s3://bucket/prefix/` works once the instance has a
+   secret: `lake.rs` creates a temporary one, scoped to the bucket, from the standard AWS variables (or the
+   AWS credential chain), before attaching. Nothing about object storage reaches the lake, and the catalog
+   password comes from libpq's `PGPASSWORD` or `.pgpass`. The suites run against MinIO with
+   `LAKE_STORAGE=s3` (Chainguard's image: MinIO no longer publishes community images to Docker Hub).
 
 ## Simplifications and gaps
 
@@ -238,7 +254,9 @@ operator's semantics and a test oracle, not a dependency.
 - **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
   certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
   view is marked failed, so a view starting while its brokers are down needs `start` again; once
-  connected, readers retry through broker restarts. Unknown fields are dropped; there is no
+  connected, readers retry through broker restarts. Likewise a view started before its topic exists fails
+  (`topic ... not found`); with failover a live worker may claim a view the moment it starts, so create the
+  topic first. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
   across workers. Without `--shared-readers` each job has its own readers: two jobs on one source read it
@@ -253,6 +271,9 @@ operator's semantics and a test oracle, not a dependency.
   joins are rejected at create time. Every operator handles retracting input (see Retractions above) except
   `MIN`/`MAX` in windows and late-data tables. Lake tables, and views whose tables change, are the
   retracting inputs; Kafka sources only insert (no CDC yet).
+- **Storage.** Local disk or `s3://` (S3 and S3-compatible stores); not `gs://` or Azure natively (GCS through
+  its S3 API works). Credentials come from the environment of each process; there is no secret store
+  integration (Vault, cloud secret managers) beyond files and variables.
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
 - **Lake inputs (F1, F2).** A view reads a lake table, or another view's table, through its change feed when

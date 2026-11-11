@@ -3,8 +3,9 @@
 # While events stream in, each way a worker can go away must move its views to the live workers within a
 # bounded time, with exact output:
 #   1. kill -9: its heartbeat stops; the views move once the lease timeout passes.
-#   2. a frozen worker (SIGSTOP): the same; when it thaws (SIGCONT) it is a zombie whose commits are fenced,
-#      and it lets go of the views.
+#   2. a frozen worker (SIGSTOP): the same, even when it froze inside its catalog commit (PostgreSQL ends
+#      that session after the lease timeout); thawed (SIGCONT), it is a zombie whose commits are fenced and
+#      it lets go of the views, or it exits.
 #   3. a clean stop (SIGTERM): it marks itself stopped, so the views move at the next refresh.
 # A restarted worker takes views again. After draining, every view verifies against the batch recomputation.
 source "$(dirname "$0")/lib.sh"
@@ -19,6 +20,8 @@ run_worker() {
   echo $! >"$OUT/$1.pid"
 }
 pid() { cat "$OUT/$1.pid"; }
+# However the test ends, no worker outlives it (a frozen one is thawed first, or SIGKILL would wait).
+trap 'for w in w1 w2 w3; do [[ -f $OUT/$w.pid ]] && { kill -CONT "$(pid $w)"; kill -9 "$(pid $w)"; } 2>/dev/null || true; done' EXIT
 # "view owner" per view; owner is "-" when unassigned.
 owners() {
   local q="" v
@@ -53,6 +56,8 @@ log "three workers, then the views started on any worker: the workers spread the
 # Nothing rebalances views between live workers yet, so the workers come up before the views start.
 for w in w1 w2 w3; do run_worker "$w"; done
 for _ in $(seq 1 40); do [[ $("$BIN" workers | grep -c ' running ') == 3 ]] && break; sleep 0.5; done
+# The topics exist before the views start: a worker that claims a view first would fail it on a missing topic.
+docker compose exec -T redpanda rpk topic create "$TOPIC" "$TOPIC2" -p "$PARTITIONS" >/dev/null
 for v in "${VIEWS[@]}"; do "$BIN" start "$v"; done
 produce --rate "$RATE" --count $((RATE * DURATION)) --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
@@ -74,9 +79,14 @@ kill -STOP "$(pid w2)"
 check_moved "frozen" w2 "$BOUND"
 sleep 4
 kill -CONT "$(pid w2)"
-for _ in $(seq 1 30); do grep -qE 'lease lost|job released' "$OUT/w2.log" && break; sleep 0.5; done
+# Thawed, w2 lets go of its views, or, if it was frozen inside a catalog transaction, finds that PostgreSQL
+# ended that session after the lease timeout (so it could not block the other workers) and exits.
+for _ in $(seq 1 30); do grep -qE 'lease lost|job released' "$OUT/w2.log" || ! kill -0 "$(pid w2)" 2>/dev/null && break; sleep 0.5; done
 if grep -qE 'lease lost|job released' "$OUT/w2.log"; then
   echo "thawed w2 let go: $(grep -cE 'lease lost|job released' "$OUT/w2.log") views released or fenced"
+elif ! kill -0 "$(pid w2)" 2>/dev/null; then
+  echo "thawed w2 exited: it was frozen inside a catalog transaction, which PostgreSQL ended"
+  grep -m1 '^Error' "$OUT/w2.log" | cut -c1-120
 else
   echo "FAIL: thawed w2 did not let go of its views"; failed=1
 fi

@@ -53,7 +53,9 @@ jobs:
           - { name: fencing, run: scripts/fencing_test.sh }
           - { name: failover, run: scripts/failover_test.sh }
           - { name: kafka-auth, run: scripts/kafka_auth_test.sh }
-          - { name: crash sasl_ssl, run: KAFKA_AUTH=sasl_ssl scripts/crash_test.sh }
+          # P2's gate: the suites against authenticated Kafka and object storage (MinIO).
+          - { name: crash sasl_ssl+s3, run: KAFKA_AUTH=sasl_ssl LAKE_STORAGE=s3 scripts/crash_test.sh }
+          - { name: retract s3, run: LAKE_STORAGE=s3 scripts/retract_test.sh }
           - { name: chain, run: scripts/chain_test.sh }
           - { name: retract, run: scripts/retract_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
@@ -91,6 +93,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ strategy.job-index }}
+          include-hidden-files: true
           path: |
             .lake/**/*.log
             .lake/**/*.txt

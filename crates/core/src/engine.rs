@@ -305,6 +305,21 @@ fn crash_point(point: &str) {
 }
 
 pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> Result<()> {
+    if cfg.lake.catalog.split_whitespace().any(|kv| kv.starts_with("password=")) {
+        warn!(
+            "the catalog password is in the connection string, where process listings and shell history show it; \
+             set PGPASSWORD or use a .pgpass file instead"
+        );
+    }
+    let mut cfg = cfg;
+    if let Some(t) = cfg.lease_timeout {
+        // A worker frozen inside its catalog commit would block every writer, failover's claims included; let
+        // PostgreSQL end its session once it has been stalled as long as the others wait to call it dead.
+        if cfg.lake.catalog.contains("options=") && !cfg.lake.catalog.contains("idle_in_transaction_session_timeout") {
+            warn!("the catalog string sets options; add -c idle_in_transaction_session_timeout so a frozen worker cannot block the lake");
+        }
+        cfg.lake.catalog = crate::lake::bound_idle_transactions(&cfg.lake.catalog, t);
+    }
     let conn = cfg.lake.open()?;
     crate::lake::bootstrap(&conn)?;
     catalog::set_control_inlining(&conn)?;

@@ -33,7 +33,12 @@ impl LakeConfig {
         if let Some(limit) = &self.memory_limit {
             conn.execute_batch(&format!("SET memory_limit = {}", lit(limit)))?;
         }
-        if !self.data_path.contains("://") {
+        if self.data_path.starts_with("s3://") {
+            conn.execute_batch(&s3_secret_sql(&self.data_path, &|k| std::env::var(k).ok())?)
+                .context("setting up S3 access for the data path")?;
+        } else if self.data_path.contains("://") {
+            bail!("data path {}: only local paths and s3:// are supported", self.data_path);
+        } else {
             std::fs::create_dir_all(&self.data_path).with_context(|| format!("creating {}", self.data_path))?;
         }
         conn.execute_batch(&format!(
@@ -47,6 +52,62 @@ impl LakeConfig {
         conn.execute_batch(&format!("USE {LAKE}"))?;
         Ok(conn)
     }
+}
+
+/// Loads httpfs and creates a temporary (never stored) DuckDB secret for the data path's bucket from the
+/// standard AWS variables of this process: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+/// `AWS_SESSION_TOKEN`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT_URL` (or
+/// `AWS_ENDPOINT_URL_S3`) for S3-compatible stores such as MinIO or GCS's S3 API, which also switches to
+/// path-style URLs unless `DUCKWAKE_S3_URL_STYLE` says `vhost`. Without keys, the AWS credential chain
+/// (environment, config files, instance and container roles) through DuckDB's `aws` extension.
+pub fn s3_secret_sql(data_path: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let rest = data_path.trim_start_matches("s3://");
+    let bucket = rest.split('/').next().filter(|b| !b.is_empty()).context("data path s3://BUCKET/... has no bucket")?;
+    let mut opts = vec!["TYPE s3".to_string(), format!("SCOPE {}", lit(&format!("s3://{bucket}")))];
+    let mut sql = String::from("INSTALL httpfs; LOAD httpfs;");
+    match (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY")) {
+        (Some(k), Some(v)) => {
+            opts.push(format!("KEY_ID {}", lit(&k)));
+            opts.push(format!("SECRET {}", lit(&v)));
+            if let Some(t) = env("AWS_SESSION_TOKEN") {
+                opts.push(format!("SESSION_TOKEN {}", lit(&t)));
+            }
+        }
+        (None, None) => {
+            sql.push_str(" INSTALL aws; LOAD aws;");
+            opts.push("PROVIDER credential_chain".into());
+        }
+        _ => bail!("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or neither (to use the AWS credential chain)"),
+    }
+    if let Some(r) = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")) {
+        opts.push(format!("REGION {}", lit(&r)));
+    }
+    if let Some(url) = env("AWS_ENDPOINT_URL_S3").or_else(|| env("AWS_ENDPOINT_URL")) {
+        let (ssl, host) = match url.split_once("://") {
+            Some(("http", h)) => (false, h),
+            Some(("https", h)) => (true, h),
+            Some((s, _)) => bail!("AWS_ENDPOINT_URL {url:?}: scheme {s:?} is not http or https"),
+            None => (true, url.as_str()),
+        };
+        opts.push(format!("ENDPOINT {}", lit(host.trim_end_matches('/'))));
+        opts.push(format!("USE_SSL {ssl}"));
+        let style = env("DUCKWAKE_S3_URL_STYLE").unwrap_or_else(|| "path".into());
+        opts.push(format!("URL_STYLE {}", lit(&style)));
+    }
+    sql.push_str(&format!(" CREATE OR REPLACE TEMPORARY SECRET duckwake_lake ({});", opts.join(", ")));
+    Ok(sql)
+}
+
+/// A PostgreSQL catalog connection whose sessions PostgreSQL ends when they sit idle inside a transaction for
+/// longer than `timeout`. Every DuckLake commit inserts the next snapshot id, so a worker frozen inside its
+/// commit (a paused VM, a stopped process, a half-open connection) holds a lock every other writer waits on;
+/// ending its session rolls the commit back and frees the lake. Unchanged for other catalogs, and when the
+/// string already passes `options` (libpq takes only one).
+pub fn bound_idle_transactions(catalog: &str, timeout: std::time::Duration) -> String {
+    if !catalog.starts_with("postgres:") || catalog.contains("options=") {
+        return catalog.to_string();
+    }
+    format!("{catalog} options='-c idle_in_transaction_session_timeout={}'", timeout.as_millis())
 }
 
 /// Another connection to the instance behind `conn`: it shares the attached lake and the in-memory `memory`
@@ -211,4 +272,35 @@ pub fn table_by_id(conn: &Connection, id: i64) -> Result<Option<(String, String)
 pub fn is_conflict(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
     msg.contains("Transaction conflict") || msg.contains("conflict")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_secret_from_env() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let minio = env(&[("AWS_ACCESS_KEY_ID", "k"), ("AWS_SECRET_ACCESS_KEY", "s"), ("AWS_ENDPOINT_URL", "http://localhost:59000/")]);
+        let sql = s3_secret_sql("s3://duckwake/lake/", &minio).unwrap();
+        assert!(sql.contains("SCOPE 's3://duckwake'"), "{sql}");
+        assert!(sql.contains("ENDPOINT 'localhost:59000', USE_SSL false, URL_STYLE 'path'"), "{sql}");
+        let chain = s3_secret_sql("s3://b", &env(&[("AWS_REGION", "eu-west-1")])).unwrap();
+        assert!(chain.contains("PROVIDER credential_chain") && chain.contains("REGION 'eu-west-1'") && !chain.contains("ENDPOINT"), "{chain}");
+        assert!(s3_secret_sql("s3://b", &env(&[("AWS_ACCESS_KEY_ID", "k")])).is_err());
+        assert!(s3_secret_sql("s3:///x", &env(&[])).is_err());
+    }
+
+    #[test]
+    fn idle_transactions_bounded_on_postgres_only() {
+        let t = std::time::Duration::from_secs(30);
+        assert_eq!(
+            bound_idle_transactions("postgres:dbname=lake host=pg", t),
+            "postgres:dbname=lake host=pg options='-c idle_in_transaction_session_timeout=30000'"
+        );
+        assert_eq!(bound_idle_transactions("postgres:dbname=lake options='-c x=1'", t), "postgres:dbname=lake options='-c x=1'");
+        assert_eq!(bound_idle_transactions("sqlite:lake.db", t), "sqlite:lake.db");
+    }
 }

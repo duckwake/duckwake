@@ -359,13 +359,36 @@ pub fn set_control_inlining(conn: &Connection) -> Result<()> {
     set_inlining(conn, schema, "checkpoints", CHECKPOINT_INLINE_ROWS)
 }
 
+/// Skips the write when this connection already sees the option: several workers starting at once would
+/// otherwise all update the same catalog row, and DuckLake reports the losers' failures as errors that are not
+/// conflicts. The write is idempotent, so a failed one is retried.
 fn set_inlining(conn: &Connection, schema: &str, table: &str, rows: usize) -> Result<()> {
-    conn.execute_batch(&format!(
+    let set: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM ducklake_options({}) WHERE option_name = 'data_inlining_row_limit'
+               AND scope = 'TABLE' AND scope_entry = ? AND value = ?",
+            lit(LAKE)
+        ),
+        [format!("{schema}.{table}"), rows.to_string()],
+        |r| r.get(0),
+    )?;
+    if set > 0 {
+        return Ok(());
+    }
+    let sql = format!(
         "CALL {LAKE}.set_option('data_inlining_row_limit', {rows}, schema => {}, table_name => {})",
         lit(schema),
         lit(table)
-    ))?;
-    Ok(())
+    );
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match conn.execute_batch(&sql) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(100 * attempt)),
+            Err(e) => return Err(e).with_context(|| format!("setting inlining on {schema}.{table}")),
+        }
+    }
 }
 
 fn finish(conn: &Connection, res: Result<()>) -> Result<()> {

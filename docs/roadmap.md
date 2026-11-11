@@ -28,9 +28,12 @@ that must pass before the next starts. The same plan is in the design doc's
       (`scripts/failover_test.sh`). Still to come: rebalancing onto workers that join later.
 - [x] **Kafka SASL and TLS.** SASL PLAIN and SCRAM, TLS with custom CAs and client certificates; passwords
       are `env:` or `file:` references (`scripts/kafka_auth_test.sh`). OAUTHBEARER and Kerberos are not built.
-- [ ] **Object storage.** Data files on S3 or GCS, tested against MinIO. Every test so far used local disk.
-- [ ] **Secrets.** Catalog passwords live in connection strings, env vars and stored definitions; read them from
-      a secret store or file instead. Quack has one shared token and no TLS of its own (use a TLS proxy).
+- [x] **Object storage.** Data files on `s3://` (S3 and S3-compatible stores), credentials from the standard AWS
+      variables or the AWS credential chain; the suites run against MinIO with `LAKE_STORAGE=s3`.
+- [x] **Secrets.** Nothing secret is stored in the lake: Kafka passwords are `env:`/`file:` references, the
+      catalog password comes from `PGPASSWORD` or `.pgpass` (a password in the connection string warns), S3
+      keys from the AWS variables or roles, and the Quack token may be a `file:` reference. Still one shared
+      Quack token and no TLS of its own (use a TLS proxy); no Vault or cloud secret manager integration.
 
 **Gate:** kill a worker and its views move to another within a bounded time, with exact output; the suites
 pass against authenticated Kafka and MinIO.

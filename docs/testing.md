@@ -3,7 +3,7 @@
 ## Results
 
 Run on a MacBook (Apple Silicon, 10 cores) against DuckDB v2.0.0 and DuckLake 1.1, with a PostgreSQL 16
-catalog and Redpanda, all from `docker-compose.yml`.
+catalog, Redpanda and MinIO, all from `docker-compose.yml`.
 
 | Gate in the design | Test | Result |
 | --- | --- | --- |
@@ -11,8 +11,9 @@ catalog and Redpanda, all from `docker-compose.yml`.
 | `kill -9` at any point, no duplicates or gaps | `scripts/crash_test.sh` | 120k events with late and malformed rows. 12–16 crashes: external `kill -9` and aborts injected at poll, transaction begin, mid-transaction, before and after COMMIT, and maintenance. Sinks match a batch recomputation exactly. |
 | Views over views and lake tables (F1) | `scripts/chain_test.sh` | A chain of three views: stateless over Kafka, windowed over its table on `_commit_ts`, windowed again over that table's `window_end`. 40k events, 8 crashes (`kill -9` and aborts at every epoch step); after every crash all three verify, Kafka for the first and time travel for the others, and again after draining (20k lake rows into the second view, 20–40 closed 30 s windows in the third). Passes in order and with all four worker flags (pipelined). Dropping a view another view reads is refused; an update to a lake table that a windowed view reads fails that view while the chain and the worker run on. |
 | Views over tables whose rows change (F2) | `scripts/retract_test.sh` | A generator rewrites `shop.accounts` (400 rows written before the views, about 640 at the end) with inserts, updates, deletes and mixed transactions, some updating rows and then deleting them: 6.8k–7.8k deletes and updates during 8 crashes. Seven views: counted rows with `_commit_ts`, a grouped aggregate with `min`/`max`, `DISTINCT`, counted rows that repeat, an aggregate over those, rows of the grouped aggregate, and a `UNION ALL` of the table and the aggregate (two change feeds). After every crash and after catching up, each view verifies against its batch query at its checkpoint's snapshot. A reset of the grouped aggregate replays it, and its two readers follow through the change feed and verify. A window over a view whose rows change is refused. Passes in order and with all four worker flags (pipelined). |
-| Automatic failover (P2) | `scripts/failover_test.sh` | Three workers spread five views started without a worker, while 120k events stream in. `kill -9` of one: its views move in 11–13 s with a 10 s lease timeout. A frozen worker (SIGSTOP): its views move in 10 s, and when it thaws its in-flight commit is fenced and it lets go. A clean stop: its views move in 3 s. A restarted worker takes views again. All five views verify exactly. Passes in order and with all four worker flags (pipelined). |
+| Automatic failover (P2) | `scripts/failover_test.sh` | Three workers spread five views started without a worker, while 120k events stream in. `kill -9` of one: its views move in 11–13 s with a 10 s lease timeout. A frozen worker (SIGSTOP): its views move in 10–14 s, also when it froze inside its catalog transaction (PostgreSQL ends that session after the lease timeout, so the others' commits go on); thawed, its in-flight commit is fenced and it lets go, or it exits. A clean stop: its views move in 3 s. A restarted worker takes views again. All five views verify exactly. Passes in order and with all four worker flags (pipelined). |
 | Kafka SASL and TLS (P2) | `scripts/kafka_auth_test.sh` | The test views read through the local Redpanda's SCRAM listener in plaintext, its SCRAM listener over TLS (test CA), and its TLS listener that requires a client certificate; 20k events each, drained and verified, with `verify` reading Kafka through the same listener. Refused: a password written into the source (at create time), a wrong password, an unset password variable, and a plaintext client on a SASL listener (each view fails within 10 s with the reason, and the worker runs on). `KAFKA_AUTH=sasl_ssl scripts/crash_test.sh` passes: 12 crashes, every view exact. |
+| Object storage (P2) | `LAKE_STORAGE=s3 scripts/crash_test.sh`, `LAKE_STORAGE=s3 scripts/retract_test.sh` | The lake's data files in a bucket of the local MinIO, with credentials from the AWS variables and the catalog password from `PGPASSWORD`. The crash test (12 crashes, maintenance merging and flushing to the bucket) and the F2 gate (change feeds and time travel read back from the bucket) pass, every view exact. |
 | Zombie worker after failover | `scripts/fencing_test.sh` | w1 commits epochs 1–3, then stalls 15 s with its epoch-4 transaction open. The views move to w2, which continues from epoch 4. w1's commit is rejected. The result verifies exactly. |
 | 5k events/s, p95 latency < 30 s | `scripts/throughput_test.sh` | 600k events of ~1 KB at 5,000/s, 10 s epochs. Per epoch (~50k rows): ~0.45 s poll+stage, ~0.15 s commit. Lag stays ~0. An event is committed at most one epoch interval plus ~0.6 s after it arrives; windowed results also wait for the window to close plus the watermark delay. |
 | Matches batch SQL | `verify` in every script | Multiset equality of each sink with the view run as one batch query over everything committed. Late rows and dead letters are also checked. |
@@ -29,8 +30,8 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to `ma
 (warnings fail it) and the unit tests and builds the binaries and the extension once. Every suite below then
 runs in its own job against the same `docker-compose.yml` stack on Linux: crash then reset, fencing,
 failover, Kafka auth, chain, retract, retention, decode, catch-up (100k events), shared readers, server, extension and composed, and
-crash, failover, chain and retract again with all four worker flags, and crash with its sources over
-SASL_SSL. A failed job uploads the worker logs. `ci-passed`
+crash, failover, chain and retract again with all four worker flags, crash with its sources over
+SASL_SSL and its lake on MinIO, and retract on MinIO. A failed job uploads the worker logs. `ci-passed`
 is green only when every job is. The throughput test, the scale benchmark and the soak only measure, so
 they stay out of CI.
 
@@ -38,7 +39,8 @@ The test scripts reset the lake and the topic themselves:
 `scripts/crash_test.sh`, `scripts/fencing_test.sh`, `scripts/throughput_test.sh`, then `scripts/reset_test.sh`.
 `scripts/chain_test.sh`, `scripts/retract_test.sh`, `scripts/failover_test.sh` and `scripts/kafka_auth_test.sh`
 are standalone. `KAFKA_AUTH=sasl_plaintext|sasl_ssl|mtls` points the sources of any suite built on the
-shared test views at an authenticated listener (producers stay on the open one).
+shared test views at an authenticated listener (producers stay on the open one), and `LAKE_STORAGE=s3` puts
+any suite's data files in the local MinIO. Every suite takes the catalog password from `PGPASSWORD`.
 `scripts/retention_test.sh`, `scripts/decode_test.sh` and `scripts/catchup_test.sh` are standalone.
 `DECODE=sql|arrow|auto` picks the source's decode for every script that uses the `clicks` source
 (default `auto`).

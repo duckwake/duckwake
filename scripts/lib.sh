@@ -9,8 +9,19 @@ PARTITIONS=${PARTITIONS:-3}
 OUT=${OUT:-.lake/run}
 # Tests get their own catalog database and data path, so they never touch the playground's lake.
 TEST_DB=${TEST_DB:-duckwake_test}
-export DUCKWAKE_CATALOG="postgres:dbname=$TEST_DB host=localhost port=55432 user=lake password=lake"
-export DUCKWAKE_DATA_PATH=".lake/test/data/"
+# The catalog password comes from PGPASSWORD (libpq), not the connection string.
+export DUCKWAKE_CATALOG="postgres:dbname=$TEST_DB host=localhost port=55432 user=lake"
+export PGPASSWORD=lake
+# Where the data files go: unset for local disk, or s3 for the bucket in the local MinIO, with the
+# credentials in the standard AWS variables.
+LAKE_STORAGE=${LAKE_STORAGE:-}
+case $LAKE_STORAGE in
+  "") export DUCKWAKE_DATA_PATH=".lake/test/data/" ;;
+  s3)
+    export DUCKWAKE_DATA_PATH="s3://duckwake/test/" AWS_ACCESS_KEY_ID=duckwake AWS_SECRET_ACCESS_KEY=duckwake-dev \
+      AWS_ENDPOINT_URL=http://localhost:59000 AWS_REGION=us-east-1 ;;
+  *) echo "LAKE_STORAGE must be s3 or unset"; exit 1 ;;
+esac
 VIEWS=(clicks_per_window big_spend game_totals active_users all_events)
 # How the source decodes JSON: auto (Arrow where the column types allow), arrow or sql.
 export DECODE=${DECODE:-auto}
@@ -46,6 +57,7 @@ reset_lake() {
   docker compose exec -T -e PGOPTIONS='-c client_min_messages=warning' postgres psql -q -U lake -d lake \
     -c "DROP DATABASE IF EXISTS $TEST_DB" -c "CREATE DATABASE $TEST_DB" >/dev/null
   rm -rf .lake/test
+  [[ $LAKE_STORAGE != s3 ]] || docker compose exec -T minio mc rm -r --force local/duckwake/test >/dev/null 2>&1 || true
   "$BIN" init >/dev/null
 }
 
@@ -58,23 +70,23 @@ setup_views() {
   "$BIN" create-view analytics.clicks_per_window --late-data lake.analytics.clicks_late \
     --epoch-interval "$epoch" \
     --sql "SELECT window_start, game_id, count(*) AS n, sum(amount) AS revenue, max(amount) AS max_amount
-           FROM TUMBLE(clicks, ts, INTERVAL $window) GROUP BY ALL" | head -1
+           FROM TUMBLE(clicks, ts, INTERVAL $window) GROUP BY ALL" | sed -n 1p
   "$BIN" create-view analytics.big_spend --epoch-interval "$epoch" \
-    --sql "SELECT ts, game_id, user_id, amount FROM clicks WHERE amount >= 90" | head -1
+    --sql "SELECT ts, game_id, user_id, amount FROM clicks WHERE amount >= 90" | sed -n 1p
   # Global aggregate with HAVING over a changing average: groups enter and leave the upsert sink.
   "$BIN" create-view analytics.game_totals --epoch-interval "$epoch" \
     --sql "SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
-           FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5" | head -1
+           FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5" | sed -n 1p
   # UNION ALL of two sources: big clicks and every purchase.
   "$BIN" create-source purchases --options "{$KAFKA,\"topic\":\"$TOPIC2\",\"event_time\":\"ts\",
     \"watermark_delay\":\"$delay\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
     \"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}" >/dev/null
   "$BIN" create-view analytics.all_events --epoch-interval "$epoch" \
     --sql "SELECT ts, game_id, user_id, amount, 'click' AS kind FROM clicks WHERE amount >= 80
-           UNION ALL SELECT ts, game_id, user_id, amount, 'purchase' FROM purchases" | head -1
+           UNION ALL SELECT ts, game_id, user_id, amount, 'purchase' FROM purchases" | sed -n 1p
   # DISTINCT: each pair once, the first time it is seen.
   "$BIN" create-view analytics.active_users --epoch-interval "$epoch" \
-    --sql "SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50" | head -1
+    --sql "SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50" | sed -n 1p
 }
 
 start_views() {
