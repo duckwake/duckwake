@@ -42,7 +42,12 @@ log "produce $((RATE * DURATION)) events at $RATE/s"
 produce --rate "$RATE" --count $((RATE * DURATION)) \
   --late-every 997 --bad-every 1499 --eos >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
-sleep 10
+# big_spend is rewound to epoch 1 below, so it must have committed past it (a slow runner needs more than 10 s).
+for _ in $(seq 1 60); do
+  e=$(remote --csv "SELECT coalesce(max(epoch), 0) FROM duckwake_checkpoints('big_spend', n := 1)" 2>/dev/null || echo 0)
+  (( ${e:-0} >= 3 )) && break
+  sleep 1
+done
 remote "SELECT job_id, status, worker, epoch, freshness_s, lag FROM duckwake_jobs()"
 
 log "pause, rewind and resume big_spend while events stream in"
