@@ -964,10 +964,24 @@ fn stage_source(
 
 /// Stages the changes of a job's `k`-th input, a lake input, in snapshots `(from, to]`: rows in the layout of a
 /// Kafka group's typed table (`_partition` the snapshot, `_offset` the rowid), with `_commit_ts` the running
-/// maximum of `snapshot_time` from `carried` on. Reads the lake and writes only the memory catalog. Until
-/// retracting inputs (F2), every input must be insert-only: an update or delete stops the view. Returns the
-/// staged input and `_commit_ts` at `to`.
-fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i64, to: i64, carried: Option<i64>) -> Result<(SourceStaged, Option<i64>)> {
+/// maximum of `snapshot_time` from `carried` on, and the weight `__w` of each change. Reads the lake and writes
+/// only the memory catalog. Returns the staged input and `_commit_ts` at `to`.
+///
+/// The view holds the rows written after `start`, the snapshot it was created at. An input that retracts
+/// stages a delete or an update's old version with the `_commit_ts` of the version it removes, so it cancels
+/// the row the view took in, and drops it when that version is from before `start`: the view never had it.
+/// An insert-only input must stay so: an update or delete stops the view.
+#[allow(clippy::too_many_arguments)]
+fn stage_lake(
+    conn: &Connection,
+    job: &str,
+    k: usize,
+    lake: &LakeInput,
+    start: i64,
+    from: i64,
+    to: i64,
+    carried: Option<i64>,
+) -> Result<(SourceStaged, Option<i64>)> {
     let t = Instant::now();
     let typed = lake_typed(job, k);
     let cols: Vec<&(String, String)> = lake.columns.iter().filter(|(c, _)| c != COMMIT_TS).collect();
@@ -986,7 +1000,7 @@ fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i6
     };
     if to <= from {
         conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {typed} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _change VARCHAR, {}, _err VARCHAR)",
+            "CREATE OR REPLACE TABLE {typed} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _change VARCHAR, {}, _err VARCHAR, __w INTEGER)",
             defs.join(", ")
         ))?;
         return Ok((staged(0), carried));
@@ -996,6 +1010,8 @@ fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i6
         .ok_or_else(|| StopJob(format!("{} (DuckLake table id {}) was dropped", lake.table, lake.table_id)))?;
     let carried_sql = carried.map(|us| format!("make_timestamp({us})")).unwrap_or("NULL".into());
     let select: Vec<String> = cols.iter().map(|(c, ty)| format!("CAST(c.{} AS {ty}) AS {}", ident(c), ident(c))).collect();
+    // A counted view's table holds each row once with its multiplicity.
+    let rows = if lake.counted { format!("c.{}", ident(crate::circuit::ops::COUNT_COLUMN)) } else { "1".into() };
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TABLE {typed} AS
            WITH snaps AS (
@@ -1003,7 +1019,8 @@ fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i6
              FROM ducklake_snapshots({lake_lit}) WHERE snapshot_id > {from} AND snapshot_id <= {to})
            SELECT c.snapshot_id::INTEGER AS _partition, c.rowid::BIGINT AS _offset, NULL::VARCHAR AS payload,
                   c.change_type AS _change, {select}, greatest(s.ts, coalesce({carried_sql}, s.ts)) AS {commit_ts},
-                  NULL::VARCHAR AS _err
+                  NULL::VARCHAR AS _err,
+                  (CASE WHEN c.change_type IN ('insert', 'update_postimage') THEN 1 ELSE -1 END * {rows})::INTEGER AS __w
            FROM ducklake_table_changes({lake_lit}, {schema_lit}, {table_lit}, {next}, {to}) c JOIN snaps s USING (snapshot_id)",
         lake_lit = lit(LAKE),
         schema_lit = lit(&schema),
@@ -1013,20 +1030,25 @@ fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i6
         commit_ts = ident(COMMIT_TS),
     ))
     .with_context(|| format!("reading the changes of {} in snapshots ({from}, {to}]", lake.table))?;
-    let (rows_in, retracted, at): (i64, i64, Option<i64>) = conn.query_row(
-        &format!("SELECT count(*), count(*) FILTER (WHERE _change <> 'insert'), min(_partition) FILTER (WHERE _change <> 'insert') FROM {typed}"),
+    let (retracted, at): (i64, Option<i64>) = conn.query_row(
+        &format!("SELECT count(*), min(_partition) FROM {typed} WHERE _change NOT IN ('insert', 'update_postimage')"),
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if retracted > 0 {
+    if retracted > 0 && !lake.retracts {
         return Err(StopJob(format!(
-            "view {job} needs {} to be insert-only, but snapshot {} updated or deleted rows of it ({retracted} changes; \
-             views over tables whose rows change come with retracting inputs, F2)",
+            "view {job} needs {} to be insert-only, but snapshot {} updated or deleted rows of it ({retracted} {}): \
+             a windowed view reads lake tables insert-only, since a window is final once the watermark passes it",
             lake.name,
-            at.unwrap_or(0)
+            at.unwrap_or(0),
+            if retracted == 1 { "change" } else { "changes" }
         ))
         .into());
     }
+    if retracted > 0 {
+        retraction_versions(conn, job, &typed, lake, &schema, &table, start, from, to)?;
+    }
+    let rows_in: i64 = conn.query_row(&format!("SELECT count(*) FROM {typed}"), [], |r| r.get(0))?;
     let newest: Option<i64> = conn.query_row(
         &format!(
             "SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id > {from} AND snapshot_id <= {to}",
@@ -1040,6 +1062,70 @@ fn stage_lake(conn: &Connection, job: &str, k: usize, lake: &LakeInput, from: i6
         (a, b) => a.or(b),
     };
     Ok((staged(rows_in as usize), commit_us))
+}
+
+/// Gives each retraction staged in `typed` (a delete, or an update's old version) the version it removes:
+/// the newest earlier write of its row in the range, or else its version at `from`, the snapshot read up to
+/// (row ids stay with a row through updates and are never reused). A retraction of a version written at or
+/// before `start` is dropped; any other gets that version's `_commit_ts`, the running maximum of
+/// `snapshot_time` up to the snapshot that wrote it.
+#[allow(clippy::too_many_arguments)]
+fn retraction_versions(
+    conn: &Connection,
+    job: &str,
+    typed: &str,
+    lake: &LakeInput,
+    schema: &str,
+    table: &str,
+    start: i64,
+    from: i64,
+    to: i64,
+) -> Result<()> {
+    let versions = mem("typed", &format!("v{job}"));
+    let tbl = quote_table(&format!("{LAKE}.{schema}.{table}"))?;
+    // Within a snapshot an update's old version comes before its new one.
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE {versions} AS
+           SELECT _partition, _offset, _change, written FROM (
+             SELECT _partition, _offset, _change,
+                    max(CASE WHEN _change IN ('insert', 'update_postimage') THEN _partition END) OVER (
+                      PARTITION BY _offset ORDER BY _partition, _change IN ('insert', 'update_postimage')
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS written
+             FROM {typed})
+           WHERE _change NOT IN ('insert', 'update_postimage')"
+    ))?;
+    let (lo, hi): (Option<i64>, Option<i64>) =
+        conn.query_row(&format!("SELECT min(_offset), max(_offset) FROM {versions} WHERE written IS NULL"), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if let (Some(lo), Some(hi)) = (lo, hi) {
+        conn.execute_batch(&format!(
+            "UPDATE {versions} v SET written = p.snapshot_id
+             FROM (SELECT rowid, snapshot_id FROM {tbl} AT (VERSION => {from})
+                   WHERE rowid BETWEEN {lo} AND {hi} AND rowid IN (SELECT _offset FROM {versions} WHERE written IS NULL)) p
+             WHERE v._offset = p.rowid AND v.written IS NULL"
+        ))
+        .with_context(|| format!("reading the versions {} had at snapshot {from}", lake.table))?;
+    }
+    let lost: i64 = conn.query_row(&format!("SELECT count(*) FROM {versions} WHERE written IS NULL"), [], |r| r.get(0))?;
+    if lost > 0 {
+        return Err(StopJob(format!(
+            "view {job}: {lost} rows {} deleted or updated in snapshots ({from}, {to}] are neither in that range nor at snapshot {from}",
+            lake.table
+        ))
+        .into());
+    }
+    let key = "t._partition = v._partition AND t._offset = v._offset AND t._change = v._change";
+    conn.execute_batch(&format!(
+        "DELETE FROM {typed} t USING {versions} v WHERE {key} AND v.written <= {start};
+         UPDATE {typed} t SET {ct} = s.ts
+         FROM {versions} v JOIN (
+           SELECT snapshot_id, max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id) AS ts
+           FROM ducklake_snapshots({lake_lit}) WHERE snapshot_id <= {to}) s ON s.snapshot_id = v.written
+         WHERE {key} AND v.written > {start};
+         DROP TABLE {versions};",
+        ct = ident(COMMIT_TS),
+        lake_lit = lit(LAKE),
+    ))?;
+    Ok(())
 }
 
 /// The watermark of view `job` as of snapshot `at`: the one its newest checkpoint up to then recorded.
@@ -1068,7 +1154,8 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
         let to = current.min(from + MAX_SNAPSHOTS).max(from);
         for (k, input) in j.inputs.iter().enumerate() {
             if let Feed::Lake { lake, commit_us } = &input.feed {
-                let (s, commit) = stage_lake(conn, id, k, lake, input.offsets[&0], to, *commit_us)?;
+                let start = def.start_snapshot.context("lake input without a start snapshot")?;
+                let (s, commit) = stage_lake(conn, id, k, lake, start, input.offsets[&0], to, *commit_us)?;
                 lakes[k] = Some((s, commit, current - to));
             }
         }

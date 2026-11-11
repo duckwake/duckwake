@@ -181,6 +181,30 @@ operator's semantics and a test oracle, not a dependency.
      every time it moved would keep a worker writing an empty snapshot every epoch forever, so a view with
      lake inputs commits only for new rows or a window that closes. When the whole lake is idle no snapshot
      comes, the watermark stands, and the last window stays open, as for an idle Kafka partition.
+11. **Lake inputs that retract (F2)** weigh each change: `insert` and `update_postimage` +1, `delete` and
+   `update_preimage` -1, times `_duckwake_count` for a counted view's table. To cancel the row the view took
+   in, a retraction must carry that version's `_commit_ts`, not the time of the delete. DuckLake makes the
+   version easy to find:
+   - A row keeps its `rowid` through updates, and row ids are never reused; the `snapshot_id` column of a
+     row is the snapshot that wrote its current version (probed on inlined and Parquet data, and after
+     `ducklake_merge_adjacent_files`).
+   - Within one snapshot, a row changes at most once: an update's old and new versions, or one delete, or
+     one insert. A transaction that updates then deletes a row shows a single delete of the version before
+     it; an insert then update, a single insert of the final version.
+   - So a retraction's version is the newest earlier write of its `rowid` in the epoch's range, or else its
+     version at P, the snapshot read up to: `t AT (VERSION => P) WHERE rowid BETWEEN lo AND hi AND rowid IN
+     (...)`, which DuckLake prunes by row-id range. Its `_commit_ts` is the running maximum of
+     `snapshot_time` up to that version's snapshot, as when the row was staged.
+   - A view holds the rows written after it was created (snapshot S0), which is also what `verify` compares
+     against (`snapshot_id > S0` at P). A retraction of a version written at or before S0 is dropped: the
+     view never had that row. An update of such a row adds its new version.
+   - A window is final once the watermark passes it, and a lake input's watermark is exact, so the delete
+     of an old row always arrives after its window closed. A windowed view therefore reads lake tables
+     insert-only (checked every epoch; an update or delete stops it), and refuses a view's table whose rows
+     change. A view that groups by `time_bucket(...)` of a column instead keeps every bucket up to date.
+   - `reset` of a view restores an upsert or counted table with time travel (delete all, insert the old
+     version), which its retracting readers see as ordinary deletes and inserts: they follow the reset
+     through the change feed. A windowed reader of an append-only view stops instead (F3 cascades reset).
 
 ## Simplifications and gaps
 
@@ -199,20 +223,24 @@ operator's semantics and a test oracle, not a dependency.
   row is written the first time its count turns positive. `HAVING` in windowed views, `DISTINCT` over
   windows and aggregates, `DISTINCT ON`, `count(DISTINCT ...)`, `approx_count_distinct` and stream-stream
   joins are rejected at create time. Every operator handles retracting input (see Retractions above) except
-  `MIN`/`MAX` in windows and late-data tables; no source kind retracts yet.
+  `MIN`/`MAX` in windows and late-data tables. Lake tables, and views whose tables change, are the
+  retracting inputs; Kafka sources only insert (no CDC yet).
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
-- **Lake inputs (F1).** A view reads a lake table, or another view's table, through its change feed when no
-  Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. Inputs must be insert-only
-  until retracting inputs (F2): an update or delete stops the view (status `failed`), and a view over an
-  aggregate's or `DISTINCT`'s table is refused at create time. A view reads the changes after the snapshot
-  current when it was created (`start: latest`); backfill of existing rows (`earliest`) is F3. Retention does
-  not yet keep the oldest position (P_min, F3): maintenance can expire snapshots a paused view still needs.
-  `reset` does not cascade to the views that read the reset view (F3). Windows over a lake input use
-  `_commit_ts`, or a windowed view's `window_start`/`window_end`; windows on another column of a lake input
-  are not supported yet. Joins of two lake inputs, and fused chains on one worker (one hop per epoch now),
-  come later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`,
-  so it compares with Kafka event times.
+- **Lake inputs (F1, F2).** A view reads a lake table, or another view's table, through its change feed when
+  no Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. A view without windows
+  takes the input's updates and deletes as retractions (finding 11): a stateless view's table counts each
+  row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view reads lake tables insert-only
+  (an update or delete stops it, status `failed`) and refuses a view's table whose rows change. A view reads
+  the changes after the snapshot current when it was created (`start: latest`) and holds the rows written
+  after it; backfill of existing rows (`earliest`) is F3. Retention does not yet keep the oldest position
+  (P_min, F3): maintenance can expire snapshots a paused view still needs. `reset` reaches retracting
+  readers through the change feed, but not windowed ones (F3). Windows over a lake input use `_commit_ts`,
+  or a windowed view's `window_start`/`window_end`; windows on another column of a lake input are not
+  supported yet. Joins of two lake inputs, and fused chains on one worker (one hop per epoch now), come
+  later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`, so it
+  compares with Kafka event times. A view reading a lake table polls its change feed every epoch even when
+  the table is idle; views on one table should share that read (F4).
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark
   holds at the checkpointed value until every active partition reports again.
 
@@ -227,5 +255,5 @@ crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and exte
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
-scripts/         crash, chain, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
+scripts/         crash, chain, retract, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

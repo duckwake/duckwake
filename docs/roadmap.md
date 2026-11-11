@@ -65,9 +65,10 @@ default.
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
 - `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
   stream–stream joins
-- DuckLake tables and other views as sources: views over insert-only tables and append-only views are done
-  (F1, `scripts/chain_test.sh`); tables whose rows change (F2), backfill and retention (F3), and shared and
-  fused reads (F4) remain. Every operator but windowed `MIN`/`MAX` already takes retracting input.
+- DuckLake tables and other views as sources: views over views and insert-only tables (F1,
+  `scripts/chain_test.sh`) and over tables whose rows change (F2, `scripts/retract_test.sh`) are done;
+  backfill, retention and reset cascade (F3), and shared and fused reads (F4) remain. Windows over tables
+  whose rows change need windows that stay open for `lateness` (C4).
 - **Partition-overwrite refresh**, right after F2's weights, for lake tables whose recent partitions are
   rerun to correct data (for example, the last 3 days rewritten with delete + insert or `INSERT OVERWRITE`).
   A view whose table is partitioned like its input (its output carries the input's partition column, such as

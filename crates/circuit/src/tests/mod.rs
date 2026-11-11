@@ -39,12 +39,14 @@ impl SourceSchema for TestSource {
 
 /// A connection with the lookup table the tests join, and three sources: `clicks`, `purchases` with a
 /// `price` where `clicks` has an `amount`, and `changes`, shaped like `clicks` but deleting and updating rows.
-/// Two lake inputs too: the lake table `shop.orders`, and `per_min`, a windowed view's table.
+/// Lake inputs too: the lake table `shop.orders`, `shop.accounts` shaped like it but read with its updates and
+/// deletes, and `per_min`, a windowed view's table.
 pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE games (game_id VARCHAR, studio VARCHAR);
-         CREATE SCHEMA shop; CREATE TABLE shop.orders (id INTEGER, game_id VARCHAR, amount DOUBLE);",
+         CREATE SCHEMA shop; CREATE TABLE shop.orders (id INTEGER, game_id VARCHAR, amount DOUBLE);
+         CREATE TABLE shop.accounts AS FROM shop.orders;",
     )
     .unwrap();
     let cols = |cs: &[(&str, &str)]| cs.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect::<Vec<_>>();
@@ -58,6 +60,8 @@ pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
         append_only: true,
         lake: Some(vec!["_commit_ts".into()]),
     };
+    // The same table as read by a view that takes its updates and deletes.
+    let accounts = TestSource { columns: orders.columns.clone(), append_only: false, lake: orders.lake.clone() };
     let per_min = TestSource {
         columns: cols(&[
             ("window_start", "TIMESTAMP"),
@@ -76,6 +80,7 @@ pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
             ("purchases".to_string(), source("price", true)),
             ("changes".to_string(), source("amount", false)),
             ("shop.orders".to_string(), orders),
+            ("shop.accounts".to_string(), accounts),
             ("per_min".to_string(), per_min),
         ]),
     )

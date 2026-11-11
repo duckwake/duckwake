@@ -8,10 +8,14 @@ A view's `FROM` names a Kafka source, or reads a lake table or another view's ta
 change feed: `SELECT game, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game` needs no source. A lake
 table joined to a Kafka source is a lookup instead, read as it is when each event is processed;
 `duckwake_explain` shows `ChangeFeed(...)` or `Lookup(...)` for each. Every lake input gets a `_commit_ts`
-column, the commit time of the change. Windows over a lake input use `_commit_ts`, or a windowed view's
-`window_start` or `window_end`, and get an exact watermark. Until retracting inputs come, a view reads only
-tables whose rows are inserted, never updated or deleted: an update or delete stops it. A view reads the
-changes after it was created, and dropping a view that another view reads is refused.
+column, the commit time of the row's version. A view takes the table's updates and deletes: it removes the
+rows it no longer holds, so a filter's table counts each row in `_duckwake_count`, and `DISTINCT` and
+`GROUP BY` views keep their rows up to date. Windows over a lake input use `_commit_ts`, or a windowed view's
+`window_start` or `window_end`, and get an exact watermark; a window is final once it closes, so a windowed
+view needs its lake tables insert-only (an update or delete stops it) and cannot read a view whose rows
+change. To keep time buckets current instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`. A view
+reads the changes after it was created and holds the rows written since; dropping a view that another view
+reads is refused.
 
 | Function | Does |
 | --- | --- |

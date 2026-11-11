@@ -46,12 +46,23 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
         },
     )?;
     let kind = match def.plan.kind_name() {
-        "windowed" => "windowed aggregate, append sink",
-        "aggregate" => "global aggregate, upsert sink",
-        "distinct" => "distinct, append sink",
-        _ => "stateless, append sink",
+        "windowed" => "windowed aggregate",
+        "aggregate" => "global aggregate",
+        k => k,
     };
-    let msg = format!("view {}: {kind}, table {}", def.job_id, def.sink);
+    let circuit = crate::circuit::Circuit::compile(&def.view())?;
+    let sink = if circuit.counts_rows() {
+        "counted sink"
+    } else if circuit.upserts() {
+        "upsert sink"
+    } else {
+        "append sink"
+    };
+    // A lake table a windowed view reads must stay insert-only: say so up front.
+    let insert_only: Vec<&str> = def.lake_inputs.iter().filter(|l| !l.retracts && l.view.is_none()).map(|l| l.name.as_str()).collect();
+    let insert_only =
+        if insert_only.is_empty() { String::new() } else { format!(" ({} must stay insert-only)", insert_only.join(", ")) };
+    let msg = format!("view {}: {kind}, {sink}{insert_only}, table {}", def.job_id, def.sink);
     Ok((def, msg))
 }
 

@@ -40,6 +40,35 @@ pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String
     plan::compile(conn, job, sql, &inputs)
 }
 
+/// Compiles a new view and settles how it reads each lake input it streams. A window is final once the
+/// watermark passes it, so a later change to one of its rows could not be applied: a windowed view reads lake
+/// tables insert-only (an update or delete then stops it), and refuses a view's table whose rows change.
+/// Every other view takes updates and deletes as retractions.
+fn compile_new(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &mut [LakeInput]) -> Result<plan::Plan> {
+    // The view's shape first, every input insert-only: over retracting ones some windowed aggregates are refused.
+    let inserts: Vec<LakeInput> = lakes.iter().map(|l| LakeInput { retracts: false, ..l.clone() }).collect();
+    let plan = compile(conn, job, sql, sources, &inserts)?;
+    let streams = plan.sources();
+    let retracting = |l: &LakeInput| l.retracts && streams.contains(&l.name);
+    if plan.is_windowed() {
+        if let Some(l) = lakes.iter().find(|l| retracting(l) && l.view.is_some()) {
+            bail!(
+                "{} is the table of view {}, whose rows are replaced or removed as they change; windows over it are \
+                 not supported yet (a window is final once the watermark passes it). Group by a time_bucket of a \
+                 column instead: the view then keeps every bucket up to date",
+                l.name,
+                l.view.as_deref().unwrap_or_default()
+            );
+        }
+        lakes.iter_mut().for_each(|l| l.retracts = false);
+        return Ok(plan);
+    }
+    if !lakes.iter().any(retracting) {
+        return Ok(plan);
+    }
+    compile(conn, job, sql, sources, lakes)
+}
+
 /// The columns of a view input named `name`: a Kafka source's or a lake input's.
 pub fn input_columns<'a>(name: &str, sources: &'a HashMap<String, SourceDef>, lakes: &'a [LakeInput]) -> Result<&'a [(String, String)]> {
     if let Some(s) = sources.get(name) {
@@ -72,6 +101,8 @@ fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMa
             let windowed = def.plan.window.as_ref().filter(|_| {
                 ["window_start", "window_end"].iter().all(|w| def.plan.sink_columns.iter().any(|(c, _)| c == w))
             });
+            // An append-only view's table only ever gains rows; any other has rows replaced or removed.
+            let retracts = def.plan.sink_mode() != plan::SinkMode::Append || def.plan.retracts();
             out.push(LakeInput {
                 name,
                 table: def.sink.clone(),
@@ -79,6 +110,8 @@ fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMa
                 columns: def.plan.sink_columns.iter().cloned().chain([(COMMIT_TS.to_string(), "TIMESTAMP".to_string())]).collect(),
                 view: Some(up),
                 window_size_us: windowed.map(|w| w.size_us),
+                retracts,
+                counted: crate::circuit::Circuit::compile(&def.view())?.counts_rows(),
             });
             continue;
         }
@@ -99,7 +132,8 @@ fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMa
             bail!("{name} has a column named {COMMIT_TS}, which DuckWake adds to every lake input");
         }
         columns.push((COMMIT_TS.to_string(), "TIMESTAMP".to_string()));
-        out.push(LakeInput { name, table: qualified, table_id, columns, view: None, window_size_us: None });
+        // Any lake table may have rows updated or deleted; `create_view` holds a windowed view to insert-only.
+        out.push(LakeInput { name, table: qualified, table_id, columns, view: None, window_size_us: None, retracts: true, counted: false });
     }
     Ok(out)
 }
@@ -218,28 +252,13 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
     }
     let sources = load_sources(conn)?;
     let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
-    let plan = compile(conn, v.job_id, v.sql, &sources, &lake_inputs)?;
+    let plan = compile_new(conn, v.job_id, v.sql, &sources, &mut lake_inputs)?;
     if v.late_data.is_some() && !plan.is_windowed() {
         bail!("only windowed views have late data; drop --late-data for a {} view", plan.kind_name());
     }
     // Tables the view joins to a Kafka source are lookups, read whole every epoch; only the streams are inputs.
     let streams = plan.sources();
     lake_inputs.retain(|l| streams.contains(&l.name));
-    for l in &lake_inputs {
-        // Until retracting inputs (F2), a view reads only tables whose rows are never updated or deleted:
-        // another view's append-only table, or a lake table checked to be insert-only every epoch.
-        if let Some(up) = &l.view {
-            let (up_def, _) = load_job(conn, up)?;
-            if up_def.plan.sink_mode() != plan::SinkMode::Append || up_def.plan.retracts() {
-                bail!(
-                    "{} is the table of the {} view {up}, whose rows are replaced or removed as they change; \
-                     views over such tables come with retracting inputs (F2)",
-                    l.name,
-                    up_def.plan.kind_name()
-                );
-            }
-        }
-    }
     let start_snapshot = (!lake_inputs.is_empty()).then(|| crate::lake::current_snapshot(conn)).transpose()?;
     let src_columns = input_columns(&plan.source, &sources, &lake_inputs)?.to_vec();
     let def = JobDef {

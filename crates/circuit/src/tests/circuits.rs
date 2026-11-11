@@ -120,6 +120,23 @@ fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
     let p = compile("SELECT window_start, game_id, sum(n) AS n FROM TUMBLE(per_min, window_end, INTERVAL 1 HOUR) GROUP BY ALL").unwrap();
     assert_eq!(p.query.columns.iter().filter(|c| c.as_str() == "window_start").count(), 1);
 
+    // A lake table read with its updates and deletes retracts: keyless rows are counted, the rest upserted.
+    let last_op = |sql: &str| ops(&Circuit::compile(&crate::View { id: "v", sink: super::SINK, late_data: None, plan: &compile(sql).unwrap() }).unwrap()).pop().unwrap();
+    let p = compile("SELECT id, amount, _commit_ts FROM shop.accounts WHERE amount > 5").unwrap();
+    assert_eq!(p.retracting, ["shop.accounts"]);
+    assert_eq!(first_op(&p), "ChangeFeed(shop.accounts)");
+    assert_eq!(last_op("SELECT id, amount FROM shop.accounts"), "Sink(counted rows)");
+    assert_eq!(last_op("SELECT DISTINCT game_id FROM shop.accounts"), "Sink(upsert)");
+    let p = compile("SELECT game_id, count(*) AS n, min(amount) AS lo FROM shop.accounts GROUP BY game_id").unwrap();
+    assert!(p.global.as_ref().unwrap().counted_values);
+    // UNION ALL over a lake table and a view's table: two change feeds in one view, counted.
+    let p = compile("SELECT game_id, amount FROM shop.accounts WHERE amount > 90 UNION ALL SELECT game_id, n FROM per_min").unwrap();
+    assert_eq!(p.change_feeds, ["shop.accounts", "per_min"]);
+    assert_eq!(p.retracting, ["shop.accounts"]);
+    // Time buckets kept up to date: a group per bucket of the commit time, which retractions also carry.
+    let p = compile("SELECT time_bucket(INTERVAL 1 HOUR, _commit_ts) AS hour, count(*) AS n FROM shop.accounts GROUP BY ALL").unwrap();
+    assert_eq!(p.global.as_ref().unwrap().sink_keys, ["hour"]);
+
     // A join of two lake inputs is not supported yet.
     let err = compile("SELECT o.id FROM shop.orders o JOIN per_min m ON m.game_id = o.game_id").unwrap_err();
     assert!(err.to_string().contains("joins of two"), "{err}");

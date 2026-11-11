@@ -141,6 +141,15 @@ pub struct LakeInput {
     /// A windowed view's table: its window size. Windows over its `window_start` or `window_end` then get
     /// an exact watermark from the view's own.
     pub window_size_us: Option<i64>,
+    /// Whether the view takes its updates and deletes: each change then carries a weight `__w` (inserts and
+    /// new versions +1, deletes and old versions -1) and the view retracts what it no longer holds.
+    /// Otherwise the view needs it insert-only, and an update or delete stops the view.
+    #[serde(default)]
+    pub retracts: bool,
+    /// A view's table that keeps each row once with its multiplicity in `_duckwake_count`: a change of such
+    /// a row weighs that many rows.
+    #[serde(default)]
+    pub counted: bool,
 }
 
 impl LakeInput {
@@ -160,6 +169,9 @@ impl crate::circuit::SourceSchema for LakeInput {
     }
     fn columns(&self) -> &[(String, String)] {
         &self.columns
+    }
+    fn append_only(&self) -> bool {
+        !self.retracts
     }
     fn is_lake(&self) -> bool {
         true
@@ -187,6 +199,12 @@ impl crate::circuit::SourceSchema for Input<'_> {
         match self {
             Input::Kafka(s) => s.columns(),
             Input::Lake(l) => l.columns(),
+        }
+    }
+    fn append_only(&self) -> bool {
+        match self {
+            Input::Kafka(s) => s.append_only(),
+            Input::Lake(l) => l.append_only(),
         }
     }
     fn is_lake(&self) -> bool {

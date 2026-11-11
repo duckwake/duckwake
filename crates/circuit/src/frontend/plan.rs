@@ -162,7 +162,7 @@ pub struct AggSpec {
 /// 3. post (stateless): HAVING and the select list over finalized values `__g<j>`, `__a<i>`.
 ///
 /// count, sum and avg are invertible (sums of weights). min and max are only mergeable, which is
-/// correct while sources are append-only; retracting inputs will need value counts (milestone 3).
+/// correct while sources are append-only; over a retracting input they keep value counts (`counted_values`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalPlan {
     pub keys: usize,

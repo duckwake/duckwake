@@ -12,7 +12,8 @@
 //!
 //! A lake input (a lake table or another view's table, read through its change feed) needs no retention:
 //! its batch input is the table as of the snapshot in the latest checkpoint (`AT (VERSION => P)`), the rows
-//! written after the view was created, with `_commit_ts` computed as the job computes it.
+//! written after the view was created, with `_commit_ts` computed as the job computes it. Rows updated or
+//! deleted since are simply not there, which is what the view's retractions must have done to its table.
 use crate::catalog::{self, state_table};
 use crate::model::{LakeInput, SourceDef, COMMIT_TS};
 use crate::kafka;
@@ -119,11 +120,15 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     };
     let sink_cols: Vec<String> = plan.sink_columns.iter().map(|(c, _)| ident(c)).collect();
     let sink_cols = sink_cols.join(", ");
+    // A counted table holds each row once with its multiplicity: as a multiset, that many rows.
+    let mut sink = quote_table(&def.sink)?;
+    if crate::circuit::Circuit::compile(&def.view())?.counts_rows() {
+        sink = format!("{sink}, range({})", ident(crate::circuit::ops::COUNT_COLUMN));
+    }
     conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE memory.main.v_sink AS SELECT {sink_cols} FROM {} WHERE {sink_filter};
+        "CREATE OR REPLACE TABLE memory.main.v_sink AS SELECT {sink_cols} FROM {sink} WHERE {sink_filter};
          CREATE OR REPLACE TABLE memory.main.v_dead AS SELECT source, source_partition AS _partition, source_offset AS _offset
-           FROM {CTL}.dead_letter WHERE job_id = '{job}';",
-        quote_table(&def.sink)?
+           FROM {CTL}.dead_letter WHERE job_id = '{job}';"
     ))?;
     if let Some(late) = &def.late_data {
         conn.execute_batch(&format!(
@@ -174,12 +179,13 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
                      FROM ducklake_snapshots({lake}) WHERE snapshot_id <= {p})
                    SELECT t.snapshot_id::INTEGER AS _partition, t.rowid::BIGINT AS _offset, {select}, s.ts AS {ct},
                           NULL::VARCHAR AS _err
-                   FROM {tbl} AS t AT (VERSION => {p}) JOIN snaps s USING (snapshot_id)
+                   FROM {tbl} AS t AT (VERSION => {p}) JOIN snaps s USING (snapshot_id){rows}
                    WHERE t.snapshot_id > {s0}",
                 lake = lit(crate::lake::LAKE),
                 select = select.join(", "),
                 ct = ident(COMMIT_TS),
                 tbl = quote_table(&format!("{}.{schema}.{table}", crate::lake::LAKE))?,
+                rows = if l.counted { format!(", range(t.{})", ident(crate::circuit::ops::COUNT_COLUMN)) } else { String::new() },
             ))?;
             lake_rows += count(conn, &format!("SELECT * FROM memory.main.v_typed_{k}"))?;
             continue;
@@ -240,7 +246,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
                  AND NOT EXISTS (SELECT 1 FROM memory.main.v_late l
                                  WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start)",
             input = plan.input_table,
-            w = plan.window_sql(&valid)
+            w = plan.window_sql(valid)
         ))?;
         late_rows = count(conn, "SELECT * FROM memory.main.v_late")?;
         late_duplicates = late_rows - count(conn, "SELECT DISTINCT * FROM memory.main.v_late")?;

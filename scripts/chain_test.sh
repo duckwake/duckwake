@@ -4,8 +4,9 @@
 # upstream's window_end. The worker is killed over and over (kill -9 from outside, and aborts injected at every
 # step of the epoch); after every crash all three views verify, each against a batch recomputation at its own
 # checkpoint (Kafka for the first, time travel for the others), and again after draining. Then the rest of the
-# gate: dropping a view that another view reads is refused, and an update to an insert-only lake table stops
-# the view that reads it while the chain keeps running. WORKER_FLAGS="--pipeline ..." runs it pipelined.
+# gate: dropping a view that another view reads is refused, and an update to a lake table that a windowed
+# view reads (windows need insert-only input) stops that view while the chain keeps running.
+# WORKER_FLAGS="--pipeline ..." runs it pipelined.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-2s}
 read -r -a POINTS <<< "${POINTS:-external poll commit_begin commit_mid before_commit after_commit maintenance staged_ahead}"
@@ -81,9 +82,10 @@ elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | head -1
 else echo "drop of chain_per_10s failed for another reason: $out"; failed=1; fi
 "$BIN" start chain_per_10s --worker w1 >/dev/null
 
-log "an update to an insert-only lake table stops the view that reads it, and only that view"
+log "an update to a lake table a windowed view reads stops that view, and only that view"
 "$BIN" sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.orders (id INTEGER, amount DOUBLE)" >/dev/null
-"$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --sql "SELECT id, amount FROM shop.orders WHERE amount > 5" | head -1
+"$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --sql "SELECT window_start, count(*) AS n, sum(amount) AS total
+  FROM TUMBLE(shop.orders, _commit_ts, INTERVAL 10 SECOND) WHERE amount > 5 GROUP BY ALL" | head -1
 "$BIN" start orders_big --worker w1 >/dev/null
 "$BIN" sql "INSERT INTO lake.shop.orders SELECT i, i FROM range(20) t(i)" >/dev/null; sleep 6
 "$BIN" sql "UPDATE lake.shop.orders SET amount = 0 WHERE id = 10" >/dev/null; sleep 6
