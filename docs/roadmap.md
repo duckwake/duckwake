@@ -16,8 +16,10 @@ that must pass before the next starts. The same plan is in the design doc's
 
 ## P1. Safety net
 
-- [ ] CI runs the unit tests and the integration suites on every push, with PostgreSQL, Redpanda and MinIO as
-      services. Today CI only builds, and the suites run on a laptop.
+- [x] CI runs clippy, the unit tests and every integration suite on each pull request and push to `main`, against
+      PostgreSQL, Redpanda (open and authenticated listeners) and MinIO (`.github/workflows/ci.yml`, about
+      12 minutes). Blocking merges on `ci-passed` needs branch protection, which GitHub's Free plan does not
+      offer for private repositories: the org must upgrade or the repository go public.
 
 **Gate:** every suite is green in CI, and a failing suite blocks merging.
 
