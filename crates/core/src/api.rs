@@ -66,20 +66,35 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
     Ok((def, msg))
 }
 
-/// Assigns the view to `worker` and bumps its lease, which fences the previous owner's next commit. With
-/// `any`, the view is left for whichever live worker claims it first.
-pub fn start(conn: &Connection, name: &str, worker: &str) -> Result<String> {
+/// Starts the view where `assign` says and bumps its lease, which fences the previous owner's next commit.
+pub fn start(conn: &Connection, name: &str, assign: catalog::Assign) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    catalog::set_status(conn, &job, JobStatus::Running, Some(worker))?;
+    catalog::set_status(conn, &job, JobStatus::Running, Some(assign))?;
+    Ok(match assign {
+        catalog::Assign::Any => format!("{job}: running on the next live worker to claim it"),
+        catalog::Assign::Prefer(w) => format!("{job}: running on {w}"),
+        catalog::Assign::Pin(w) => format!("{job}: running on {w} (pinned)"),
+    })
+}
+
+/// How the CLI and SQL name a placement: `any` (or nothing, in the CLI) floats; a worker id pins.
+pub fn assign_named(worker: &str) -> catalog::Assign<'_> {
     if worker == crate::failover::ANY_WORKER {
-        return Ok(format!("{job}: running on the next live worker to claim it"));
+        catalog::Assign::Any
+    } else {
+        catalog::Assign::Pin(worker)
     }
-    Ok(format!("{job}: running on {worker}"))
 }
 
 /// The query behind `duckwake_workers()`.
 pub fn workers_sql(conn: &Connection) -> Result<String> {
     crate::failover::workers_query(conn)
+}
+
+/// Asks `worker` to hand all its views to the other workers and take none, before it is taken out.
+pub fn drain(conn: &Connection, worker: &str) -> Result<String> {
+    crate::failover::drain(conn, worker)?;
+    Ok(format!("{worker}: draining; its views move to the other workers within a refresh or two"))
 }
 
 pub fn pause(conn: &Connection, name: &str) -> Result<String> {

@@ -207,6 +207,8 @@ fn spawn_worker(app: Shared) -> std::thread::JoinHandle<()> {
                 max_epochs: None,
                 refresh_every: Duration::from_secs(1),
                 lease_timeout: Some(Duration::from_secs(30)),
+                stop_grace: Duration::from_secs(60),
+                rebalance: Some(duckwake_core::failover::RebalanceConfig::default()),
                 stage_threads: app.opts.stage_threads,
                 pipeline: app.opts.pipeline,
                 shared_readers: app.opts.shared_readers,
@@ -692,7 +694,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
             },
         )?;
         if r.start.unwrap_or(true) {
-            catalog::set_status(conn, &job_id, JobStatus::Running, Some(&app.worker_id))?;
+            catalog::set_status(conn, &job_id, JobStatus::Running, Some(catalog::Assign::Prefer(&app.worker_id)))?;
         }
         Ok(json!({ "ok": true, "job_id": job_id, "kind": def.plan.kind_name(), "explain": duckwake_core::api::explain(conn, &job_id).unwrap_or_else(|e| format!("{e:#}")) }))
     })
@@ -770,7 +772,7 @@ async fn view_action(
     }
     with_conn(&app, move |app, conn| {
         match action.as_str() {
-            "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(&app.worker_id))?,
+            "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(catalog::Assign::Prefer(&app.worker_id)))?,
             "pause" => catalog::set_status(conn, &name, JobStatus::Paused, None)?,
             "stop" => catalog::set_status(conn, &name, JobStatus::Stopped, None)?,
             "reset" => catalog::reset(conn, &name, req.to_epoch.ok_or_else(|| anyhow!("to_epoch is required"))?)?,

@@ -27,7 +27,7 @@ use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,8 +43,13 @@ pub struct WorkerConfig {
     /// How often to look for newly assigned / paused jobs.
     pub refresh_every: Duration,
     /// Failover: a worker whose heartbeat has not moved for this long is dead, and its views move to the live
-    /// workers. None: this worker heartbeats but never claims another's views.
+    /// workers. None: this worker heartbeats but never claims another's views, and does not rebalance.
     pub lease_timeout: Option<Duration>,
+    /// How long the views of a cleanly stopped (restarting) worker wait for it before they move.
+    pub stop_grace: Duration,
+    /// Moving views from the busiest worker to the least loaded one; None: views move only on failover,
+    /// drain and pins.
+    pub rebalance: Option<failover::RebalanceConfig>,
     /// Threads that stage in parallel, each with its own connection; 1 stages everything on the scheduler
     /// thread, 0 means half the cores.
     pub stage_threads: usize,
@@ -80,7 +85,16 @@ struct JobRuntime {
     /// the table at start, then kept up to date from each epoch's partials and watermark. A window can close
     /// only when one of them is at or below the watermark.
     open_ends: Option<BTreeSet<i64>>,
+    /// When this worker started the job: it may move again once the rebalance cooldown has passed.
+    started: Instant,
+    /// The share of a worker the job uses: a moving average of its staging, source and commit time per
+    /// second of wall time. None until its first epoch commits.
+    cost: Option<f64>,
+    last_commit: Option<Instant>,
 }
+
+/// Weight of the newest epoch in a job's moving-average cost.
+const COST_ALPHA: f64 = 0.2;
 
 /// Where an input's rows come from.
 enum Feed {
@@ -350,10 +364,11 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         lease_timeout_s = cfg.lease_timeout.map(|t| t.as_secs_f64()),
         "worker started"
     );
-    let liveness = failover::Liveness::new(cfg.lease_timeout.unwrap_or(Duration::MAX));
+    let liveness = failover::Liveness::new(cfg.lease_timeout.unwrap_or(Duration::MAX), cfg.stop_grace);
     let mut w = Worker {
         liveness,
         last_heartbeat: Instant::now(),
+        last_rebalance: Instant::now(),
         cfg,
         rt,
         conns,
@@ -364,6 +379,8 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         rounds: 0,
         committed: 0,
         drops: Vec::new(),
+        waiting: HashSet::new(),
+        load_rounds: 0,
     };
     w.run(&shutdown)?;
     // The others take this worker's views over at once instead of after the lease timeout.
@@ -418,6 +435,11 @@ struct Worker {
     /// The other workers' heartbeats as this one has seen them.
     liveness: failover::Liveness,
     last_heartbeat: Instant,
+    last_rebalance: Instant,
+    /// Jobs whose topic does not exist yet: retried every refresh, logged once.
+    waiting: HashSet<String>,
+    /// Rebalance rounds in a row that found this worker carrying too much load.
+    load_rounds: u32,
 }
 
 /// How often a worker heartbeats: well inside the lease timeout, and at least every 5 s so workers with a
@@ -436,7 +458,12 @@ impl Worker {
                 continue;
             }
             if self.last_heartbeat.elapsed() >= heartbeat_every(self.cfg.lease_timeout) {
-                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len())?;
+                let costs: BTreeMap<String, f64> =
+                    self.jobs.iter().filter_map(|(id, j)| j.cost.map(|c| (id.clone(), c))).collect();
+                let cooldown = self.cfg.rebalance.map_or(Duration::ZERO, |r| r.cooldown);
+                let cooling: Vec<String> =
+                    self.jobs.iter().filter(|(_, j)| j.started.elapsed() < cooldown).map(|(id, _)| id.clone()).collect();
+                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len(), &costs, &cooling)?;
                 self.last_heartbeat = Instant::now();
             }
             if last_refresh.elapsed() >= self.cfg.refresh_every {
@@ -494,16 +521,18 @@ impl Worker {
     }
 
     /// Picks up jobs newly assigned to this worker and drops ones paused, stopped or taken over. With
-    /// failover, first claims this worker's share of the views whose owner is dead or unassigned.
+    /// failover, first claims this worker's share of the views whose owner is dead or unassigned, or else
+    /// hands views away: all of them while draining, pinned ones back home, and a few when this is the
+    /// busiest worker (`failover`).
     fn refresh(&mut self) -> Result<()> {
         let mut running = catalog::running_jobs(&self.conns[0])?;
-        if self.cfg.lease_timeout.is_some() && self.claim_orphans(&running)? {
+        if self.cfg.lease_timeout.is_some() && self.place(&running)? {
             running = catalog::running_jobs(&self.conns[0])?;
         }
         let mine: BTreeMap<String, i64> = running
             .into_iter()
-            .filter(|(_, owner, _)| owner.as_deref() == Some(self.cfg.worker_id.as_str()))
-            .map(|(id, _, lease)| (id, lease))
+            .filter(|j| j.owner.as_deref() == Some(self.cfg.worker_id.as_str()))
+            .map(|j| (j.id, j.lease))
             .collect();
         let released: Vec<String> =
             self.jobs.iter().filter(|(id, j)| mine.get(*id) != Some(&j.lease)).map(|(id, _)| id.clone()).collect();
@@ -518,11 +547,22 @@ impl Worker {
                 self.apply(c);
             }
         }
+        self.waiting.retain(|id| mine.contains_key(id));
         for id in new {
             match self.start_job(&id) {
-                Ok(_) => {}
+                Ok(_) => {
+                    if self.waiting.remove(&id) {
+                        info!(job = %id, "topic is there now; job started");
+                    }
+                }
                 Err(e) if crate::lake::is_conflict(&e) => {
                     warn!(job = %id, error = %format!("{e:#}"), "lease race; retrying on next refresh");
+                }
+                // A topic created after the view started: wait for it, as Kafka consumers do.
+                Err(e) if crate::kafka::is_topic_missing(&e) => {
+                    if self.waiting.insert(id.clone()) {
+                        warn!(job = %id, error = %format!("{e:#}"), "waiting for the topic; retrying every refresh");
+                    }
                 }
                 Err(e) => {
                     warn!(job = %id, error = %format!("{e:#}"), "cannot start job; marking failed");
@@ -533,24 +573,69 @@ impl Worker {
         Ok(())
     }
 
+    /// One placement round: claims, or else handoffs (never both, so a handoff never works from ownership a
+    /// claim just changed). True when a view changed hands.
+    fn place(&mut self, running: &[catalog::RunningJob]) -> Result<bool> {
+        let me = self.cfg.worker_id.clone();
+        let rows = failover::workers(&self.conns[0])?;
+        let now = Instant::now();
+        let owners = running.iter().filter_map(|j| j.owner.clone()).filter(|o| o != failover::ANY_WORKER);
+        self.liveness.observe(&rows, owners, now);
+        let my_state = rows.iter().find(|w| w.id == me).map_or(failover::WorkerState::Running, |w| w.state);
+        let mut targets = self.liveness.targets(now);
+        if my_state == failover::WorkerState::Running && !targets.contains(&me) {
+            targets.push(me.clone());
+            targets.sort();
+        }
+        let views = failover::view_infos(running, &rows, &HashMap::new());
+        if my_state == failover::WorkerState::Running && self.claim_orphans(&views, &targets, now)? {
+            return Ok(true);
+        }
+        let draining = my_state == failover::WorkerState::Draining;
+        let Some(cfg) = self.cfg.rebalance.or(draining.then(failover::RebalanceConfig::default)) else { return Ok(false) };
+        if !draining && self.last_rebalance.elapsed() < cfg.every {
+            return Ok(false);
+        }
+        self.last_rebalance = Instant::now();
+        // Rebalancing prefers targets that already read a view's source.
+        let sources = catalog::running_sources(&self.conns[0])?;
+        let views = failover::view_infos(running, &rows, &sources);
+        // Views within their cooldown, here (as of now) and on the other workers (as of their last heartbeat).
+        let mut cooling: HashSet<String> =
+            self.jobs.iter().filter(|(_, j)| j.started.elapsed() < cfg.cooldown).map(|(id, _)| id.clone()).collect();
+        cooling.extend(rows.iter().filter(|w| w.id != me).flat_map(|w| w.cooling.iter().cloned()));
+        // A load imbalance must last LOAD_ROUNDS rounds before views move for it; drains, pins and view
+        // counts do not wait.
+        let planned = failover::moves(&me, my_state, &views, &targets, &cooling, &cfg, true);
+        let by_load = planned.iter().any(|m| m.reason == failover::Reason::Load);
+        self.load_rounds = if by_load { self.load_rounds + 1 } else { 0 };
+        let plan = if by_load && self.load_rounds < failover::LOAD_ROUNDS {
+            failover::moves(&me, my_state, &views, &targets, &cooling, &cfg, false)
+        } else {
+            planned
+        };
+        let mut moved = false;
+        for m in plan {
+            if m.reason == failover::Reason::Load {
+                self.load_rounds = 0;
+            }
+            moved |= self.hand_off(&m)?;
+        }
+        Ok(moved)
+    }
+
     /// Claims this worker's share of the orphaned views (see `failover`); true when it claimed any.
-    fn claim_orphans(&mut self, running: &[(String, Option<String>, i64)]) -> Result<bool> {
+    fn claim_orphans(&mut self, views: &[failover::ViewInfo], targets: &[String], now: Instant) -> Result<bool> {
         let conn = &self.conns[0];
         let me = self.cfg.worker_id.as_str();
-        let beats = failover::beats(conn)?;
-        let now = Instant::now();
-        let owners = running.iter().filter_map(|(_, o, _)| o.clone()).filter(|o| o != failover::ANY_WORKER);
-        self.liveness.observe(&beats, owners, now);
-        let mut live = self.liveness.live(now);
-        if !live.iter().any(|w| w == me) {
-            live.push(me.to_string());
-            live.sort();
-        }
         let mut claimed = false;
-        for (job, from, lease) in failover::plan(me, running, &live, |w| self.liveness.dead(w, now)) {
-            match failover::claim(conn, &job, from.as_deref(), lease, me) {
+        for v in failover::claims(me, views, targets, |w| self.liveness.dead(w, now)) {
+            match failover::claim(conn, &v.id, v.owner.as_deref(), v.lease, me) {
                 Ok(true) => {
-                    info!(job = %job, from = from.as_deref().unwrap_or("unassigned"), "claimed orphaned view");
+                    info!(job = %v.id, from = v.owner.as_deref().unwrap_or("unassigned"), "claimed orphaned view");
+                    if let Some(m) = &self.cfg.metrics {
+                        m.record_claim();
+                    }
                     claimed = true;
                 }
                 Ok(false) => {}
@@ -562,15 +647,52 @@ impl Worker {
         Ok(claimed)
     }
 
+    /// Moves one of this worker's views to another worker: its epoch in flight commits first, then the lease
+    /// moves, so nothing is fenced and nothing staged is lost; the target starts from that checkpoint.
+    fn hand_off(&mut self, m: &failover::Move) -> Result<bool> {
+        if self.committer.includes(&m.job) {
+            if let Some(c) = self.committer.finish()? {
+                self.apply(c);
+            }
+        }
+        // A view that committed its last epoch elsewhere in the meantime is not ours to give.
+        let lease = match self.jobs.get(&m.job) {
+            Some(j) => j.lease,
+            None => m.lease,
+        };
+        match failover::claim(&self.conns[0], &m.job, Some(&self.cfg.worker_id), lease, &m.to) {
+            Ok(true) => {
+                info!(job = %m.job, to = %m.to, reason = m.reason.as_str(), "handed off view");
+                self.remove_job(&m.job);
+                if let Some(metrics) = &self.cfg.metrics {
+                    metrics.record_move();
+                }
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(e) if crate::lake::is_conflict(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Recovery: take the lease, read the latest checkpoint, seek each partition to its offset. State needs no
     /// restore with the DuckLake backend: the state table is as of the last commit. With shared readers a job
     /// at the position of a group of its source joins that group. Returns false when the job is not ours.
     fn start_job(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
-        let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
         let (def, sources) = catalog::load_compiled(conn, id)?;
-        catalog::set_sink_inlining(conn, &def)?;
         let names = def.plan.sources();
+        // Every Kafka topic must exist before the lease is taken: a job waiting for its topic retries each
+        // refresh, and taking the lease each time would commit a snapshot for nothing.
+        for s in names.iter().filter_map(|n| sources.get(n)) {
+            let opts = s.options.clone();
+            self.rt.block_on(async move {
+                let c = crate::kafka::client(&opts).await?;
+                crate::kafka::partitions(&c, &opts.topic).await
+            })?;
+        }
+        let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
+        catalog::set_sink_inlining(conn, &def)?;
         // One checkpoint row holds every source's offsets.
         let ckpt = catalog::latest_checkpoint(conn, id, &names[0])?.unwrap_or_default();
         let now = Instant::now();
@@ -661,6 +783,9 @@ impl Worker {
             inputs,
             last_round: None,
             open_ends,
+            started: Instant::now(),
+            cost: None,
+            last_commit: None,
         };
         self.jobs.insert(id.to_string(), j);
         Ok(true)
@@ -697,8 +822,25 @@ impl Worker {
         if let Some(m) = &self.cfg.metrics {
             m.record_commit(c.batch.poll_stage_ms, c.commit_ms, c.attempts);
         }
+        let now = Instant::now();
+        let n_jobs = c.batch.jobs.len().max(1) as f64;
         for j in c.batch.jobs.iter().filter(|j| !c.fenced.contains(&j.id)) {
             let s = &j.staged;
+            // The share of the worker this epoch took: the job's staging, its part of the source read (shared
+            // by the group's members) and of the commit, over the wall time since its previous epoch.
+            let readers = self.jobs.get(&j.id).and_then(|rt| {
+                rt.inputs.iter().find_map(|i| i.group()).and_then(|g| self.groups.get(&g)).map(|g| g.members.len())
+            });
+            let busy_ms = s.stage_ms as f64 + s.source_ms as f64 / readers.unwrap_or(1).max(1) as f64 + c.commit_ms as f64 / n_jobs;
+            if let Some(rt) = self.jobs.get_mut(&j.id) {
+                let wall_ms = rt.last_commit.map_or(rt.interval.as_millis() as f64, |t| (now - t).as_millis() as f64).max(1.0);
+                let share = (busy_ms / wall_ms).min(4.0);
+                rt.cost = Some(rt.cost.map_or(share, |c| (1.0 - COST_ALPHA) * c + COST_ALPHA * share));
+                rt.last_commit = Some(now);
+                if let (Some(m), Some(cost)) = (&self.cfg.metrics, rt.cost) {
+                    m.set_cost(&j.id, cost);
+                }
+            }
             // Newest event committed to the moment it became visible (negative for event times in the future).
             let freshness_ms = s.max_event_time_us.map(|us| (c.visible_at.timestamp_micros() - us) / 1000);
             if let Some(m) = &self.cfg.metrics {

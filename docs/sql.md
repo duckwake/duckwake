@@ -21,10 +21,10 @@ reads is refused.
 | --- | --- |
 | `duckwake_create_source(name, kind, options_json)` | register a Kafka source |
 | `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=)` | create the table `name` and its job |
-| `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` defaults to the server's worker, and `worker := 'any'` leaves the view to whichever live worker claims it |
+| `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` puts the view on the server's worker, `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it |
 | `duckwake_reset(view, to_epoch)` / `duckwake_drop(view, keep_table :=)` | rewind and replay / remove |
 | `duckwake_jobs()` / `duckwake_checkpoints(view, n :=)` / `duckwake_sources()` | status, history, sources |
-| `duckwake_workers()` | every worker that ran on the lake: state, views, last heartbeat |
+| `duckwake_workers()` / `duckwake_drain(worker)` | every worker that ran on the lake: state, views, load, last heartbeat / hand all of a worker's views to the others before taking it out |
 | `duckwake_verify(view)` | the differential exactly-once check |
 | `duckwake_explain(view)` | the view's operator circuit, how it was made incremental, and one epoch's SQL ([internals](internals.md#views-as-dbsp-circuits)) |
 | `duckwake_wait(view, timeout_s :=)` | block until the view has committed what its topic holds now |
@@ -48,7 +48,7 @@ Only in the extension:
 | `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
 | `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows]` |
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME [--worker W]` (default `any`) / `stop` / `pause` |
-| `duckwake_workers()` | `workers` |
+| `duckwake_workers()` / `duckwake_drain(worker)` | `workers` / `drain WORKER` |
 | `duckwake_jobs()` / `duckwake_checkpoints(view)` | `jobs` / `checkpoints NAME` |
 | `duckwake_reset(view, to_epoch)` | `reset NAME --to-epoch N` |
 | `duckwake_verify(view)` / `duckwake_explain(view)` | `verify NAME` / `explain NAME` |

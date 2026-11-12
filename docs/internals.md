@@ -211,10 +211,10 @@ operator's semantics and a test oracle, not a dependency.
    `__duckwake.worker_<id>`, one row it updates every `lease_timeout / 5` (at most every 5 s), inlined in the
    catalog. A worker is dead when its `beat` counter has not moved for `--lease-timeout` (default 30 s) as
    timed by the worker watching it, so clocks need not agree; a worker that stops cleanly marks itself
-   `stopped` and is dead at once. In each refresh (every 2 s) a worker reads the heartbeats and the
+   `stopped` and is dead once `--stop-grace` has passed (finding 15). In each refresh (every 2 s) a worker reads the heartbeats and the
    running views' leases, and claims its share of the orphans: views unassigned (`start` without a worker)
-   or owned by a dead worker. Each orphan goes, in job order, to the live worker with the fewest views, so
-   every worker computes the same plan. A claim is `UPDATE lease SET owner_worker = me, lease_epoch =
+   or owned by a dead worker. Orphans go largest first, each to the live worker with the least load (finding
+   15), so every worker computes the same plan. A claim is `UPDATE lease SET owner_worker = me, lease_epoch =
    lease_epoch + 1 WHERE owner_worker = <old> AND lease_epoch = <read>`; two workers claiming one view
    conflict and the first committer wins. The new owner starts from the last checkpoint as after any
    restart, and the bumped lease fences the old owner if it was only stalled (`scripts/failover_test.sh`
@@ -247,6 +247,25 @@ operator's semantics and a test oracle, not a dependency.
    password comes from libpq's `PGPASSWORD` or `.pgpass`. The suites run against MinIO with
    `LAKE_STORAGE=s3` (Chainguard's image: MinIO no longer publishes community images to Docker Hub).
 
+15. **Rebalancing moves a view between epochs, from the busiest worker only.** Moving a view is cheap here:
+   its state and checkpoint are in the lake, so the new owner restores nothing (Kafka Streams needs warm-up
+   replicas for that) and the cost of a move is a refresh, the job start and one epoch of latency. Each
+   worker publishes, per view, its cost (a moving average of staging, its share of the source read and of the
+   commit, per second of wall time) and whether it is within the cooldown. Every `--rebalance-every` the
+   busiest worker with a view it may move compares itself with the least loaded one: above the average by
+   `ε` times it and by at least a tenth of a worker, for three rounds in a row (lightly loaded workers are not
+   worth balancing, and a view catching up after a restart is a spike, not a trend), or two views ahead
+   (a worker joined; counts are not noisy, so no wait), it gives the view that best
+   evens out the pair, a little against targets that do not read the view's source (one reader serves all
+   views of a source on a worker), and never one that only shifts the imbalance. Only one worker gives at a
+   time, so two never pile onto one target, and a moved view stays put for the cooldown, so nothing
+   ping-pongs. The handoff waits for the view's epoch in flight to commit, then moves the lease with the same
+   compare-and-set as a claim: nothing is fenced, nothing staged is lost. Kafka Connect's lesson applies to
+   restarts: a clean stop is a restart, so its views wait `--stop-grace` instead of moving away and back;
+   `drain` is the explicit way out. Pins (`start --worker W`) are stored in `jobs.pinned_to`: never balanced
+   away, failed over when W dies, handed back when W is live. `scripts/rebalance_test.sh` is the gate:
+   joining workers, a settled cluster making no moves, a rolling restart keeping every view in place, drain,
+   a pinned view failing over and going home, and a `kill -9` in the middle of a drain, with exact output.
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
@@ -254,9 +273,9 @@ operator's semantics and a test oracle, not a dependency.
 - **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
   certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
   view is marked failed, so a view starting while its brokers are down needs `start` again; once
-  connected, readers retry through broker restarts. Likewise a view started before its topic exists fails
-  (`topic ... not found`); with failover a live worker may claim a view the moment it starts, so create the
-  topic first. Unknown fields are dropped; there is no
+  connected, readers retry through broker restarts. A view whose topic does not exist yet waits for it, as
+  Kafka consumers do: its worker checks every refresh (before taking the lease, so waiting commits nothing)
+  and logs once. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
   across workers. Without `--shared-readers` each job has its own readers: two jobs on one source read it
@@ -290,9 +309,10 @@ operator's semantics and a test oracle, not a dependency.
   later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`, so it
   compares with Kafka event times. A view reading a lake table polls its change feed every epoch even when
   the table is idle; views on one table should share that read (F4).
-- **Failover.** Views move only away from dead workers: nothing rebalances views onto a worker that joins
-  later, and a view's owner is never chosen by load beyond the count of views. Every worker that ever ran
-  keeps its `worker_<id>` table (state `stopped` after a clean stop); nothing drops old ones yet.
+- **Placement.** Load assumes workers of equal size: a bigger machine is not given more views. A view's
+  cost is measured on the worker that runs it, so a view that has not run yet counts as the average view.
+  Every worker that ever ran keeps its `worker_<id>` table (state `stopped` after a clean stop); nothing
+  drops old ones yet, and `workers` lists them all.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark
   holds at the checkpointed value until every active partition reports again.
 
@@ -308,5 +328,5 @@ crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
 docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
-scripts/         crash, chain, retract, fencing, failover, kafka auth, reset, retention, decode, shared-reader, server and extension tests; benchmark
+scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

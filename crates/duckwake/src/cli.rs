@@ -69,10 +69,14 @@ enum Cmd {
     /// duckwake_start(view): assign to a worker (bumps the lease, fencing the previous owner).
     Start {
         name: String,
-        /// The worker to run it on; `any` (the default) leaves it to whichever live worker claims it.
+        /// The worker to pin it to (rebalancing never moves it; after a failover it goes back there); `any`
+        /// (the default) leaves it to whichever live worker claims it, and lets rebalancing move it.
         #[arg(long, default_value = "any")]
         worker: String,
     },
+    /// duckwake_drain(worker): the worker hands all its views to the others and takes none, before it is
+    /// taken out for good. A restart ends the drain.
+    Drain { worker: String },
     /// duckwake_pause(view)
     Pause { name: String },
     /// duckwake_stop(view)
@@ -211,6 +215,22 @@ pub struct WorkerArgs {
     /// workers; `off` keeps this worker from taking over others' views.
     #[arg(long, default_value = "30s", env = "DUCKWAKE_LEASE_TIMEOUT")]
     pub lease_timeout: String,
+    /// How long the views of a cleanly stopped worker wait for it to come back (a restart) before they move.
+    /// Take a worker out for good with `drain` first.
+    #[arg(long, default_value = "60s", env = "DUCKWAKE_STOP_GRACE")]
+    pub stop_grace: String,
+    /// How often a worker checks the balance; `off` moves views only on failover, drain and pins.
+    #[arg(long, default_value = "30s", env = "DUCKWAKE_REBALANCE_EVERY")]
+    pub rebalance_every: String,
+    /// A view runs at least this long on a worker before rebalancing moves it again.
+    #[arg(long, default_value = "5m", env = "DUCKWAKE_REBALANCE_COOLDOWN")]
+    pub rebalance_cooldown: String,
+    /// Most views the busiest worker gives away per round.
+    #[arg(long, default_value_t = 2, env = "DUCKWAKE_REBALANCE_MAX_MOVES")]
+    pub rebalance_max_moves: usize,
+    /// Imbalance tolerated: the busiest worker may carry up to (1 + this) times the average load.
+    #[arg(long, default_value_t = 0.2, env = "DUCKWAKE_REBALANCE_EPSILON")]
+    pub rebalance_epsilon: f64,
     /// Stage views in parallel on this many threads, each with its own connection (0 = half the cores).
     #[arg(long, default_value_t = 1, env = "DUCKWAKE_STAGE_THREADS")]
     pub stage_threads: usize,
@@ -245,6 +265,16 @@ impl WorkerArgs {
             lease_timeout: match self.lease_timeout.as_str() {
                 "off" | "0" => None,
                 t => Some(parse_duration(t)?),
+            },
+            stop_grace: parse_duration(&self.stop_grace)?,
+            rebalance: match self.rebalance_every.as_str() {
+                "off" | "0" => None,
+                every => Some(duckwake_core::failover::RebalanceConfig {
+                    every: parse_duration(every)?,
+                    cooldown: parse_duration(&self.rebalance_cooldown)?,
+                    max_moves: self.rebalance_max_moves.max(1),
+                    epsilon: self.rebalance_epsilon.max(0.0),
+                }),
             },
             stage_threads: self.stage_threads,
             pipeline: self.pipeline,
@@ -314,7 +344,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             println!("{msg} {:?}", def.plan.sink_columns);
             println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
         }
-        Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, &worker)?),
+        Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, api::assign_named(&worker))?),
+        Cmd::Drain { worker } => println!("{}", api::drain(&open()?, &worker)?),
         Cmd::Pause { name } => println!("{}", api::pause(&open()?, &name)?),
         Cmd::Stop { name } => println!("{}", api::stop(&open()?, &name)?),
         Cmd::Reset { name, to_epoch } => println!("{}", api::reset(&open()?, &name, to_epoch)?),

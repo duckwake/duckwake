@@ -52,6 +52,7 @@ jobs:
           - { name: crash+reset, run: "scripts/crash_test.sh && scripts/reset_test.sh" }
           - { name: fencing, run: scripts/fencing_test.sh }
           - { name: failover, run: scripts/failover_test.sh }
+          - { name: rebalance, run: scripts/rebalance_test.sh }
           - { name: kafka-auth, run: scripts/kafka_auth_test.sh }
           # P2's gate: the suites against authenticated Kafka and object storage (MinIO).
           - { name: crash sasl_ssl+s3, run: KAFKA_AUTH=sasl_ssl LAKE_STORAGE=s3 scripts/crash_test.sh }
@@ -68,6 +69,7 @@ jobs:
           # The suites that kill workers mid-epoch, again with the four parallel-processing flags.
           - { name: crash pipelined, run: scripts/crash_test.sh, flags: true }
           - { name: failover pipelined, run: scripts/failover_test.sh, flags: true }
+          - { name: rebalance pipelined, run: scripts/rebalance_test.sh, flags: true }
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
     name: suite (${{ matrix.name }})

@@ -6,13 +6,14 @@
 #   2. a frozen worker (SIGSTOP): the same, even when it froze inside its catalog commit (PostgreSQL ends
 #      that session after the lease timeout); thawed (SIGCONT), it is a zombie whose commits are fenced and
 #      it lets go of the views, or it exits.
-#   3. a clean stop (SIGTERM): it marks itself stopped, so the views move at the next refresh.
+#   3. a drained worker (`duckwake drain`) hands its views to the others at once; a clean stop alone is a
+#      restart, whose views wait for it (scripts/rebalance_test.sh covers that).
 # A restarted worker takes views again. After draining, every view verifies against the batch recomputation.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-120}
 LEASE_TIMEOUT=${LEASE_TIMEOUT:-10}   # seconds
 BOUND=$((LEASE_TIMEOUT + 10))        # kill to every view moved: the timeout, a refresh and a heartbeat
-CLEAN_BOUND=${CLEAN_BOUND:-8}        # clean stop to every view moved
+CLEAN_BOUND=${CLEAN_BOUND:-8}        # drain to every view moved
 failed=0
 
 run_worker() {
@@ -92,11 +93,12 @@ else
 fi
 [[ $(owned_by w2) == 0 ]] || { echo "FAIL: w2 owns views again"; failed=1; }
 
-log "3. restart w1, then stop w3 cleanly"
+log "3. restart w1, then drain w3 and stop it"
 run_worker w1
 sleep 6
+"$BIN" drain w3
+check_moved "drain" w3 "$CLEAN_BOUND"
 kill -TERM "$(pid w3)"; wait "$(pid w3)" 2>/dev/null || true
-check_moved "clean stop" w3 "$CLEAN_BOUND"
 
 log "workers"; "$BIN" workers
 

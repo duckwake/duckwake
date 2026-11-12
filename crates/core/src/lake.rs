@@ -141,14 +141,33 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
     ))
     .context("bootstrapping __duckwake schema")?;
     // Lakes bootstrapped before the Arrow decode lack `rows_sql` (messages decoded in SQL per epoch).
-    let has_rows_sql: i64 = conn.query_row(
-        "SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lake' AND schema_name = '__duckwake'
-           AND table_name = 'checkpoints' AND column_name = 'rows_sql'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_rows_sql == 0 {
-        conn.execute_batch(&format!("ALTER TABLE {CTL}.checkpoints ADD COLUMN rows_sql BIGINT"))?;
+    add_column(conn, "checkpoints", "rows_sql", "BIGINT")?;
+    // Before rebalancing: the worker a view is pinned to (`start --worker W`), NULL when it may move.
+    add_column(conn, "jobs", "pinned_to", "VARCHAR")?;
+    Ok(())
+}
+
+/// Adds a column to a control table unless it has it. Several processes may bootstrap the same lake at
+/// once: one that loses the race finds the column there and goes on.
+pub fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
+    let has = || -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM duckdb_columns() WHERE database_name = ? AND schema_name = ? AND table_name = ? AND column_name = ?",
+            [LAKE, schema, table, column],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    for attempt in 1..=5u64 {
+        if has()? {
+            return Ok(());
+        }
+        match conn.execute_batch(&format!("ALTER TABLE {CTL}.{} ADD COLUMN {} {ty}", ident(table), ident(column))) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(100 * attempt)),
+            Err(e) => return Err(e).with_context(|| format!("adding {column} to {CTL}.{table}")),
+        }
     }
     Ok(())
 }

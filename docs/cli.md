@@ -80,17 +80,33 @@ $B run --worker w1
 Anything else that reads the lake, such as a DuckDB session that attaches it, needs the same access: its
 own S3 secret (`CREATE SECRET (TYPE s3, ...)`) and catalog credentials.
 
-## Workers and failover
+## Workers, failover and rebalancing
 
-Every worker heartbeats into the lake. When one dies, its views move to the live workers once its heartbeat
-has not moved for `--lease-timeout` (default `30s`), and they continue from their last checkpoint; a worker
-stopped with Ctrl-C or SIGTERM hands its views over at once. `start NAME` without `--worker` leaves the view
-to whichever live worker claims it, and the workers spread such views by count. `workers` lists every worker
-with its state, views and last heartbeat. `--lease-timeout off` keeps a worker from taking over other
-workers' views. With a PostgreSQL catalog, a worker also has PostgreSQL end any of its sessions that stalls
-inside a transaction for longer than the lease timeout, so a frozen worker cannot block the others' commits;
-if your catalog string already passes `options`, add `-c idle_in_transaction_session_timeout=30000` to it. Nothing rebalances views onto a worker that joins later: start the workers before the views,
-or move a view with `start NAME --worker W`.
+Every worker heartbeats into the lake, and the workers move views between themselves:
+
+- **A view's topic does not exist yet**: the view waits for it (logged once) and starts when it appears.
+- **A worker dies** (killed, frozen, its machine gone): its views move to the live workers once its heartbeat
+  has not moved for `--lease-timeout` (default `30s`), and continue from their last checkpoint.
+- **A worker stops cleanly** (Ctrl-C, SIGTERM): it is taken to be restarting, so its views wait
+  `--stop-grace` (default `60s`) for it and do not move during a rolling restart. To take a worker out for
+  good, `drain` it first: `duckwake drain w3` (or `CALL duckwake_drain('w3')`) hands all its views to the
+  others within a refresh or two, and it takes none until it restarts.
+- **A worker joins, or loads drift apart**: every `--rebalance-every` (default `30s`) the busiest worker
+  that has a view it may move gives up to `--rebalance-max-moves` (2) views to the least loaded one, when it
+  holds two views more than that worker, or when for three rounds in a row it carries more than
+  `1 + --rebalance-epsilon` (1.2) times the average load and at least a tenth of a worker above it. Load is what each view costs (its staging, source and commit time per second, a moving average),
+  and a target that already reads the view's source is preferred. A view that just moved or started stays
+  put for `--rebalance-cooldown` (default `5m`). `--rebalance-every off` turns this off.
+
+`start NAME` leaves the view to whichever live worker claims it, and lets rebalancing move it.
+`start NAME --worker W` pins it to W: rebalancing never moves it, and after a failover it goes back to W once
+W is live again. `workers` lists every worker with its state (`running`, `draining`, `stopped`), views,
+load and last heartbeat; `duckwake_view_cost`, `duckwake_worker_load`, `duckwake_failover_claims_total` and
+`duckwake_handoffs_total` are in `/metrics`. `--lease-timeout off` keeps a worker from taking over other
+workers' views, and turns rebalancing off for it. With a PostgreSQL catalog, a worker also has PostgreSQL
+end any of its sessions that stalls inside a transaction for longer than the lease timeout, so a frozen
+worker cannot block the others' commits; if your catalog string already passes `options`, add
+`-c idle_in_transaction_session_timeout=30000` to it.
 
 ## Playground
 

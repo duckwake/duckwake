@@ -321,7 +321,10 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
             lt = lease_table(v.job_id)
         ))?;
         conn.execute(
-            &format!("INSERT INTO {CTL}.jobs VALUES (?, ?, 1, 'created', now(), now())"),
+            &format!(
+                "INSERT INTO {CTL}.jobs (job_id, definition, version, status, created_at, updated_at)
+                 VALUES (?, ?, 1, 'created', now(), now())"
+            ),
             [v.job_id, &serde_json::to_string(&def)?],
         )?;
         for l in &def.lake_inputs {
@@ -428,14 +431,42 @@ pub fn load_job(conn: &Connection, job: &str) -> Result<(JobDef, JobStatus)> {
     Ok((serde_json::from_str(&def)?, JobStatus::parse(&status)?))
 }
 
-/// Running jobs and their current lease owner.
-pub fn running_jobs(conn: &Connection) -> Result<Vec<(String, Option<String>, i64)>> {
-    let mut stmt = conn.prepare(&format!("SELECT job_id FROM {CTL}.jobs WHERE status = 'running' ORDER BY job_id"))?;
-    let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
+/// A running view and where it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningJob {
+    pub id: String,
+    /// The lease owner; None while unassigned.
+    pub owner: Option<String>,
+    pub lease: i64,
+    /// The worker `start --worker` pinned it to: never moved by rebalancing, and moved back there after a
+    /// failover once that worker is live again.
+    pub pinned_to: Option<String>,
+}
+
+/// Running jobs, their current lease owner and pin.
+pub fn running_jobs(conn: &Connection) -> Result<Vec<RunningJob>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT job_id, pinned_to FROM {CTL}.jobs WHERE status = 'running' ORDER BY job_id"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<duckdb::Result<Vec<_>>>()?;
     let mut out = Vec::new();
-    for id in ids {
+    for (id, pinned_to) in rows {
         let (owner, lease) = lease(conn, &id)?;
-        out.push((id, owner, lease));
+        out.push(RunningJob { id, owner, lease, pinned_to });
+    }
+    Ok(out)
+}
+
+/// The sources (Kafka sources, lake tables, views) each running view reads, by view: workers that already
+/// read a source are the better place for another view of it (one reader serves both).
+pub fn running_sources(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs WHERE status = 'running'"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<duckdb::Result<Vec<_>>>()?;
+    let mut out = HashMap::new();
+    for (id, def) in rows {
+        // A definition this version cannot read only loses its affinity, not the rebalance.
+        if let Ok(def) = serde_json::from_str::<JobDef>(&def) {
+            out.insert(id, def.plan.sources());
+        }
     }
     Ok(out)
 }
@@ -485,23 +516,41 @@ pub fn retry_conflicts<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
-/// `start` assigns the job to `worker` (`any`: to whichever live worker claims it) and bumps the lease, which
-/// fences the previous owner's next commit.
-pub fn set_status(conn: &Connection, job: &str, status: JobStatus, worker: Option<&str>) -> Result<()> {
-    job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
-    retry_conflicts(|| set_status_once(conn, job, status, worker))
+/// Where `start` puts a view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Assign<'a> {
+    /// On this worker, and kept there: rebalancing never moves it, and after a failover it goes back once the
+    /// worker is live again.
+    Pin(&'a str),
+    /// On this worker for now; rebalancing may move it.
+    Prefer(&'a str),
+    /// Unassigned: the next live worker to claim it takes it (see `failover`).
+    Any,
 }
 
-fn set_status_once(conn: &Connection, job: &str, status: JobStatus, worker: Option<&str>) -> Result<()> {
+/// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
+pub fn set_status(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
+    job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
+    if let Some(Assign::Pin(w) | Assign::Prefer(w)) = assign {
+        crate::failover::check_worker_id(w)?;
+    }
+    retry_conflicts(|| set_status_once(conn, job, status, assign))
+}
+
+fn set_status_once(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute(
             &format!("UPDATE {CTL}.jobs SET status = ?, updated_at = now() WHERE job_id = ?"),
             [status.as_str(), job],
         )?;
-        if let Some(w) = worker {
-            // `any` leaves the view unassigned, for any live worker to claim (see `failover`).
-            let owner = (w != crate::failover::ANY_WORKER).then_some(w);
+        if let Some(a) = assign {
+            let (owner, pin) = match a {
+                Assign::Pin(w) => (Some(w), Some(w)),
+                Assign::Prefer(w) => (Some(w), None),
+                Assign::Any => (None, None),
+            };
+            conn.execute(&format!("UPDATE {CTL}.jobs SET pinned_to = ? WHERE job_id = ?"), duckdb::params![pin, job])?;
             conn.execute(
                 &format!("UPDATE {} SET owner_worker = ?, lease_epoch = lease_epoch + 1", lease_table(job)),
                 [owner],
@@ -689,7 +738,7 @@ pub fn jobs_query(conn: &Connection) -> Result<String> {
                     FROM {CTL}.checkpoints GROUP BY ALL)
          SELECT j.job_id, j.status, l.owner_worker AS worker, l.lease_epoch AS lease, c.epoch, c.watermark,
                 round(epoch(now()::TIMESTAMP - c.max_event_time), 1) AS freshness_s, c.lag,
-                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit
+                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit, j.pinned_to
          FROM {CTL}.jobs j LEFT JOIN leases l USING (job_id) LEFT JOIN last c USING (job_id) LEFT JOIN totals t USING (job_id)
          ORDER BY j.job_id",
         leases.join(" UNION ALL ")

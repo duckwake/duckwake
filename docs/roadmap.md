@@ -27,7 +27,11 @@ that must pass before the next starts. The same plan is in the design doc's
 
 - [x] **Automatic failover.** Workers heartbeat into the lake; a view whose worker dies, freezes or stops
       moves to the live workers within the lease timeout and continues from its checkpoint
-      (`scripts/failover_test.sh`). Still to come: rebalancing onto workers that join later.
+      (`scripts/failover_test.sh`).
+- [x] **Rebalancing.** The busiest worker hands views to the least loaded, weighted by each view's measured
+      cost and preferring workers that read the view's source, with a cooldown per view; a clean stop is a
+      restart (its views wait `--stop-grace`), `drain` takes a worker out, `start --worker W` pins
+      (`scripts/rebalance_test.sh`). Workers of different sizes are treated alike.
 - [x] **Kafka SASL and TLS.** SASL PLAIN and SCRAM, TLS with custom CAs and client certificates; passwords
       are `env:` or `file:` references (`scripts/kafka_auth_test.sh`). OAUTHBEARER and Kerberos are not built.
 - [x] **Object storage.** Data files on `s3://` (S3 and S3-compatible stores), credentials from the standard AWS

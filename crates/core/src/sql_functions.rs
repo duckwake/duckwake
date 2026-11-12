@@ -108,6 +108,7 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     query::<Explain>(conn, api)?;
     query::<Jobs>(conn, api)?;
     query::<Workers>(conn, api)?;
+    action::<Drain>(conn, api)?;
     query::<Checkpoints>(conn, api)?;
     query::<Sources>(conn, api)?;
     query::<MetricsFn>(conn, api)?;
@@ -344,8 +345,8 @@ impl Spec for CreateView {
     }
 }
 
-/// `duckwake_start(view, worker :=)`: without a worker, the server's own; `worker := 'any'` leaves the view to
-/// whichever live worker claims it.
+/// `duckwake_start(view, worker :=)`: a named worker pins the view there; `worker := 'any'` leaves it to
+/// whichever live worker claims it; without a worker, the server's own, unpinned.
 struct Start;
 impl Spec for Start {
     const NAME: &'static str = "duckwake_start";
@@ -356,11 +357,14 @@ impl Spec for Start {
         vec![("worker", Varchar)]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
-        let worker = match a.opt("worker").map(String::from).or_else(|| api.default_worker()) {
-            Some(w) => w,
-            None => bail!("duckwake_start: name the worker, e.g. duckwake_start('{}', worker := 'w1')", a.arg(0)),
+        let named = a.opt("worker").map(String::from);
+        let default = api.default_worker();
+        let assign = match (&named, &default) {
+            (Some(w), _) => api::assign_named(w),
+            (None, Some(w)) => crate::catalog::Assign::Prefer(w),
+            (None, None) => bail!("duckwake_start: name the worker, e.g. duckwake_start('{}', worker := 'w1')", a.arg(0)),
         };
-        one(a.arg(0), api.with(|c| api::start(c, a.arg(0), &worker))?)
+        one(a.arg(0), api.with(|c| api::start(c, a.arg(0), assign))?)
     }
 }
 
@@ -542,6 +546,19 @@ impl Spec for Workers {
     }
 }
 
+/// `duckwake_drain(worker)`: the worker hands all its views to the others and takes none, before it is
+/// taken out for good.
+struct Drain;
+impl Spec for Drain {
+    const NAME: &'static str = "duckwake_drain";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        one(a.arg(0), api.with(|c| api::drain(c, a.arg(0)))?)
+    }
+}
+
 /// `duckwake_checkpoints(view, n := 10)`: the newest n checkpoints.
 struct Checkpoints;
 impl Spec for Checkpoints {
@@ -658,6 +675,8 @@ impl Spec for WorkerStart {
                 max_epochs: None,
                 refresh_every: std::time::Duration::from_secs(1),
                 lease_timeout: Some(std::time::Duration::from_secs(30)),
+                stop_grace: std::time::Duration::from_secs(60),
+                rebalance: Some(crate::failover::RebalanceConfig::default()),
                 stage_threads,
                 pipeline,
                 shared_readers,

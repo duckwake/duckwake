@@ -183,9 +183,26 @@ fn sasl_config(opts: &SourceOptions) -> Result<rskafka::client::SaslConfig> {
     })
 }
 
+/// A source's topic does not exist (yet): a view waits for it rather than failing, as Kafka consumers do.
+#[derive(Debug)]
+pub struct TopicMissing(pub String);
+
+impl std::fmt::Display for TopicMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "topic {:?} not found", self.0)
+    }
+}
+
+impl std::error::Error for TopicMissing {}
+
+/// Whether `e` (anywhere in its chain) is a missing topic.
+pub fn is_topic_missing(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<TopicMissing>().is_some())
+}
+
 pub async fn partitions(client: &Client, topic: &str) -> Result<Vec<i32>> {
     let topics = client.list_topics().await?;
-    let t = topics.into_iter().find(|t| t.name == topic).ok_or_else(|| anyhow!("topic {topic:?} not found"))?;
+    let t = topics.into_iter().find(|t| t.name == topic).ok_or_else(|| TopicMissing(topic.to_string()))?;
     Ok(t.partitions.into_iter().collect())
 }
 
