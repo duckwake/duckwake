@@ -283,10 +283,10 @@ mod tests {
         let env = |vars: &'static [(&'static str, &'static str)]| {
             move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        let minio = env(&[("AWS_ACCESS_KEY_ID", "k"), ("AWS_SECRET_ACCESS_KEY", "s"), ("AWS_ENDPOINT_URL", "http://localhost:59000/")]);
+        let minio = env(&[("AWS_ACCESS_KEY_ID", "k"), ("AWS_SECRET_ACCESS_KEY", "s"), ("AWS_ENDPOINT_URL", "http://localhost:19900/")]);
         let sql = s3_secret_sql("s3://duckwake/lake/", &minio).unwrap();
         assert!(sql.contains("SCOPE 's3://duckwake'"), "{sql}");
-        assert!(sql.contains("ENDPOINT 'localhost:59000', USE_SSL false, URL_STYLE 'path'"), "{sql}");
+        assert!(sql.contains("ENDPOINT 'localhost:19900', USE_SSL false, URL_STYLE 'path'"), "{sql}");
         let chain = s3_secret_sql("s3://b", &env(&[("AWS_REGION", "eu-west-1")])).unwrap();
         assert!(chain.contains("PROVIDER credential_chain") && chain.contains("REGION 'eu-west-1'") && !chain.contains("ENDPOINT"), "{chain}");
         assert!(s3_secret_sql("s3://b", &env(&[("AWS_ACCESS_KEY_ID", "k")])).is_err());

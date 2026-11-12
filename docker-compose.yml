@@ -37,7 +37,7 @@ services:
       retries: 30
 
   # S3-compatible storage for the object-storage tests (LAKE_STORAGE=s3 in scripts/lib.sh): bucket duckwake,
-  # key duckwake / duckwake-dev, S3 API on localhost:59000. MinIO no longer publishes community images to
+  # key duckwake / duckwake-dev, S3 API on localhost:19900. MinIO no longer publishes community images to
   # Docker Hub; Chainguard builds them from source.
   minio:
     image: cgr.dev/chainguard/minio:latest
@@ -52,7 +52,7 @@ services:
         (until mc alias set local http://localhost:9000 duckwake duckwake-dev >/dev/null 2>&1; do sleep 1; done
          mc mb -p local/duckwake) &
         exec minio server /tmp/data --address :9000 --console-address :9001
-    ports: ["59000:9000"]
+    ports: ["19900:9000"]
     healthcheck:
       test: ["CMD-SHELL", "mc ls local/duckwake >/dev/null"]
       interval: 2s

@@ -19,7 +19,7 @@ case $LAKE_STORAGE in
   "") export DUCKWAKE_DATA_PATH=".lake/test/data/" ;;
   s3)
     export DUCKWAKE_DATA_PATH="s3://duckwake/test/" AWS_ACCESS_KEY_ID=duckwake AWS_SECRET_ACCESS_KEY=duckwake-dev \
-      AWS_ENDPOINT_URL=http://localhost:59000 AWS_REGION=us-east-1 ;;
+      AWS_ENDPOINT_URL=http://localhost:19900 AWS_REGION=us-east-1 ;;
   *) echo "LAKE_STORAGE must be s3 or unset"; exit 1 ;;
 esac
 VIEWS=(clicks_per_window big_spend game_totals active_users all_events)
