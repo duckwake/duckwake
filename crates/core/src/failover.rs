@@ -249,17 +249,35 @@ pub fn claim(conn: &Connection, job: &str, from: Option<&str>, lease: i64, to: &
 }
 
 /// What one worker has seen of the others' heartbeats.
+///
+/// Silence is measured on this worker's clock, and only counts while this worker could write to the catalog
+/// itself: a peer is dead once its beat has not changed for the timeout *and* this worker has written enough
+/// heartbeats of its own meanwhile. When the catalog stalls for everyone (a PostgreSQL failover, an I/O
+/// hiccup, a long lock), nobody's beat moves, this one's included, so nobody is declared dead; without that,
+/// every worker would claim every other's views the moment the stall ends.
 pub struct Liveness {
     timeout: Duration,
     stop_grace: Duration,
-    /// Per worker: the last beat and state seen (beat None: no heartbeat table) and when either last changed,
-    /// on this clock.
-    seen: HashMap<String, (Option<i64>, WorkerState, Instant)>,
+    /// This worker's own heartbeats written so far, and how many must pass before a silent peer is dead.
+    beats: u64,
+    min_beats: u64,
+    /// Per worker: the last beat and state seen (beat None: no heartbeat table), when either last changed on
+    /// this clock, and this worker's own beat count then.
+    seen: HashMap<String, (Option<i64>, WorkerState, Instant, u64)>,
 }
 
 impl Liveness {
-    pub fn new(timeout: Duration, stop_grace: Duration) -> Self {
-        Liveness { timeout, stop_grace, seen: HashMap::new() }
+    /// `every` is how often this worker heartbeats; it must write half a timeout's worth of heartbeats (at
+    /// least 2) before it calls a silent peer dead.
+    pub fn new(timeout: Duration, stop_grace: Duration, every: Duration) -> Self {
+        let ratio = timeout.as_secs_f64() / every.as_secs_f64().max(1e-3);
+        let min_beats = ((ratio / 2.0).ceil() as u64).max(2);
+        Liveness { timeout, stop_grace, beats: 0, min_beats, seen: HashMap::new() }
+    }
+
+    /// This worker's own heartbeat just landed.
+    pub fn beat(&mut self) {
+        self.beats += 1;
     }
 
     /// Records the heartbeats read now, and the owners of running views (an owner with no heartbeat table,
@@ -274,22 +292,21 @@ impl Liveness {
         for (w, (beat, state)) in current {
             match self.seen.get_mut(&w) {
                 Some(s) if s.0 == beat && s.1 == state => {}
-                Some(s) => *s = (beat, state, now),
+                Some(s) => *s = (beat, state, now, self.beats),
                 None => {
-                    self.seen.insert(w, (beat, state, now));
+                    self.seen.insert(w, (beat, state, now, self.beats));
                 }
             }
         }
     }
 
-    /// Dead: stopped for `stop_grace`, or no change for `timeout` since this worker started watching it. A
-    /// worker first seen less than that ago gets the benefit of the doubt.
+    /// Dead: stopped for `stop_grace`, or no change for `timeout`, since this worker started watching it, and
+    /// with this worker's own heartbeats landing meanwhile. A worker first seen less than that ago gets the
+    /// benefit of the doubt.
     pub fn dead(&self, worker: &str, now: Instant) -> bool {
-        match self.seen.get(worker) {
-            Some((_, WorkerState::Stopped, since)) => now.duration_since(*since) >= self.stop_grace,
-            Some((_, _, since)) => now.duration_since(*since) >= self.timeout,
-            None => false,
-        }
+        let Some((_, state, since, at)) = self.seen.get(worker) else { return false };
+        let quiet = if *state == WorkerState::Stopped { self.stop_grace } else { self.timeout };
+        now.duration_since(*since) >= quiet && self.beats - at >= self.min_beats
     }
 
     /// Workers that may take views: running (not draining or stopped) and not dead.
@@ -709,17 +726,22 @@ mod tests {
     #[test]
     fn liveness_times_out_on_the_observer_clock() {
         let row = |id: &str, beat, state| WorkerRow { id: id.into(), beat, state, costs: HashMap::new(), cooling: HashSet::new() };
-        let mut l = Liveness::new(Duration::from_secs(10), Duration::from_secs(30));
+        // Heartbeats every 2 s with a 10 s timeout: 3 of its own beats before this worker calls anyone dead.
+        let mut l = Liveness::new(Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(2));
+        let beats = |l: &mut Liveness, n| (0..n).for_each(|_| l.beat());
         let t0 = Instant::now();
         l.observe(&[row("w1", 5, WorkerState::Running), row("w2", 7, WorkerState::Running)], std::iter::empty(), t0);
+        beats(&mut l, 4);
         let t1 = t0 + Duration::from_secs(8);
         l.observe(&[row("w1", 6, WorkerState::Running), row("w2", 7, WorkerState::Running)], std::iter::empty(), t1);
+        beats(&mut l, 1);
         let t2 = t0 + Duration::from_secs(11);
         assert!(!l.dead("w1", t2));
         assert!(l.dead("w2", t2));
         assert_eq!(l.targets(t2), vec!["w1".to_string()]);
         // A clean stop is a restart: dead only after the grace, and never a target meanwhile.
         l.observe(&[row("w1", 6, WorkerState::Stopped)], std::iter::empty(), t2);
+        beats(&mut l, 15);
         assert!(!l.dead("w1", t2 + Duration::from_secs(29)));
         assert!(l.dead("w1", t2 + Duration::from_secs(30)));
         assert!(l.targets(t2).is_empty());
@@ -727,5 +749,35 @@ mod tests {
         l.observe(&[row("w1", 7, WorkerState::Draining)], std::iter::empty(), t2);
         assert!(!l.dead("w1", t2));
         assert!(l.targets(t2).is_empty());
+    }
+
+    #[test]
+    fn a_catalog_stall_everyone_shares_kills_no_one() {
+        let row = |id: &str, beat| WorkerRow {
+            id: id.into(),
+            beat,
+            state: WorkerState::Running,
+            costs: HashMap::new(),
+            cooling: HashSet::new(),
+        };
+        let mut l = Liveness::new(Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(2));
+        let t0 = Instant::now();
+        l.observe(&[row("w1", 5), row("w2", 7)], std::iter::empty(), t0);
+        // The catalog stalls for 14 s: no beat lands anywhere, this worker's included.
+        let t1 = t0 + Duration::from_secs(14);
+        l.observe(&[row("w1", 5), row("w2", 7)], std::iter::empty(), t1);
+        assert!(!l.dead("w1", t1) && !l.dead("w2", t1));
+        // It ends: this worker beats once and w1 beats too; w2 does not yet, and is not dead after one beat.
+        l.beat();
+        let t2 = t1 + Duration::from_secs(2);
+        l.observe(&[row("w1", 6), row("w2", 7)], std::iter::empty(), t2);
+        assert!(!l.dead("w2", t2));
+        assert_eq!(l.targets(t2), vec!["w1".to_string(), "w2".to_string()]);
+        // w2 really is gone: dead at this worker's third beat since the stall.
+        l.beat();
+        assert!(!l.dead("w2", t2));
+        l.beat();
+        assert!(l.dead("w2", t2 + Duration::from_secs(4)));
+        assert!(!l.dead("w1", t2 + Duration::from_secs(4)));
     }
 }

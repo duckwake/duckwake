@@ -364,7 +364,11 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         lease_timeout_s = cfg.lease_timeout.map(|t| t.as_secs_f64()),
         "worker started"
     );
-    let liveness = failover::Liveness::new(cfg.lease_timeout.unwrap_or(Duration::MAX), cfg.stop_grace);
+    let liveness = failover::Liveness::new(
+        cfg.lease_timeout.unwrap_or(Duration::MAX),
+        cfg.stop_grace,
+        heartbeat_every(cfg.lease_timeout),
+    );
     let mut w = Worker {
         liveness,
         last_heartbeat: Instant::now(),
@@ -464,6 +468,7 @@ impl Worker {
                 let cooling: Vec<String> =
                     self.jobs.iter().filter(|(_, j)| j.started.elapsed() < cooldown).map(|(id, _)| id.clone()).collect();
                 failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len(), &costs, &cooling)?;
+                self.liveness.beat();
                 self.last_heartbeat = Instant::now();
             }
             if last_refresh.elapsed() >= self.cfg.refresh_every {

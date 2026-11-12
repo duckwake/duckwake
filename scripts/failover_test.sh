@@ -2,6 +2,8 @@
 # P2 failover gate: three workers share the test views, started without a worker so the workers spread them.
 # While events stream in, each way a worker can go away must move its views to the live workers within a
 # bounded time, with exact output:
+#   0. first, a catalog stall longer than the lease timeout (PostgreSQL holds every commit up): nobody is
+#      declared dead and no view moves.
 #   1. kill -9: its heartbeat stops; the views move once the lease timeout passes.
 #   2. a frozen worker (SIGSTOP): the same, even when it froze inside its catalog commit (PostgreSQL ends
 #      that session after the lease timeout); thawed (SIGCONT), it is a zombie whose commits are fenced and
@@ -12,7 +14,7 @@
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-120}
 LEASE_TIMEOUT=${LEASE_TIMEOUT:-10}   # seconds
-BOUND=$((LEASE_TIMEOUT + 10))        # kill to every view moved: the timeout, a refresh and a heartbeat
+BOUND=$((LEASE_TIMEOUT + 15))        # kill to every view moved: the timeout, 3 of the observer's own heartbeats, a refresh
 CLEAN_BOUND=${CLEAN_BOUND:-8}        # drain to every view moved
 failed=0
 
@@ -69,6 +71,23 @@ done
 owners | sed 's/^/  /'
 for w in w1 w2 w3; do [[ $(owned_by "$w") -ge 1 ]] || { echo "FAIL: $w got no view"; failed=1; }; done
 sleep 8
+
+log "0. the catalog stalls for 1.5x the lease timeout: every worker waits, none is declared dead"
+before=$(owners); claims0=$(cat "$OUT"/w*.log | grep -c 'claimed orphaned view' || true)
+# An exclusive lock on DuckLake's snapshot table holds up every commit, heartbeats included, while reads go on,
+# as a stalled disk or a long lock would: the worker whose commit lands first reads the others' heartbeats
+# before theirs land. (Before workers counted only time in which their own heartbeats landed, it claimed
+# their views.) The session is busy (pg_sleep), so the idle-in-transaction timeout spares it.
+docker compose exec -T postgres psql -q -U lake -d "$TEST_DB" -c \
+  "BEGIN; LOCK TABLE ducklake_snapshot IN EXCLUSIVE MODE; SELECT pg_sleep($((LEASE_TIMEOUT * 3 / 2))); COMMIT;" >/dev/null
+sleep "$LEASE_TIMEOUT"
+claims1=$(cat "$OUT"/w*.log | grep -c 'claimed orphaned view' || true)
+if [[ $(owners) == "$before" && $claims1 == "$claims0" ]]; then
+  echo "catalog stall of $((LEASE_TIMEOUT * 3 / 2))s: no view moved"
+else
+  echo "FAIL: views moved after a catalog stall ($((claims1 - claims0)) claims)"; owners | sed 's/^/  /'; failed=1
+fi
+for w in w1 w2 w3; do kill -0 "$(pid "$w")" 2>/dev/null || { echo "FAIL: $w died in the catalog stall"; failed=1; }; done
 
 log "1. kill -9 w1"
 kill -9 "$(pid w1)"; wait "$(pid w1)" 2>/dev/null || true

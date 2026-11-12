@@ -210,7 +210,12 @@ operator's semantics and a test oracle, not a dependency.
    A shared `workers` table would conflict the way `jobs` would (finding 1), so each worker owns
    `__duckwake.worker_<id>`, one row it updates every `lease_timeout / 5` (at most every 5 s), inlined in the
    catalog. A worker is dead when its `beat` counter has not moved for `--lease-timeout` (default 30 s) as
-   timed by the worker watching it, so clocks need not agree; a worker that stops cleanly marks itself
+   timed by the worker watching it, so clocks need not agree, and only over time in which the watcher's own
+   heartbeats landed: it must write half a timeout's worth of them (at least 2) meanwhile. A catalog stall
+   stops every heartbeat at once; in CI a 12 s stall on a 2-core runner (every commit waited, none failed)
+   made the worker that came out of it first claim the views of both its live peers, and in a larger
+   cluster every worker would have claimed every other's. A stall everyone shares now kills no one, and a
+   real death is still seen in the lease timeout. A worker that stops cleanly marks itself
    `stopped` and is dead once `--stop-grace` has passed (finding 15). In each refresh (every 2 s) a worker reads the heartbeats and the
    running views' leases, and claims its share of the orphans: views unassigned (`start` without a worker)
    or owned by a dead worker. Orphans go largest first, each to the live worker with the least load (finding

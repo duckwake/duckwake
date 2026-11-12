@@ -4,7 +4,7 @@
 #   1. One worker runs the five test views (big_spend pinned to it), started before their topics exist: the
 #      worker waits for the topics instead of failing the views.
 #   2. A second worker joins, then a third: views spread to them (view counts within one of each other), the
-#      pinned view stays, and no view moves twice within its cooldown.
+#      pinned view stays, no view moves twice within its cooldown, and no view is claimed (nobody died).
 #   3. Rolling restart: each worker stopped cleanly and started again within the stop grace keeps its views.
 #   4. Drain: a drained worker hands every view away and takes none.
 #   5. The pinned view's worker dies: the view fails over, then goes back when its worker returns.
@@ -67,6 +67,7 @@ check "every view started once its topic exists" 20 '[[ $(grep -c "job started" 
 if "$BIN" jobs | grep -q ' failed '; then echo "FAIL: a view was marked failed while its topic was missing"; failed=1; fi
 
 log "2. w2 joins, then w3: the views spread once their cooldown has passed"
+claims_alive=$(claims)
 run_worker w2
 check "spread over w1 and w2" $((COOLDOWN + 30)) 'spread w1 w2'
 run_worker w3
@@ -88,6 +89,8 @@ for line in sys.stdin:
     last[job] = t
 sys.exit(bad)' "$COOLDOWN" || failed=1
 echo "handoffs so far: $(handoffs)"
+# Every worker is alive throughout: a claim here is a false failover (a stalled catalog judged as death).
+[[ $(claims) == "$claims_alive" ]] || { echo "FAIL: views claimed while every worker was alive"; failed=1; }
 
 log "3. rolling restart: each worker stopped and started again within the stop grace keeps its views"
 claims_before=$(claims)

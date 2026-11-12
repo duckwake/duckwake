@@ -86,7 +86,9 @@ Every worker heartbeats into the lake, and the workers move views between themse
 
 - **A view's topic does not exist yet**: the view waits for it (logged once) and starts when it appears.
 - **A worker dies** (killed, frozen, its machine gone): its views move to the live workers once its heartbeat
-  has not moved for `--lease-timeout` (default `30s`), and continue from their last checkpoint.
+  has not moved for `--lease-timeout` (default `30s`), and continue from their last checkpoint. Only time
+  in which the watching worker's own heartbeats land counts, so a catalog stall that holds everyone up (a
+  PostgreSQL failover, a slow disk) moves nothing.
 - **A worker stops cleanly** (Ctrl-C, SIGTERM): it is taken to be restarting, so its views wait
   `--stop-grace` (default `60s`) for it and do not move during a rolling restart. To take a worker out for
   good, `drain` it first: `duckwake drain w3` (or `CALL duckwake_drain('w3')`) hands all its views to the
