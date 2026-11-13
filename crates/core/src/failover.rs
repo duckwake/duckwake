@@ -73,7 +73,11 @@ impl WorkerState {
 
 /// Creates the worker's heartbeat table if needed and marks it running with a fresh beat (a restart also
 /// ends a drain).
-pub fn register(conn: &Connection, worker: &str) -> Result<()> {
+/// This build's version, recorded in each worker's heartbeat row (`duckwake workers`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Registers the worker as running; `metrics` is where its Prometheus endpoint is reached, if it has one.
+pub fn register(conn: &Connection, worker: &str, metrics: Option<&str>) -> Result<()> {
     check_worker_id(worker)?;
     let wt = worker_table(worker);
     retry_conflicts(|| {
@@ -88,21 +92,26 @@ pub fn register(conn: &Connection, worker: &str) -> Result<()> {
     add_column(conn, &table, "load", "DOUBLE")?;
     add_column(conn, &table, "costs", "VARCHAR")?;
     add_column(conn, &table, "cooling", "VARCHAR")?;
+    add_column(conn, &table, "version", "VARCHAR")?;
+    add_column(conn, &table, "metrics_addr", "VARCHAR")?;
     retry_conflicts(|| {
         let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {wt}"), [], |r| r.get(0))?;
         if n == 0 {
             conn.execute(
                 &format!(
-                    "INSERT INTO {wt} (worker_id, state, beat, jobs, started_at, heartbeat_at, load, costs, cooling)
-                     VALUES (?, 'running', 1, 0, now(), now(), 0, '{{}}', '[]')"
+                    "INSERT INTO {wt} (worker_id, state, beat, jobs, started_at, heartbeat_at, load, costs, cooling, version, metrics_addr)
+                     VALUES (?, 'running', 1, 0, now(), now(), 0, '{{}}', '[]', ?, ?)"
                 ),
-                [worker],
+                duckdb::params![worker, VERSION, metrics],
             )?;
         } else {
-            conn.execute_batch(&format!(
-                "UPDATE {wt} SET state = 'running', beat = beat + 1, jobs = 0, load = 0, costs = '{{}}', cooling = '[]',
-                   started_at = now(), heartbeat_at = now()"
-            ))?;
+            conn.execute(
+                &format!(
+                    "UPDATE {wt} SET state = 'running', beat = beat + 1, jobs = 0, load = 0, costs = '{{}}', cooling = '[]',
+                       started_at = now(), heartbeat_at = now(), version = ?, metrics_addr = ?"
+                ),
+                duckdb::params![VERSION, metrics],
+            )?;
         }
         Ok(())
     })
@@ -158,6 +167,32 @@ fn worker_tables(conn: &Connection) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// How long a worker that stopped heartbeating stays a scrape target: long enough for `DuckWakeWorkerDown` to
+/// fire and be seen, not for ever.
+const SCRAPE_DEAD_FOR: &str = "1 hour";
+
+/// The metrics endpoints of the workers that should be scraped: every worker with an endpoint that has not
+/// stopped cleanly (a drained or restarting one included) and has heartbeated within the last hour. A crashed
+/// worker stays listed for that hour, so its failed scrapes raise the alert; a cleanly stopped one leaves.
+pub fn scrape_targets(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut parts = Vec::new();
+    for t in worker_tables(conn)? {
+        if crate::lake::has_column(conn, &t, "metrics_addr")? {
+            parts.push(format!(
+                "SELECT worker_id, metrics_addr FROM {CTL}.{} WHERE metrics_addr IS NOT NULL AND state <> 'stopped'
+                   AND heartbeat_at > now() - INTERVAL '{SCRAPE_DEAD_FOR}'",
+                ident(&t)
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("{} ORDER BY worker_id", parts.join(" UNION ALL ")))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<duckdb::Result<Vec<_>>>()?)
+}
+
 /// A worker's heartbeat row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerRow {
@@ -205,20 +240,29 @@ pub fn workers_query(conn: &Connection) -> Result<String> {
     if tables.is_empty() {
         return Ok("SELECT NULL::VARCHAR AS worker, NULL::VARCHAR AS state, NULL::INTEGER AS views, NULL::DOUBLE AS load,
                           NULL::BIGINT AS beat, NULL::TIMESTAMP AS started_at, NULL::TIMESTAMP AS heartbeat_at,
-                          NULL::DOUBLE AS heartbeat_age_s WHERE false"
+                          NULL::DOUBLE AS heartbeat_age_s, NULL::VARCHAR AS version, NULL::VARCHAR AS metrics WHERE false"
             .into());
     }
     let rows = tables
         .iter()
         .map(|t| {
-            format!("SELECT worker_id, state, jobs, load, beat, started_at, heartbeat_at FROM {CTL}.{}", ident(t))
+            // A worker that last ran an older version has no version column yet.
+            let col = |c: &str| -> Result<String> {
+                Ok(if crate::lake::has_column(conn, t, c)? { c.to_string() } else { format!("NULL::VARCHAR AS {c}") })
+            };
+            Ok(format!(
+                "SELECT worker_id, state, jobs, load, beat, started_at, heartbeat_at, {}, {} FROM {CTL}.{}",
+                col("version")?,
+                col("metrics_addr")?,
+                ident(t)
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>>>()?
         .join(" UNION ALL ");
     Ok(format!(
         "SELECT worker_id AS worker, state, jobs AS views, round(coalesce(load, 0), 3) AS load, beat,
                 started_at::TIMESTAMP AS started_at, heartbeat_at::TIMESTAMP AS heartbeat_at,
-                round(epoch(now() - heartbeat_at), 1) AS heartbeat_age_s
+                round(epoch(now() - heartbeat_at), 1) AS heartbeat_age_s, version, metrics_addr AS metrics
          FROM ({rows}) ORDER BY worker"
     ))
 }

@@ -78,15 +78,19 @@ struct WorkerState {
 }
 
 /// How the in-process worker stages and commits (the `run` flags of the same names).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WorkerOpts {
     pub stage_threads: usize,
     pub pipeline: bool,
     pub shared_readers: bool,
     pub lean_commit: bool,
+    /// Where to serve the worker's Prometheus metrics, if anywhere.
+    pub metrics: Option<String>,
 }
 
 struct App {
+    /// Prometheus metrics of the in-process worker, served with `--metrics`.
+    metrics: Option<Arc<duckwake_core::metrics::Metrics>>,
     lake: LakeConfig,
     conn: Mutex<Connection>,
     rt: Handle,
@@ -139,7 +143,17 @@ pub fn run(
     let conn = lake.open()?;
     duckwake_core::lake::bootstrap(&conn)?;
     let shutdown = Arc::new(AtomicBool::new(false));
+    let metrics = match opts.metrics.clone().filter(|a| a != "none") {
+        Some(addr) => {
+            let m = Arc::new(duckwake_core::metrics::Metrics::default());
+            m.serve_http(&addr, rt.handle())?;
+            tracing::info!(addr = %addr, "metrics at /metrics");
+            Some(m)
+        }
+        None => None,
+    };
     let app = Arc::new(App {
+        metrics,
         lake,
         conn: Mutex::new(conn),
         rt: rt.handle().clone(),
@@ -213,13 +227,16 @@ fn spawn_worker(app: Shared) -> std::thread::JoinHandle<()> {
                 pipeline: app.opts.pipeline,
                 shared_readers: app.opts.shared_readers,
                 lean_commit: app.opts.lean_commit,
-                metrics: None,
+                metrics: app.metrics.clone(),
             };
             let res = engine::run_worker(cfg, app.rt.clone(), app.shutdown.clone());
             let mut w = app.worker.lock().unwrap();
             w.running = false;
             if let Err(e) = res {
                 let msg = format!("{e:#}");
+                if let Some(m) = &app.metrics {
+                    m.record_failure(&msg);
+                }
                 tracing::error!(error = %msg, "worker failed; restarting from the last checkpoint in 3 s");
                 w.last_error = Some(msg);
                 w.restarts += 1;
@@ -691,6 +708,8 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
                 epoch_interval: r.epoch_interval.as_deref().unwrap_or("5s"),
                 max_rows: 100_000,
                 inline_row_limit: 10_000,
+                limits: Default::default(),
+                replace: false,
             },
         )?;
         if r.start.unwrap_or(true) {

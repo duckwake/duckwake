@@ -69,7 +69,7 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
 
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
-    let sources = catalog::load_sources(conn)?;
+    let sources = catalog::view_sources(&def, catalog::load_sources(conn)?);
     let plan = catalog::compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
     // The view's inputs, the first holding a windowed view's only stream: Kafka sources or lake inputs.
     let names = plan.sources();

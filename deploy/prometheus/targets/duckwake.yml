@@ -1,0 +1,4 @@
+# Workers that discovery cannot list (prometheus.yml finds the others in the lake through a worker's /sd), e.g.
+#   - targets: ["10.0.0.7:9464"]
+# A target that is down fires DuckWakeWorkerDown.
+[]

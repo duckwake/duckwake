@@ -1,0 +1,150 @@
+# Prometheus alerting rules for DuckWake workers (`duckwake run --metrics`, `duckwaked`).
+# Scrape every worker with job="duckwake". critical pages; warning opens a ticket.
+# What each alert means and what to do first: docs/alerts.md. Unit tests: duckwake-alerts.test.yml.
+groups:
+  - name: duckwake-workers
+    rules:
+      - alert: DuckWakeWorkerDown
+        expr: up{job="duckwake"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DuckWake worker {{ $labels.instance }} cannot be scraped"
+          description: "No metrics from {{ $labels.instance }} for 2 minutes. Its views move to the other workers after the lease timeout; with a single worker, nothing runs."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeworkerdown
+
+      - alert: DuckWakeNoWorkers
+        expr: absent(up{job="duckwake"} == 1)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No DuckWake worker is up"
+          description: "No worker has been scraped successfully for 5 minutes: no view is running."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakenoworkers
+
+      - alert: DuckWakeWorkerRestarting
+        expr: increase(duckwake_worker_restarts_total[15m]) >= 3 or duckwake_worker_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DuckWake worker {{ $labels.worker }} keeps failing"
+          description: "The supervised worker failed and restarted at least 3 times in 15 minutes, or is waiting to restart. duckwake_worker_status() shows the last error."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeworkerrestarting
+
+      - alert: DuckWakeOutOfMemory
+        expr: increase(duckwake_out_of_memory_total[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker {{ $labels.worker }} ran out of memory and shrank its epochs"
+          description: "An epoch did not fit in the DuckDB memory limit; the worker now reads at most duckwake_epoch_rows_cap rows per epoch until it restarts. Raise --memory-limit or move views away."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeoutofmemory
+
+      - alert: DuckWakeCommitSlow
+        expr: rate(duckwake_commit_seconds_sum[10m]) / rate(duckwake_epochs_total[10m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Epoch commits on {{ $labels.worker }} take {{ $value | humanizeDuration }} on average"
+          description: "The catalog (PostgreSQL) or object storage is slow, or the worker commits too much per epoch."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakecommitslow
+
+      - alert: DuckWakeCommitConflicts
+        expr: rate(duckwake_commit_conflicts_total[15m]) / rate(duckwake_epochs_total[15m]) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of epoch commits on {{ $labels.worker }} conflict"
+          description: "DuckLake write conflicts are retried, but this many cost throughput: control-table writes from many workers, or maintenance running too often."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakecommitconflicts
+
+  - name: duckwake-views
+    rules:
+      - alert: DuckWakeViewFailed
+        expr: increase(duckwake_views_failed_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A view on {{ $labels.worker }} failed"
+          description: "A view went over a limit, an input broke a promise it relies on, or it could not start. `duckwake jobs` shows which; the worker log names the reason."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewfailed
+
+      - alert: DuckWakeViewStuck
+        expr: duckwake_lag_events > 0 and changes(duckwake_epoch[10m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "View {{ $labels.view }} has events waiting and commits nothing"
+          description: "{{ $value }} events are waiting and the view has not committed an epoch in 15 minutes."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewstuck
+
+      - alert: DuckWakeViewFallingBehind
+        expr: >
+          duckwake_freshness_seconds > clamp_min(3 * duckwake_epoch_interval_seconds, 30)
+          and duckwake_lag_events > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "View {{ $labels.view }} is {{ $value | humanizeDuration }} behind its events"
+          description: "Its newest committed event is more than 3 epoch intervals old while events are waiting. An idle topic does not fire this."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewfallingbehind
+
+      - alert: DuckWakeLagGrowing
+        expr: deriv(duckwake_lag_events[30m]) > 0 and min_over_time(duckwake_lag_events[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "View {{ $labels.view }} falls further behind its topic"
+          description: "Its lag has grown for 30 minutes without catching up once: the worker cannot keep up with the input rate."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakelaggrowing
+
+      - alert: DuckWakeWatermarkStuck
+        expr: >
+          duckwake_watermark_delay_seconds
+            > 2 * duckwake_watermark_delay_setting_seconds + 3 * duckwake_epoch_interval_seconds + 60
+          and duckwake_lag_events > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The watermark of {{ $labels.view }} is {{ $value | humanizeDuration }} behind"
+          description: "Windows do not close: a partition with old events, a producer clock behind, or an idle_timeout longer than the gap."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakewatermarkstuck
+
+      - alert: DuckWakeStateNearLimit
+        expr: duckwake_state_rows > 0.8 * duckwake_max_state_rows
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The state of {{ $labels.view }} is at {{ $value }} rows, over 80% of its limit"
+          description: "At max_state_rows the view fails. Raise the limit with alter-view, or bound the view."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakestatenearlimit
+
+      - alert: DuckWakeDeadLetters
+        expr: rate(duckwake_dead_letters_total[10m]) / rate(duckwake_rows_in_total[10m]) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of the events of {{ $labels.view }} cannot be decoded"
+          description: "They go to __duckwake.dead_letter with the error. A producer changed its format, or a source column has the wrong type."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakedeadletters
+
+      - alert: DuckWakeLateRows
+        expr: rate(duckwake_late_rows_total[10m]) / rate(duckwake_rows_in_total[10m]) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of the events of {{ $labels.view }} arrive after their window closed"
+          description: "They go to the late-data table, not the view. watermark_delay is shorter than the real disorder of the events."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakelaterows

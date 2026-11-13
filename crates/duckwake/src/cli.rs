@@ -27,8 +27,13 @@ struct Cli {
     /// Where DuckLake writes data files.
     #[arg(long, global = true, env = "DUCKWAKE_DATA_PATH", default_value = ".lake/data/")]
     data_path: String,
+    /// DuckDB's memory limit per process, e.g. 2GB (default: 80% of RAM, too much with several workers on a
+    /// machine). Past it, DuckDB spills to --temp-dir.
     #[arg(long, global = true, env = "DUCKWAKE_MEMORY_LIMIT")]
     memory_limit: Option<String>,
+    /// Where DuckDB spills; a worker uses <temp-dir>/<worker id> and clears it at start (default .tmp).
+    #[arg(long, global = true, env = "DUCKWAKE_TEMP_DIR")]
+    temp_dir: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -65,6 +70,30 @@ enum Cmd {
         max_rows: usize,
         #[arg(long, default_value_t = 10_000)]
         inline_row_limit: usize,
+        /// Fail the view once its state holds more rows than this (open windows, groups or distinct rows).
+        #[arg(long)]
+        max_state_rows: Option<u64>,
+        /// Fail the view when one epoch writes more late rows than this (a broken watermark or clock).
+        #[arg(long)]
+        max_late_rows: Option<u64>,
+        /// Replace the view if it exists (CREATE OR REPLACE): it recomputes from the start, keeping its
+        /// status and worker.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// duckwake_add_source_column(source, column, type): views that read the source keep their columns.
+    AddSourceColumn { source: String, column: String, r#type: String },
+    /// duckwake_alter_view(view, ...): how a view runs, not what it computes; a limit of 0 removes it.
+    AlterView {
+        name: String,
+        #[arg(long)]
+        epoch_interval: Option<String>,
+        #[arg(long)]
+        max_rows: Option<usize>,
+        #[arg(long)]
+        max_state_rows: Option<u64>,
+        #[arg(long)]
+        max_late_rows: Option<u64>,
     },
     /// duckwake_start(view): assign to a worker (bumps the lease, fencing the previous owner).
     Start {
@@ -108,6 +137,9 @@ enum Cmd {
     Run {
         #[command(flatten)]
         w: WorkerArgs,
+        /// Serve Prometheus metrics (`GET /metrics`, `GET /healthz`) on this address, e.g. 0.0.0.0:9187.
+        #[arg(long, env = "DUCKWAKE_METRICS")]
+        metrics: Option<String>,
     },
     /// Run a worker and serve the duckwake_* SQL functions and the lake over Quack, plus Prometheus metrics
     /// (the `duckwaked` daemon).
@@ -185,6 +217,10 @@ enum Cmd {
         shared_readers: bool,
         #[arg(long)]
         lean_commit: bool,
+        /// Serve the worker's Prometheus metrics (`GET /metrics`) on this address, e.g. 127.0.0.1:19187, for the
+        /// Grafana dashboard (docs/alerts.md).
+        #[arg(long, env = "DUCKWAKE_METRICS")]
+        metrics: Option<String>,
     },
 }
 
@@ -313,7 +349,12 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         )
         .with(ui_layer)
         .init();
-    let lake_cfg = LakeConfig { catalog: cli.catalog.clone(), data_path: cli.data_path.clone(), memory_limit: cli.memory_limit.clone() };
+    let lake_cfg = LakeConfig {
+        catalog: cli.catalog.clone(),
+        data_path: cli.data_path.clone(),
+        memory_limit: cli.memory_limit.clone(),
+        temp_dir: cli.temp_dir.clone(),
+    };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
     let open = || -> Result<duckdb::Connection> {
         let c = lake_cfg.open()?;
@@ -329,7 +370,19 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::CreateSource { name, kind, options } => {
             println!("{}", api::create_source(&open()?, &name, &kind, &options)?);
         }
-        Cmd::CreateView { name, sql, sink, late_data, checkpoint, epoch_interval, max_rows, inline_row_limit } => {
+        Cmd::CreateView {
+            name,
+            sql,
+            sink,
+            late_data,
+            checkpoint,
+            epoch_interval,
+            max_rows,
+            inline_row_limit,
+            max_state_rows,
+            max_late_rows,
+            replace,
+        } => {
             if sink.is_some() {
                 eprintln!("warning: --sink is deprecated; name the view after its table: create-view analytics.<table>");
             }
@@ -339,10 +392,20 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 epoch_interval: Some(epoch_interval),
                 max_rows: Some(max_rows),
                 inline_row_limit: Some(inline_row_limit),
+                max_state_rows,
+                max_late_rows,
+                replace,
             };
             let (def, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
             println!("{msg} {:?}", def.plan.sink_columns);
             println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
+        }
+        Cmd::AddSourceColumn { source, column, r#type } => {
+            println!("{}", api::add_source_column(&open()?, &source, &column, &r#type)?)
+        }
+        Cmd::AlterView { name, epoch_interval, max_rows, max_state_rows, max_late_rows } => {
+            let a = catalog::AlterView { epoch_interval, max_rows, max_state_rows, max_late_rows };
+            println!("{}", api::alter_view(&open()?, &name, &a)?)
         }
         Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, api::assign_named(&worker))?),
         Cmd::Drain { worker } => println!("{}", api::drain(&open()?, &worker)?),
@@ -365,9 +428,16 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             let conn = open()?;
             print_query(&conn, &api::checkpoints_sql(&conn, &name, limit)?)?;
         }
-        Cmd::Run { w } => {
+        Cmd::Run { w, metrics } => {
             let shutdown = shutdown_on_signal(&rt);
-            engine::run_worker(w.config(&lake_cfg)?, rt.handle().clone(), shutdown)?;
+            let mut cfg = w.config(&lake_cfg)?;
+            if let Some(addr) = metrics.filter(|a| a != "none") {
+                let m = Arc::new(duckwake_core::metrics::Metrics::default());
+                m.serve_http(&addr, rt.handle())?;
+                tracing::info!(addr = %addr, "metrics at /metrics");
+                cfg.metrics = Some(m);
+            }
+            engine::run_worker(cfg, rt.handle().clone(), shutdown)?;
         }
         Cmd::Serve { w, s } => {
             return serve::run(&lake_cfg, rt, &w, &s);
@@ -392,8 +462,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             };
             println!("VERIFY OK: {name} output matches batch recomputation over {scope} (epoch {}, watermark {})", r.epoch, r.watermark);
         }
-        Cmd::Playground { port, worker, brokers, stage_threads, pipeline, shared_readers, lean_commit } => {
-            let opts = playground::WorkerOpts { stage_threads, pipeline, shared_readers, lean_commit };
+        Cmd::Playground { port, worker, brokers, stage_threads, pipeline, shared_readers, lean_commit, metrics } => {
+            let opts = playground::WorkerOpts { stage_threads, pipeline, shared_readers, lean_commit, metrics };
             return playground::run(lake_cfg, rt, worker, opts, brokers, port, logs);
         }
         Cmd::Sql { query, csv, server: Some(server), token, .. } => {

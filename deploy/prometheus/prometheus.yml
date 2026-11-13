@@ -1,0 +1,26 @@
+# Prometheus for DuckWake (Linux, host network; docker-compose.mac.yml uses prometheus.mac.yml instead).
+# Workers are discovered from the lake: each worker with --metrics records its address in its heartbeat row, and
+# every worker serves the list of all live ones at GET /sd. Prometheus asks one of them; add a second http_sd_configs
+# entry for another worker if the first may be down (Prometheus keeps the last list it got meanwhile).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+rule_files:
+  - /etc/prometheus/duckwake-alerts.yml
+scrape_configs:
+  - job_name: duckwake
+    http_sd_configs:
+      - url: http://localhost:9464/sd
+        refresh_interval: 15s
+    # Workers discovery cannot reach (another lake, another network), listed by hand.
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/duckwake*.yml"]
+    relabel_configs:
+      # Name each target after its worker rather than host:port.
+      - source_labels: [__meta_duckwake_worker]
+        regex: (.+)
+        target_label: instance
+  - job_name: node
+    # The machines, through node_exporter: CPU, memory, network, disk.
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/node*.yml"]

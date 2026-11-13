@@ -136,10 +136,8 @@ impl SourceOptions {
         if !o.columns.iter().any(|(c, t)| c == &o.event_time && t.eq_ignore_ascii_case("TIMESTAMP")) {
             bail!("event_time column {:?} must be listed in columns with type TIMESTAMP", o.event_time);
         }
-        for (c, _) in &o.columns {
-            if c.starts_with('_') || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-                bail!("column {c:?}: use [A-Za-z0-9_] and do not start with '_' (reserved)");
-            }
+        for (c, t) in &o.columns {
+            check_column(c, t)?;
         }
         parse_duration(&o.watermark_delay)?;
         parse_duration(&o.idle_timeout)?;
@@ -157,6 +155,18 @@ impl SourceOptions {
         o.check_security()?;
         Ok(o)
     }
+}
+
+/// A source column's name and type: names are `[A-Za-z0-9_]` and do not start with `_` (reserved for
+/// DuckWake's own columns); a type is a DuckDB type name, such as `VARCHAR`, `DECIMAL(18,2)` or `INTEGER[]`.
+pub fn check_column(name: &str, ty: &str) -> Result<()> {
+    if name.is_empty() || name.starts_with('_') || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        bail!("column {name:?}: use [A-Za-z0-9_] and do not start with '_' (reserved)");
+    }
+    if ty.trim().is_empty() || !ty.chars().all(|ch| ch.is_ascii_alphanumeric() || " _(),[]".contains(ch)) {
+        bail!("column {name}: type {ty:?} is not a DuckDB type name");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +190,32 @@ pub struct JobDef {
     /// (`start: latest`); its first checkpoint starts from here.
     #[serde(default)]
     pub start_snapshot: Option<i64>,
+    /// The columns of each Kafka source the view reads, as they were when it was created: a column added to
+    /// the source later (`add_source_column`) does not change the view's shape. Empty in views made before
+    /// columns could be added, which read the source's columns as they are.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub source_columns: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// Limits that fail the view (status `failed`, the worker and its other views go on) instead of letting
+    /// it grow without bound. None: no limit.
+    #[serde(default, skip_serializing_if = "Limits::is_none")]
+    pub limits: Limits,
+}
+
+/// A view's limits; `alter_view` changes them without recomputing the view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Most rows the view's state may hold (open windows, groups or distinct rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_state_rows: Option<u64>,
+    /// Most late rows one epoch may write: more means a broken watermark or clock, not late data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_late_rows: Option<u64>,
+}
+
+impl Limits {
+    pub fn is_none(&self) -> bool {
+        self.max_state_rows.is_none() && self.max_late_rows.is_none()
+    }
 }
 
 /// The column every lake input adds: the commit time of the change, as the running maximum of
@@ -360,5 +396,29 @@ mod tests {
         assert_eq!(parse_duration("1 minute").unwrap(), Duration::from_secs(60));
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert!(parse_duration("1 fortnight").is_err());
+    }
+
+    #[test]
+    fn column_names_and_types() {
+        check_column("country", "VARCHAR").unwrap();
+        check_column("price", "DECIMAL(18, 2)").unwrap();
+        check_column("tags", "VARCHAR[]").unwrap();
+        assert!(check_column("_epoch", "BIGINT").is_err(), "reserved prefix");
+        assert!(check_column("a-b", "BIGINT").is_err());
+        assert!(check_column("", "BIGINT").is_err());
+        assert!(check_column("x", "INT); DROP TABLE t; --").is_err());
+        assert!(check_column("x", "INT'").is_err());
+        assert!(check_column("x", " ").is_err());
+    }
+
+    #[test]
+    fn limits_are_optional_in_stored_definitions() {
+        // Definitions written before limits existed have no `limits` key.
+        let l: Limits = serde_json::from_str("{}").unwrap();
+        assert!(l.is_none());
+        let l: Limits = serde_json::from_str(r#"{"max_state_rows": 10}"#).unwrap();
+        assert_eq!(l, Limits { max_state_rows: Some(10), max_late_rows: None });
+        // And nothing is written when there are none, so older versions read new definitions too.
+        assert_eq!(serde_json::to_string(&Limits::default()).unwrap(), "{}");
     }
 }

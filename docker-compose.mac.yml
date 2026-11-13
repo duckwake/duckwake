@@ -1,0 +1,10 @@
+# The monitoring profile on Docker Desktop or Rancher Desktop for Mac, where the host network is the VM's: Prometheus
+# runs on the bridge network and reaches workers on the Mac through host.docker.internal (prometheus.mac.yml).
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml --profile monitoring up -d prometheus grafana
+#   target/release/duckwake playground --metrics 127.0.0.1:9464
+services:
+  prometheus:
+    network_mode: bridge
+    ports: ["19090:19090"]
+    volumes:
+      - ./deploy/prometheus/prometheus.mac.yml:/etc/prometheus/prometheus.yml:ro

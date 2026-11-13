@@ -271,6 +271,26 @@ operator's semantics and a test oracle, not a dependency.
    away, failed over when W dies, handed back when W is live. `scripts/rebalance_test.sh` is the gate:
    joining workers, a settled cluster making no moves, a rolling restart keeping every view in place, drain,
    a pinned view failing over and going home, and a `kill -9` in the middle of a drain, with exact output.
+16. **A view that stops must not take its epoch with it.** A view stops alone when an insert-only input changes
+   or (since P4) when it goes over a limit. The worker used to throw the whole staged epoch away and stage it
+   again: but its readers had already handed over those events, so its other views lost them
+   (`scripts/limits_test.sh` caught it: 202 rows missing from a view no limit touched). The stopped view is now
+   left out of the epoch and the others commit it. Replacing and dropping running views brought two more
+   races: `stop` did not fence, so an epoch in flight could land after a `drop` began, and a commit that found
+   its view's lease table dropped failed the worker. `stop` and `pause` now bump the lease, and a commit treats
+   a vanished lease table as fenced.
+17. **DuckDB does not always spill.** Under a tight memory limit DuckDB spills joins and aggregates, but an
+   epoch's inserts into DuckLake still failed with Out of Memory (64 MB limit, 1M-row epochs), so a worker in
+   that state would fail on the same epoch forever. Workers now run with `preserve_insertion_order = false`
+   (nothing they run depends on it, and inserts then stream), and an epoch that still runs out of memory makes
+   the worker start again from its checkpoints, in a fresh instance, with half as many rows per epoch. Each
+   worker spills into its own directory, emptied at start: DuckDB's default `.tmp` is shared by every
+   process started in the same directory.
+18. **Adding a source column must not change running views.** A view's plan is compiled again at every start,
+   from the source's columns as they are: a `SELECT *` view would grow a column its table does not have and
+   be refused. Each view now stores the columns of each source it read when it was created, and is compiled
+   against those; adding a column records them, in the same transaction, for views made before this.
+
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
@@ -333,5 +353,6 @@ crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
 docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
-scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, reset, retention, decode, shared-reader, server and extension tests; benchmark
+deploy/          Prometheus alerting rules and their tests, scrape config, Grafana dashboard and provisioning
+scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, schema, limits, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

@@ -29,6 +29,7 @@ pub fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
         catalog: env("DUCKWAKE_CATALOG", "postgres:dbname=lake host=localhost port=55432 user=lake password=lake"),
         data_path: env("DUCKWAKE_DATA_PATH", ".lake/data/"),
         memory_limit: std::env::var("DUCKWAKE_MEMORY_LIMIT").ok(),
+        temp_dir: std::env::var("DUCKWAKE_TEMP_DIR").ok(),
     };
     sql_functions::register(&con, &Api::local(lake, runtime().handle().clone())).map_err(|e| format!("{e:#}"))?;
     Ok(())

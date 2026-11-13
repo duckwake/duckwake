@@ -20,7 +20,9 @@ reads is refused.
 | Function | Does |
 | --- | --- |
 | `duckwake_create_source(name, kind, options_json)` | register a Kafka source |
-| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=)` | create the table `name` and its job |
+| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=, replace :=)` | create the table `name` and its job; `replace := true` replaces an existing view, which recomputes from the start ([details](cli.md#changing-views-and-sources)) |
+| `duckwake_add_source_column(source, column, type)` | add a column to a source; views that read it keep their columns |
+| `duckwake_alter_view(view, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=)` | change how a view runs without recomputing it; a limit of 0 removes it ([limits](cli.md#limits)) |
 | `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` puts the view on the server's worker, `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it |
 | `duckwake_reset(view, to_epoch)` / `duckwake_drop(view, keep_table :=)` | rewind and replay / remove |
 | `duckwake_jobs()` / `duckwake_checkpoints(view, n :=)` / `duckwake_sources()` | status, history, sources |
@@ -46,7 +48,9 @@ Only in the extension:
 | SQL function (server, extension) | CLI |
 | --- | --- |
 | `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
-| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows]` |
+| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--replace]` |
+| `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |
+| `duckwake_alter_view(view, ...)` | `alter-view NAME [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows]` |
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME [--worker W]` (default `any`) / `stop` / `pause` |
 | `duckwake_workers()` / `duckwake_drain(worker)` | `workers` / `drain WORKER` |
 | `duckwake_jobs()` / `duckwake_checkpoints(view)` | `jobs` / `checkpoints NAME` |

@@ -62,11 +62,17 @@ default.
 
 - [ ] **Runbook.** Deploy, scale, move views between workers, recover from a bad epoch (`reset`), handle a
       failed view, rotate tokens.
-- [ ] **Alerts and a dashboard** for the design's thresholds (freshness, lag, epoch duration, commit latency
-      and conflicts, restarts) on top of `/metrics`.
-- [ ] **Schema changes.** `OR REPLACE` for views; adding source columns without recreating.
-- [ ] **Limits.** Per-view caps on state size and late-data growth; worker memory limits enforced and tested.
-- [ ] **Distribution.** A public image and extension repository, versioning and a changelog.
+- [x] **Alerts and a dashboard** for the design's thresholds (freshness, lag, epoch duration, commit latency
+      and conflicts, restarts) on top of `/metrics`. Prometheus rules with `promtool` unit tests, a Grafana
+      dashboard and a compose profile in `deploy/`; [alerts.md](alerts.md) says what to do for each. To tune with
+      the soak's numbers (P3).
+- [x] **Schema changes.** `OR REPLACE` for views; adding source columns without recreating; `alter-view` for
+      settings (`scripts/schema_test.sh`).
+- [x] **Limits.** Per-view caps on state size and late-data growth; worker memory limits enforced and tested
+      (`scripts/limits_test.sh`).
+- [x] **Distribution.** Versioning and a changelog ([releasing.md](releasing.md)); release binaries with
+      checksums, the multi-arch image and the extension repository. Making the image and extension public is
+      the organization's call: ghcr.io package visibility, and `PUBLISH_EXTENSIONS` for the website.
 
 **Gate:** an on-call engineer can run the drills from the runbook alone.
 
