@@ -87,8 +87,9 @@ unreachable, credentials, disk full).
 
 **warning.** An epoch did not fit in the DuckDB memory limit (`--memory-limit`). The worker started again from its
 checkpoints with half as many rows per epoch (`duckwake_epoch_rows_cap`), and keeps that cap until it restarts:
-output stays exact, but throughput drops. Raise `--memory-limit` if the machine has room, move views to other
-workers (`duckwake drain`, `start --worker`), or lower the views' `max_rows`. A worker that runs out of memory
+output stays exact, but throughput drops. Raise `--memory-limit` if the machine has room, lower `--threads` (DuckDB
+suggests 1 to 4 GB per thread), move views to other workers (`duckwake drain`, `start --worker`), or lower the
+views' `max_rows`. A worker that runs out of memory
 even at 1,000 rows per epoch exits.
 
 ## DuckWakeCommitSlow

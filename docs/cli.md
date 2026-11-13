@@ -100,11 +100,13 @@ with `alter-view`; by default views have none.
 **Memory.** Each worker is one DuckDB instance; `--memory-limit` (`DUCKWAKE_MEMORY_LIMIT`, e.g. `2GB`) caps it.
 The default is DuckDB's, 80% of the machine's RAM, which is too much with several workers on a machine. Past the
 limit, DuckDB spills to `--temp-dir`/<worker> (default `.tmp/<worker>`, emptied at start; put it on local disk,
-not tmpfs). An epoch that still does not fit runs out of memory: the worker then starts again from its
+not tmpfs). What an epoch needs grows with DuckDB's threads (`--threads`, `DUCKWAKE_THREADS`, default one per
+core): under a small limit, fewer threads let more of it spill instead of running out (DuckDB suggests 1 to 4 GB
+per thread). An epoch that still does not fit runs out of memory: the worker then starts again from its
 checkpoints with half as many rows per epoch, in a fresh instance (logged, `duckwake_out_of_memory_total` and
 `duckwake_epoch_rows_cap`), and keeps that cap until it restarts. Output stays exact. Below 1,000 rows per epoch
 it gives up and exits. Kafka buffers and the Arrow decode live outside the DuckDB limit: give the process a few
-hundred MB more than `--memory-limit` (`scripts/limits_test.sh`: a 64 MB limit peaked at about 330 MB resident).
+hundred MB more than `--memory-limit` (`scripts/limits_test.sh`: a 64 MB limit with 12 threads peaked at about 330 MB resident).
 
 ## Storage and credentials
 

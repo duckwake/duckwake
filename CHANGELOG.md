@@ -13,7 +13,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   `alter-view` changes a view's epoch interval, rows per epoch and limits without recomputing it.
 - **Limits.** `max_state_rows` and `max_late_rows` per view fail that view alone, with the reason in the log.
   A worker whose epoch runs out of DuckDB memory starts again from its checkpoints with half as many rows per
-  epoch instead of exiting. `--temp-dir` places each worker's spill files in a directory of its own.
+  epoch instead of exiting. `--temp-dir` places each worker's spill files in a directory of its own; `--threads` sets DuckDB's
+  threads, which what an epoch needs in memory grows with.
 - **Monitoring.** `duckwake run --metrics ADDR` and `playground --metrics ADDR`. The worker process's CPU,
   memory, threads and open files (`process_*`), DuckDB's memory, spill and limit, and bytes read from Kafka;
   node_exporter in the monitoring profile for the hosts. Prometheus discovers the workers from the lake: each

@@ -455,6 +455,7 @@ fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Resul
         lean_commit = cfg.lean_commit,
         lease_timeout_s = cfg.lease_timeout.map(|t| t.as_secs_f64()),
         memory_limit = %conns[0].query_row("SELECT current_setting('memory_limit')", [], |r| r.get::<_, String>(0))?,
+        duckdb_threads = conns[0].query_row("SELECT current_setting('threads')", [], |r| r.get::<_, i64>(0))?,
         temp_dir = %cfg.lake.temp_dir.as_deref().unwrap_or_default(),
         rows_per_epoch_cap = rows_cap,
         "worker started"

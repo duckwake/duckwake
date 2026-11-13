@@ -30,6 +30,7 @@ pub fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
         data_path: env("DUCKWAKE_DATA_PATH", ".lake/data/"),
         memory_limit: std::env::var("DUCKWAKE_MEMORY_LIMIT").ok(),
         temp_dir: std::env::var("DUCKWAKE_TEMP_DIR").ok(),
+        threads: std::env::var("DUCKWAKE_THREADS").ok().and_then(|n| n.parse().ok()),
     };
     sql_functions::register(&con, &Api::local(lake, runtime().handle().clone())).map_err(|e| format!("{e:#}"))?;
     Ok(())

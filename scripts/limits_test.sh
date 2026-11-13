@@ -5,12 +5,13 @@
 #      state_guard (max_state_rows 50) fail with the limit named in the log and duckwake_views_failed_total;
 #      the other views go on. Raised with alter-view and started again, both catch up, and every view
 #      matches its batch recomputation.
-#   2. Memory: a backlog of large events through a high-cardinality view, under a 64 MB DuckDB limit. Epochs
-#      that do not fit run out of memory; the worker halves its rows per epoch (duckwake_out_of_memory_total,
+#   2. Memory: a backlog of large events through a high-cardinality view, under a 64 MB DuckDB limit with 12
+#      DuckDB threads (what an epoch needs grows with the threads, so the count is fixed: with 4, as on a CI
+#      runner, these epochs spill and fit). Epochs that do not fit run out of memory; the worker halves its rows per epoch (duckwake_out_of_memory_total,
 #      duckwake_epoch_rows_cap), spills to its own directory, and the view matches its recomputation.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-90}
-BACKLOG=${BACKLOG:-1500000}; MEMORY_LIMIT=${MEMORY_LIMIT:-64MB}
+BACKLOG=${BACKLOG:-1500000}; MEMORY_LIMIT=${MEMORY_LIMIT:-64MB}; THREADS=${THREADS:-12}
 METRICS=127.0.0.1:19187
 PARTS=${PARTS:-12}   # which parts to run
 failed=0
@@ -95,7 +96,7 @@ setup_views 2s "10 SECOND" "5 seconds" >/dev/null
 produce --rate 50000 --count "$BACKLOG" --pad-bytes 1000 --eos >/dev/null 2>&1
 "$BIN" start every_event --worker w1 >/dev/null
 t0=$SECONDS
-run_worker --memory-limit "$MEMORY_LIMIT"
+run_worker --memory-limit "$MEMORY_LIMIT" --threads "$THREADS"
 peak=0; spill=0
 end=$(topic_end)
 while ! caught_up every_event "$end" 0; do
@@ -106,9 +107,9 @@ while ! caught_up every_event "$end" 0; do
   sleep 0.5
 done
 echo "caught up in $((SECONDS - t0))s; peak RSS $((peak / 1024)) MB, peak spill $((spill / 1024)) MB"
-grep -h 'ran out of memory' "$OUT/w1.log" | grep -o 'rows_per_epoch=[0-9]*' | tr '\n' ' '; echo
+grep -h 'ran out of memory' "$OUT/w1.log" | grep -o 'rows_per_epoch=[0-9]*' | tr '\n' ' ' || true; echo
 oom=$(metric duckwake_out_of_memory_total)
-((${oom%.*} >= 1)) && echo "duckwake_out_of_memory_total $oom, duckwake_epoch_rows_cap $(metric duckwake_epoch_rows_cap)" \
+((${oom:-0} >= 1)) && echo "duckwake_out_of_memory_total $oom, duckwake_epoch_rows_cap $(metric duckwake_epoch_rows_cap)" \
   || { echo "FAIL: no epoch ran out of memory, so the limit was not exercised"; failed=1; }
 ((spill > 0)) || { echo "FAIL: DuckDB never spilled"; failed=1; }
 kill -TERM "$W"; wait "$W" 2>/dev/null || true

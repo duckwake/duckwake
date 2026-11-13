@@ -20,6 +20,8 @@ pub struct LakeConfig {
     pub memory_limit: Option<String>,
     /// Where DuckDB spills; a worker uses `<temp_dir>/<worker id>` (default `.tmp/<worker id>`).
     pub temp_dir: Option<String>,
+    /// DuckDB threads for this instance (default: one per core). What an epoch needs in memory grows with them.
+    pub threads: Option<usize>,
 }
 
 impl LakeConfig {
@@ -37,6 +39,9 @@ impl LakeConfig {
         }
         if let Some(dir) = &self.temp_dir {
             conn.execute_batch(&format!("SET temp_directory = {}", lit(dir)))?;
+        }
+        if let Some(n) = self.threads {
+            conn.execute_batch(&format!("SET threads = {}", n.max(1)))?;
         }
         if self.data_path.starts_with("s3://") {
             conn.execute_batch(&s3_secret_sql(&self.data_path, &|k| std::env::var(k).ok())?)

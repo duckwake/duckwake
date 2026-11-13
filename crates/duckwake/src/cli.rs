@@ -34,6 +34,10 @@ struct Cli {
     /// Where DuckDB spills; a worker uses <temp-dir>/<worker id> and clears it at start (default .tmp).
     #[arg(long, global = true, env = "DUCKWAKE_TEMP_DIR")]
     temp_dir: Option<String>,
+    /// DuckDB threads per process (default: one per core). The memory an epoch needs grows with them: with a
+    /// small --memory-limit, fewer threads let more of it fit before DuckDB runs out.
+    #[arg(long, global = true, env = "DUCKWAKE_THREADS")]
+    threads: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -354,6 +358,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         data_path: cli.data_path.clone(),
         memory_limit: cli.memory_limit.clone(),
         temp_dir: cli.temp_dir.clone(),
+        threads: cli.threads,
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
     let open = || -> Result<duckdb::Connection> {
