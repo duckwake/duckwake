@@ -1,0 +1,2 @@
+# Machines to scrape with node_exporter (CPU, memory, network, disk): the compose profile runs one on :9100.
+- targets: ["localhost:9100"]

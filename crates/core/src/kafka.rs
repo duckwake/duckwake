@@ -21,6 +21,10 @@ use tokio::task::JoinHandle;
 const FETCH_BYTES: i32 = 4 << 20;
 const FETCH_WAIT_MS: i32 = 250;
 
+/// Messages and payload bytes this process's readers have fetched from Kafka (`duckwake_kafka_read_*`).
+pub static READ_MESSAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub struct Msg {
     pub partition: i32,
@@ -386,6 +390,9 @@ async fn read_partition(pc: PartitionClient, p: i32, mut next: i64, feed: Feed, 
         match pc.fetch_records(next, 1..FETCH_BYTES, FETCH_WAIT_MS).await {
             Ok((records, high)) => {
                 hw.lock().unwrap().insert(p, high);
+                let bytes: usize = records.iter().map(|r| r.record.value.as_ref().map_or(0, Vec::len) + r.record.key.as_ref().map_or(0, Vec::len)).sum();
+                READ_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                READ_MESSAGES.fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 let mut msgs = Vec::with_capacity(records.len());
                 for r in records {
                     if r.offset < next {

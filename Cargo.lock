@@ -742,6 +742,7 @@ dependencies = [
  "chrono",
  "duckdb",
  "duckwake_circuit",
+ "libc",
  "rand 0.9.5",
  "rskafka",
  "rustls",

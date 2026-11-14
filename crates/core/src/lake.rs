@@ -16,8 +16,12 @@ pub struct LakeConfig {
     pub catalog: String,
     /// Where DuckLake writes Parquet files (local path or s3://...).
     pub data_path: String,
-    /// DuckDB memory limit for this instance, e.g. `4GB`.
+    /// DuckDB memory limit for this instance, e.g. `4GB`. Past it, DuckDB spills to `temp_dir`.
     pub memory_limit: Option<String>,
+    /// Where DuckDB spills; a worker uses `<temp_dir>/<worker id>` (default `.tmp/<worker id>`).
+    pub temp_dir: Option<String>,
+    /// DuckDB threads for this instance (default: one per core). What an epoch needs in memory grows with them.
+    pub threads: Option<usize>,
 }
 
 impl LakeConfig {
@@ -32,6 +36,12 @@ impl LakeConfig {
         .context("loading ducklake/postgres/icu extensions")?;
         if let Some(limit) = &self.memory_limit {
             conn.execute_batch(&format!("SET memory_limit = {}", lit(limit)))?;
+        }
+        if let Some(dir) = &self.temp_dir {
+            conn.execute_batch(&format!("SET temp_directory = {}", lit(dir)))?;
+        }
+        if let Some(n) = self.threads {
+            conn.execute_batch(&format!("SET threads = {}", n.max(1)))?;
         }
         if self.data_path.starts_with("s3://") {
             conn.execute_batch(&s3_secret_sql(&self.data_path, &|k| std::env::var(k).ok())?)
@@ -150,17 +160,8 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
 /// Adds a column to a control table unless it has it. Several processes may bootstrap the same lake at
 /// once: one that loses the race finds the column there and goes on.
 pub fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
-    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
-    let has = || -> Result<bool> {
-        let n: i64 = conn.query_row(
-            "SELECT count(*) FROM duckdb_columns() WHERE database_name = ? AND schema_name = ? AND table_name = ? AND column_name = ?",
-            [LAKE, schema, table, column],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    };
     for attempt in 1..=5u64 {
-        if has()? {
+        if has_column(conn, table, column)? {
             return Ok(());
         }
         match conn.execute_batch(&format!("ALTER TABLE {CTL}.{} ADD COLUMN {} {ty}", ident(table), ident(column))) {
@@ -170,6 +171,17 @@ pub fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// Whether control table `table` has `column`.
+pub fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM duckdb_columns() WHERE database_name = ? AND schema_name = ? AND table_name = ? AND column_name = ?",
+        [LAKE, schema, table, column],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Lakes created before the rename keep their control data in `__stream` and stamp output rows with

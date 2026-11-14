@@ -53,6 +53,8 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 - [Performance](docs/performance.md): the worker flags and the benchmarks
 - [Testing](docs/testing.md): what has been verified, and how to run the tests
 - [Internals](docs/internals.md): how the code maps to the design, findings, gaps and layout
+- [Monitoring and alerts](docs/alerts.md): the metrics, the Prometheus alerts and Grafana dashboard in `deploy/`, and what to do when each fires
+- [Releases](docs/releasing.md): versioning, what a release publishes, and how to make one; [changelog](CHANGELOG.md)
 - [Roadmap](docs/roadmap.md): what is done and what stands between it and production
 
 ## Status
@@ -62,7 +64,9 @@ across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `m
 another view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with
 nothing to declare; when that table's rows are updated or deleted, the view retracts them (windowed views
 need it insert-only). Workers heartbeat into the lake: the views of a worker that dies move to the live ones,
-and views spread to workers that join, by measured load. Sources connect with SASL (PLAIN, SCRAM) and TLS, data files can live on S3, and no
+and views spread to workers that join, by measured load. Views can be replaced and sources gain columns while
+they run; per-view limits fail one view instead of its worker, and a worker short of memory shrinks its epochs.
+Sources connect with SASL (PLAIN, SCRAM) and TLS, data files can live on S3, and no
 credential is stored in the lake. Every test checks the views against the same SQL run as one batch query. Not yet:
 `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.

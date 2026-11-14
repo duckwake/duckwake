@@ -1,0 +1,137 @@
+# promtool test rules duckwake-alerts.test.yml  (CI runs it)
+rule_files:
+  - duckwake-alerts.yml
+evaluation_interval: 1m
+tests:
+  # A view with events waiting and no new epoch is stuck; an idle one (no lag) is not, however old its events.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_lag_events{job="duckwake",instance="w1:9464",worker="w1",view="busy"}'
+        values: '500x20'
+      - series: 'duckwake_epoch{job="duckwake",instance="w1:9464",worker="w1",view="busy"}'
+        values: '7x20'
+      - series: 'duckwake_lag_events{job="duckwake",instance="w1:9464",worker="w1",view="idle"}'
+        values: '0x20'
+      - series: 'duckwake_epoch{job="duckwake",instance="w1:9464",worker="w1",view="idle"}'
+        values: '9x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: DuckWakeViewStuck
+        exp_alerts:
+          - exp_labels: {severity: critical, job: duckwake, instance: "w1:9464", worker: w1, view: busy}
+            exp_annotations:
+              summary: "View busy has events waiting and commits nothing"
+              description: "500 events are waiting and the view has not committed an epoch in 15 minutes."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewstuck
+
+  # Falling behind: old events while some wait. The idle view's events are older still, but none wait.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_lag_events{job="duckwake",instance="w1:9464",worker="w1",view="slow"}'
+        values: '1000x15'
+      - series: 'duckwake_freshness_seconds{job="duckwake",instance="w1:9464",worker="w1",view="slow"}'
+        values: '120x15'
+      - series: 'duckwake_epoch_interval_seconds{job="duckwake",instance="w1:9464",worker="w1",view="slow"}'
+        values: '10x15'
+      - series: 'duckwake_lag_events{job="duckwake",instance="w1:9464",worker="w1",view="idle"}'
+        values: '0x15'
+      - series: 'duckwake_freshness_seconds{job="duckwake",instance="w1:9464",worker="w1",view="idle"}'
+        values: '3600x15'
+      - series: 'duckwake_epoch_interval_seconds{job="duckwake",instance="w1:9464",worker="w1",view="idle"}'
+        values: '10x15'
+      # A fast view 20 s behind with 2 s epochs is under the 30 s floor.
+      - series: 'duckwake_lag_events{job="duckwake",instance="w1:9464",worker="w1",view="fast"}'
+        values: '50x15'
+      - series: 'duckwake_freshness_seconds{job="duckwake",instance="w1:9464",worker="w1",view="fast"}'
+        values: '20x15'
+      - series: 'duckwake_epoch_interval_seconds{job="duckwake",instance="w1:9464",worker="w1",view="fast"}'
+        values: '2x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: DuckWakeViewFallingBehind
+        exp_alerts:
+          - exp_labels: {severity: warning, job: duckwake, instance: "w1:9464", worker: w1, view: slow}
+            exp_annotations:
+              summary: "View slow is 2m 0s behind its events"
+              description: "Its newest committed event is more than 3 epoch intervals old while events are waiting. An idle topic does not fire this."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewfallingbehind
+
+  # State over 80% of the view's own limit; a view without a limit never fires.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_state_rows{job="duckwake",instance="w1:9464",worker="w1",view="capped"}'
+        values: '900x15'
+      - series: 'duckwake_max_state_rows{job="duckwake",instance="w1:9464",worker="w1",view="capped"}'
+        values: '1000x15'
+      - series: 'duckwake_state_rows{job="duckwake",instance="w1:9464",worker="w1",view="free"}'
+        values: '90000000x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: DuckWakeStateNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, job: duckwake, instance: "w1:9464", worker: w1, view: capped}
+            exp_annotations:
+              summary: "The state of capped is at 900 rows, over 80% of its limit"
+              description: "At max_state_rows the view fails. Raise the limit with alter-view, or bound the view."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakestatenearlimit
+
+  # A view failed: fires at once, and clears 10 minutes later.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_views_failed_total{job="duckwake",instance="w1:9464",worker="w1"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DuckWakeViewFailed
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DuckWakeViewFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, job: duckwake, instance: "w1:9464", worker: w1}
+            exp_annotations:
+              summary: "A view on w1 failed"
+              description: "A view went over a limit, an input broke a promise it relies on, or it could not start. `duckwake jobs` shows which; the worker log names the reason."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewfailed
+      - eval_time: 21m
+        alertname: DuckWakeViewFailed
+        exp_alerts: []
+
+  # A worker that cannot be scraped; with every worker down, no worker is up either.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="duckwake",instance="w1:9464"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DuckWakeWorkerDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: duckwake, instance: "w1:9464"}
+            exp_annotations:
+              summary: "DuckWake worker w1:9464 cannot be scraped"
+              description: "No metrics from w1:9464 for 2 minutes. Its views move to the other workers after the lease timeout; with a single worker, nothing runs."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeworkerdown
+      - eval_time: 6m
+        alertname: DuckWakeNoWorkers
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "No DuckWake worker is up"
+              description: "No worker has been scraped successfully for 5 minutes: no view is running."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakenoworkers
+
+  # 2% of the events cannot be decoded (100 events/s in, 2/s to dead letters).
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_rows_in_total{job="duckwake",instance="w1:9464",worker="w1",view="noisy"}'
+        values: '0+6000x20'
+      - series: 'duckwake_dead_letters_total{job="duckwake",instance="w1:9464",worker="w1",view="noisy"}'
+        values: '0+120x20'
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: DuckWakeDeadLetters
+        exp_alerts:
+          - exp_labels: {severity: warning, job: duckwake, instance: "w1:9464", worker: w1, view: noisy}
+            exp_annotations:
+              summary: "2% of the events of noisy cannot be decoded"
+              description: "They go to __duckwake.dead_letter with the error. A producer changed its format, or a source column has the wrong type."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakedeadletters

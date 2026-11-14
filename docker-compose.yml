@@ -86,5 +86,44 @@ services:
       DUCKWAKE_QUACK_TOKEN: ${DUCKWAKE_QUACK_TOKEN:-duckwake-dev-token}
     volumes: ["server-data:/data"]
 
+
+  # Prometheus with the DuckWake alerts, and Grafana with its dashboard: `docker compose --profile monitoring up -d`,
+  # then http://localhost:19300 (Grafana, anonymous viewer) and http://localhost:19090 (Prometheus, Alerts tab).
+  # Like duckwaked, both use the host network, so they reach workers at localhost; the workers to scrape are
+  # listed in deploy/prometheus/targets/.
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.1.0
+    network_mode: host
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.listen-address=:19090", "--web.enable-lifecycle"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/duckwake-alerts.yml:/etc/prometheus/duckwake-alerts.yml:ro
+      - ./deploy/prometheus/targets:/etc/prometheus/targets:ro
+
+  # The machine's CPU, memory, network and disk for the dashboard's Host row (Linux; on a Mac it would report
+  # Docker's VM, so docker-compose.mac.yml scrapes a node_exporter running on the Mac instead).
+  node-exporter:
+    profiles: ["monitoring"]
+    image: prom/node-exporter:v1.8.2
+    network_mode: host
+    pid: host
+    command: ["--path.rootfs=/host", "--web.listen-address=:9100"]
+    volumes: ["/:/host:ro,rslave"]
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:11.4.0
+    network_mode: host
+    depends_on: [prometheus]
+    environment:
+      GF_SERVER_HTTP_PORT: "19300"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/duckwake.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
 volumes:
   server-data:

@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: duckwake
+    folder: DuckWake
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

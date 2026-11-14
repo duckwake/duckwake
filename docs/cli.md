@@ -56,6 +56,58 @@ $B create-source clicks --options '{"brokers":"kafka-1:9094","topic":"clicks","e
 
 `run`, `serve` and `playground` take the worker flags described in [performance.md](performance.md).
 
+## Changing views and sources
+
+Views and sources change while workers run them:
+
+- **`create-view NAME --replace`** (`CREATE OR REPLACE`, `duckwake_create_view(..., replace := true)`) swaps a
+  view's definition in one transaction. The new definition starts over like a new view: Kafka sources from their
+  `start` position (`earliest` by default: everything the topic still holds), lake tables from now. Its table,
+  state, checkpoints and dead letters are replaced, and so are the rows of a late-data table no other view writes.
+  The view keeps its status, worker and pin (a failed one becomes stopped). A worker still running the old
+  definition is fenced and starts the new one at its next refresh. A view that other views read cannot be
+  replaced: drop those first.
+- **`add-source-column SOURCE COLUMN TYPE`** (`duckwake_add_source_column`) adds a column to a source. The views
+  that already read the source keep the columns they were created with, and keep running unchanged; replace a
+  view to use the new column. Events without the field get NULL. Columns cannot be removed or retyped: create
+  a new source for that.
+- **`alter-view NAME`** (`duckwake_alter_view`) changes how a view runs, not what it computes:
+  `--epoch-interval`, `--max-rows`, `--max-state-rows`, `--max-late-rows` (0 removes a limit). A running view is
+  restarted by its worker with the new settings and continues from where it was.
+
+```sh
+$B add-source-column clicks country VARCHAR
+$B create-view analytics.big_spend --replace --sql "SELECT ts, game_id, country, amount FROM clicks WHERE amount >= 90"
+$B alter-view clicks_per_min --epoch-interval 30s
+```
+
+`stop` and `pause` fence the view's worker at once: an epoch it has in flight does not land, so `drop` or
+`reset` can follow straight away.
+
+## Limits
+
+A view that grows without bound should fail alone, not slow down or take down its worker:
+
+- **`--max-state-rows N`**: the view fails once its state holds more than N rows (open windows, groups or distinct
+  rows; checked every 10 s, `duckwake_state_rows`).
+- **`--max-late-rows N`**: the view fails when one epoch writes more than N late rows: a watermark or a producer
+  clock that is wrong, not ordinary late data. The epoch that went over is not committed.
+
+A failed view says why in the worker log and in `duckwake_views_failed_total`. Fix the cause or raise the limit
+(`alter-view`), then `start` it: it continues from its last checkpoint. Both are set at `create-view` or later
+with `alter-view`; by default views have none.
+
+**Memory.** Each worker is one DuckDB instance; `--memory-limit` (`DUCKWAKE_MEMORY_LIMIT`, e.g. `2GB`) caps it.
+The default is DuckDB's, 80% of the machine's RAM, which is too much with several workers on a machine. Past the
+limit, DuckDB spills to `--temp-dir`/<worker> (default `.tmp/<worker>`, emptied at start; put it on local disk,
+not tmpfs). What an epoch needs grows with DuckDB's threads (`--threads`, `DUCKWAKE_THREADS`, default one per
+core): under a small limit, fewer threads let more of it spill instead of running out (DuckDB suggests 1 to 4 GB
+per thread). An epoch that still does not fit runs out of memory: the worker then starts again from its
+checkpoints with half as many rows per epoch, in a fresh instance (logged, `duckwake_out_of_memory_total` and
+`duckwake_epoch_rows_cap`), and keeps that cap until it restarts. Output stays exact. Below 1,000 rows per epoch
+it gives up and exits. Kafka buffers and the Arrow decode live outside the DuckDB limit: give the process a few
+hundred MB more than `--memory-limit` (`scripts/limits_test.sh`: a 64 MB limit with 12 threads peaked at about 330 MB resident).
+
 ## Storage and credentials
 
 `--catalog` (`DUCKWAKE_CATALOG`) is the DuckLake catalog and `--data-path` (`DUCKWAKE_DATA_PATH`) where its
@@ -81,6 +133,11 @@ Anything else that reads the lake, such as a DuckDB session that attaches it, ne
 own S3 secret (`CREATE SECRET (TYPE s3, ...)`) and catalog credentials.
 
 ## Workers, failover and rebalancing
+
+Run one worker per machine: a worker uses every core it is given (`--stage-threads`, `--pipeline`), so a second one
+on the same machine only adds failover between processes. For failover that survives a machine, run workers on
+two or more machines. Give each `--metrics 0.0.0.0:9464`; Prometheus finds them through the lake
+([alerts.md](alerts.md)).
 
 Every worker heartbeats into the lake, and the workers move views between themselves:
 
@@ -117,7 +174,9 @@ docker compose up -d --wait
 cargo run --release -- playground      # then open http://localhost:8787 and click "Load demo"
 ```
 
-A local web UI with an in-process worker (`playground`). It lets you:
+A local web UI with an in-process worker (`playground`); `--metrics 127.0.0.1:9464` serves its Prometheus
+metrics for the Grafana dashboard ([alerts.md](alerts.md)). It shares the local Redpanda's `clicks` topic with
+the test scripts: stop it while they run. It lets you:
 - create sources (the Kafka topic is created for you), run a test-data generator with late and malformed events, or send your own JSON;
 - create lake tables, e.g. dimension tables for lookup joins;
 - create continuous views from templates (unsupported SQL is rejected with the compiler's message);

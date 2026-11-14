@@ -5,7 +5,7 @@
 //! in DuckLake, an UPDATE of one row in a table conflicts with a concurrent UPDATE of any other row of the
 //! same table, so per-epoch fencing on `jobs` would make every worker conflict with every other one.
 use crate::lake::{ident, lit, quote_table, CTL, LAKE};
-use crate::model::{parse_duration, Input, JobDef, JobStatus, LakeInput, SourceDef, SourceOptions, COMMIT_TS};
+use crate::model::{parse_duration, Input, JobDef, JobStatus, LakeInput, Limits, SourceDef, SourceOptions, COMMIT_TS};
 use crate::plan;
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
@@ -21,7 +21,7 @@ pub use duckwake_circuit::sql::state_table;
 /// were created from the stored plan, so their columns must be what this compiler would create.
 pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<String, SourceDef>)> {
     let (mut def, _) = load_job(conn, job)?;
-    let sources = load_sources(conn)?;
+    let sources = view_sources(&def, load_sources(conn)?);
     let plan = compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
     if plan.state_columns != def.plan.state_columns || plan.sink_columns != def.plan.sink_columns {
         bail!(
@@ -31,6 +31,17 @@ pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<St
     }
     def.plan = plan;
     Ok((def, sources))
+}
+
+/// The sources as `def` sees them: each Kafka source it reads with the columns it was created with, so a
+/// column added to a source later changes nothing in the views that already read it.
+pub fn view_sources(def: &JobDef, mut sources: HashMap<String, SourceDef>) -> HashMap<String, SourceDef> {
+    for (name, columns) in &def.source_columns {
+        if let Some(s) = sources.get_mut(name) {
+            s.options.columns = columns.clone();
+        }
+    }
+    sources
 }
 
 /// Compiles a view whose FROM names Kafka sources, and lake tables and views resolved to `lakes`.
@@ -184,6 +195,62 @@ pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_
     Ok(def)
 }
 
+/// Adds a column to a Kafka source. Views that read the source keep the columns they were created with (their
+/// definitions record them, in the same transaction); a view created or replaced afterwards can use the new
+/// one. Events without the field get NULL, as for any missing field.
+pub fn add_source_column(conn: &Connection, source: &str, column: &str, ty: &str) -> Result<SourceDef> {
+    crate::model::check_column(column, ty)?;
+    // The type must be one DuckDB knows; `prepare` also refuses anything but one statement.
+    conn.prepare(&format!("SELECT NULL::{ty}")).with_context(|| format!("column {column}: type {ty:?}"))?;
+    retry_conflicts(|| {
+        let mut sources = load_sources(conn)?;
+        let mut def = sources.remove(source).ok_or_else(|| anyhow!("no such source {source:?}"))?;
+        if def.options.columns.iter().any(|(c, _)| c.eq_ignore_ascii_case(column)) {
+            bail!("source {source} already has a column {column}");
+        }
+        let before = def.options.columns.clone();
+        def.options.columns.push((column.to_string(), ty.to_string()));
+        // Every rule a new source must meet, the decoder's included.
+        def.options = SourceOptions::from_json(&serde_json::to_value(&def.options)?)?;
+        let jobs = jobs_reading(conn, source)?;
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            conn.execute(
+                &format!("UPDATE {CTL}.sources SET options = ? WHERE name = ?"),
+                [&serde_json::to_string(&def.options)?, source],
+            )?;
+            for (job, mut jd) in jobs {
+                if jd.source_columns.contains_key(source) {
+                    continue;
+                }
+                jd.source_columns.insert(source.to_string(), before.clone());
+                conn.execute(
+                    &format!("UPDATE {CTL}.jobs SET definition = ?, updated_at = now() WHERE job_id = ?"),
+                    [&serde_json::to_string(&jd)?, &job],
+                )?;
+            }
+            Ok(())
+        })();
+        finish(conn, res)?;
+        Ok(def.clone())
+    })
+}
+
+/// Every view whose definition reads Kafka source `source`, with its definition.
+fn jobs_reading(conn: &Connection, source: &str) -> Result<Vec<(String, JobDef)>> {
+    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs ORDER BY job_id"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (job, def) = row?;
+        let def: JobDef = serde_json::from_str(&def)?;
+        if def.plan.sources().iter().any(|s| s == source) && !def.lake_inputs.iter().any(|l| l.name == source) {
+            out.push((job, def));
+        }
+    }
+    Ok(out)
+}
+
 pub fn load_sources(conn: &Connection) -> Result<HashMap<String, SourceDef>> {
     let mut stmt = conn.prepare(&format!("SELECT name, kind, options::VARCHAR FROM {CTL}.sources"))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
@@ -237,18 +304,26 @@ pub struct CreateView<'a> {
     pub epoch_interval: &'a str,
     pub max_rows: usize,
     pub inline_row_limit: usize,
+    pub limits: Limits,
+    /// Replace the view if it exists (`CREATE OR REPLACE`): see `replace_view`.
+    pub replace: bool,
 }
 
 /// Compiles the view, creates its sink / late-data / state / lease tables and registers the job, in one
-/// transaction. The job starts in status `created`; `start` assigns it to a worker.
+/// transaction. The job starts in status `created`; `start` assigns it to a worker. With `replace`, an existing
+/// view of that name is replaced instead (`replace_view`).
 pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
     crate::lake::check_name("view", v.job_id)?;
     if v.checkpoint != "ducklake" {
         bail!("CHECKPOINT {:?}: only the ducklake backend is implemented (object storage state is phase 3)", v.checkpoint);
     }
     parse_duration(v.epoch_interval)?;
-    if job_status(conn, v.job_id)?.is_some() {
-        bail!("view {:?} already exists", v.job_id);
+    if v.max_rows == 0 {
+        bail!("max_rows must be at least 1");
+    }
+    let existing = job_status(conn, v.job_id)?;
+    if existing.is_some() && !v.replace {
+        bail!("view {:?} already exists; replace it with CREATE OR REPLACE (`--replace`, `replace := true`)", v.job_id);
     }
     let sources = load_sources(conn)?;
     let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
@@ -273,71 +348,212 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         plan,
         lake_inputs,
         start_snapshot,
+        source_columns: BTreeMap::new(),
+        limits: v.limits,
     };
+    let mut def = def;
+    def.source_columns = def
+        .plan
+        .sources()
+        .into_iter()
+        .filter_map(|n| sources.get(&n).filter(|_| !def.lake_inputs.iter().any(|l| l.name == n)).map(|s| (n, s.options.columns.clone())))
+        .collect();
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
     let circuit = crate::circuit::Circuit::compile(&def.view())?;
-    let sink = quote_table(&def.sink)?;
-    let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
-
-    conn.execute_batch("BEGIN")?;
-    let res = (|| -> Result<()> {
-        conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&sink_schema)))?;
-        let mut cols: Vec<String> =
-            def.plan.sink_columns.iter().chain(&circuit.sink_extra_columns()).map(|(c, t)| format!("{} {t}", ident(c))).collect();
-        cols.push("_duckwake_epoch BIGINT".into());
-        // The view owns its table: creating one over an existing table would mix in rows no epoch wrote.
-        if table_exists(conn, &sink_schema, &sink_name)? {
-            bail!("table {} already exists; drop it or name the view after a new table", def.sink);
+    match existing {
+        None => {
+            conn.execute_batch("BEGIN")?;
+            let res = (|| -> Result<()> {
+                create_tables(conn, &def, &circuit, &src_columns)?;
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {lt} (owner_worker VARCHAR, lease_epoch BIGINT, last_epoch BIGINT);
+                     INSERT INTO {lt} VALUES (NULL, 0, 0);",
+                    lt = lease_table(v.job_id)
+                ))?;
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {CTL}.jobs (job_id, definition, version, status, created_at, updated_at)
+                         VALUES (?, ?, 1, 'created', now(), now())"
+                    ),
+                    [v.job_id, &serde_json::to_string(&def)?],
+                )?;
+                insert_dependencies(conn, &def)
+            })();
+            finish(conn, res)?;
         }
-        conn.execute_batch(&format!("CREATE TABLE {sink} ({})", cols.join(", ")))?;
-        if def.plan.is_windowed() && def.plan.sink_columns.iter().any(|(c, _)| c == "window_start") {
-            conn.execute_batch(&format!(
-                "ALTER TABLE {sink} SET PARTITIONED BY (year(window_start), month(window_start), day(window_start))"
-            ))?;
-        }
-        if let Some(late) = &def.late_data {
-            let (_, ls, lt) = crate::lake::qualified_table(late)?;
-            conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&ls)))?;
-            if !table_exists(conn, &ls, &lt)? {
-                let mut cols: Vec<String> = src_columns
-                    .iter()
-                    .filter(|(c, _)| !crate::circuit::codegen::is_window_column(c))
-                    .map(|(c, t)| format!("{} {t}", ident(c)))
-                    .collect();
-                cols.extend(
-                    ["window_start TIMESTAMP", "window_end TIMESTAMP", "_source_partition INTEGER", "_source_offset BIGINT", "_duckwake_epoch BIGINT"]
-                        .map(String::from),
-                );
-                conn.execute_batch(&format!("CREATE TABLE {} ({})", quote_table(late)?, cols.join(", ")))?;
-            }
-        }
-        if def.plan.has_state() {
-            let cols: Vec<String> = def.plan.state_columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
-            conn.execute_batch(&format!("CREATE TABLE {} ({})", state_table(v.job_id), cols.join(", ")))?;
-        }
-        conn.execute_batch(&format!(
-            "CREATE TABLE {lt} (owner_worker VARCHAR, lease_epoch BIGINT, last_epoch BIGINT);
-             INSERT INTO {lt} VALUES (NULL, 0, 0);",
-            lt = lease_table(v.job_id)
-        ))?;
-        conn.execute(
-            &format!(
-                "INSERT INTO {CTL}.jobs (job_id, definition, version, status, created_at, updated_at)
-                 VALUES (?, ?, 1, 'created', now(), now())"
-            ),
-            [v.job_id, &serde_json::to_string(&def)?],
-        )?;
-        for l in &def.lake_inputs {
-            conn.execute(
-                &format!("INSERT INTO {CTL}.dependencies VALUES (?, ?, ?, ?)"),
-                duckdb::params![v.job_id, l.name, l.table_id, l.view],
-            )?;
-        }
-        Ok(())
-    })();
-    finish(conn, res)?;
+        Some(_) => replace_view(conn, &def, &circuit, &src_columns)?,
+    }
     set_sink_inlining(conn, &def)?;
     Ok(def)
+}
+
+/// Creates a view's table, late-data table (unless it exists, with the columns this view writes) and state
+/// table, inside the caller's transaction.
+fn create_tables(conn: &Connection, def: &JobDef, circuit: &crate::circuit::Circuit, src_columns: &[(String, String)]) -> Result<()> {
+    let sink = quote_table(&def.sink)?;
+    let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
+    conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&sink_schema)))?;
+    let mut cols: Vec<String> =
+        def.plan.sink_columns.iter().chain(&circuit.sink_extra_columns()).map(|(c, t)| format!("{} {t}", ident(c))).collect();
+    cols.push("_duckwake_epoch BIGINT".into());
+    // The view owns its table: creating one over an existing table would mix in rows no epoch wrote.
+    if table_exists(conn, &sink_schema, &sink_name)? {
+        bail!("table {} already exists; drop it or name the view after a new table", def.sink);
+    }
+    conn.execute_batch(&format!("CREATE TABLE {sink} ({})", cols.join(", ")))?;
+    if def.plan.is_windowed() && def.plan.sink_columns.iter().any(|(c, _)| c == "window_start") {
+        conn.execute_batch(&format!("ALTER TABLE {sink} SET PARTITIONED BY (year(window_start), month(window_start), day(window_start))"))?;
+    }
+    if let Some(late) = &def.late_data {
+        let (_, ls, lt) = crate::lake::qualified_table(late)?;
+        conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&ls)))?;
+        let mut cols: Vec<(String, String)> =
+            src_columns.iter().filter(|(c, _)| !crate::circuit::codegen::is_window_column(c)).cloned().collect();
+        cols.extend(
+            [("window_start", "TIMESTAMP"), ("window_end", "TIMESTAMP"), ("_source_partition", "INTEGER"), ("_source_offset", "BIGINT"), ("_duckwake_epoch", "BIGINT")]
+                .map(|(c, t)| (c.to_string(), t.to_string())),
+        );
+        if table_exists(conn, &ls, &lt)? {
+            // Shared with another view, or kept from an earlier one: its rows must line up with this view's.
+            let have: Vec<String> = crate::lake::describe(conn, &quote_table(late)?)?.into_iter().map(|(c, _)| c).collect();
+            let want: Vec<String> = cols.iter().map(|(c, _)| c.clone()).collect();
+            if have != want {
+                bail!(
+                    "late-data table {late} has columns ({}), but this view writes ({}): name another table",
+                    have.join(", "),
+                    want.join(", ")
+                );
+            }
+        } else {
+            let defs: Vec<String> = cols.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+            conn.execute_batch(&format!("CREATE TABLE {} ({})", quote_table(late)?, defs.join(", ")))?;
+        }
+    }
+    if def.plan.has_state() {
+        let cols: Vec<String> = def.plan.state_columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+        conn.execute_batch(&format!("CREATE TABLE {} ({})", state_table(&def.job_id), cols.join(", ")))?;
+    }
+    Ok(())
+}
+
+fn insert_dependencies(conn: &Connection, def: &JobDef) -> Result<()> {
+    for l in &def.lake_inputs {
+        conn.execute(
+            &format!("INSERT INTO {CTL}.dependencies VALUES (?, ?, ?, ?)"),
+            duckdb::params![def.job_id, l.name, l.table_id, l.view],
+        )?;
+    }
+    Ok(())
+}
+
+/// `CREATE OR REPLACE`: swaps a view's definition in one transaction. The new definition starts over like a
+/// new view (Kafka sources from their `start` position, lake inputs from now): its table, state, checkpoints
+/// and dead letters are replaced, and so are the rows of a late-data table no other view writes. The view
+/// keeps its status (a failed one becomes stopped), its worker and pin; its lease is bumped, so a worker
+/// still running the old definition is fenced, then starts the new one. A view that other views read cannot
+/// be replaced: their positions in its table would no longer mean anything.
+fn replace_view(conn: &Connection, def: &JobDef, circuit: &crate::circuit::Circuit, src_columns: &[(String, String)]) -> Result<()> {
+    let job = def.job_id.as_str();
+    let readers = readers(conn, job)?;
+    if !readers.is_empty() {
+        bail!("view {job} is read by {}; drop those views before replacing it", readers.join(", "));
+    }
+    retry_conflicts(|| {
+        let (old, status) = load_job(conn, job)?;
+        // A late-data table is the user's and may be shared: only one this view alone writes is emptied.
+        let late_alone = match &old.late_data {
+            Some(l) => !all_jobs(conn)?.iter().any(|(id, d)| id != job && d.late_data.as_deref() == Some(l)),
+            None => false,
+        };
+        let status = if status == JobStatus::Failed { JobStatus::Stopped } else { status };
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};",
+                quote_table(&old.sink)?,
+                state_table(job)
+            ))?;
+            // Its rows are the old definition's; the new one writes the same table again from the start.
+            if let (Some(l), true) = (&old.late_data, late_alone && def.late_data == old.late_data) {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_table(l)?))?;
+            }
+            for t in ["checkpoints", "dead_letter", "dependencies"] {
+                conn.execute(&format!("DELETE FROM {CTL}.{t} WHERE job_id = ?"), [job])?;
+            }
+            create_tables(conn, def, circuit, src_columns)?;
+            conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1, last_epoch = 0", lease_table(job)))?;
+            conn.execute(
+                &format!(
+                    "UPDATE {CTL}.jobs SET definition = ?, version = version + 1, status = ?, updated_at = now() WHERE job_id = ?"
+                ),
+                [&serde_json::to_string(def)?, status.as_str(), job],
+            )?;
+            insert_dependencies(conn, def)
+        })();
+        finish(conn, res)
+    })
+}
+
+/// Every view with its definition.
+fn all_jobs(conn: &Connection) -> Result<Vec<(String, JobDef)>> {
+    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs ORDER BY job_id"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    rows.map(|r| {
+        let (id, d) = r?;
+        Ok((id, serde_json::from_str(&d)?))
+    })
+    .collect()
+}
+
+/// Settings `alter_view` changes in place, without recomputing the view; None keeps the current value.
+#[derive(Debug, Default, Clone)]
+pub struct AlterView {
+    pub epoch_interval: Option<String>,
+    pub max_rows: Option<usize>,
+    /// 0 removes the limit.
+    pub max_state_rows: Option<u64>,
+    /// 0 removes the limit.
+    pub max_late_rows: Option<u64>,
+}
+
+/// Changes how a view runs, not what it computes: its epoch interval, rows per epoch and limits. A running
+/// view's lease is bumped, so its worker starts it again with the new settings at its next refresh; its output
+/// and position stay as they are.
+pub fn alter_view(conn: &Connection, job: &str, a: &AlterView) -> Result<JobDef> {
+    if let Some(i) = &a.epoch_interval {
+        parse_duration(i)?;
+    }
+    if a.max_rows == Some(0) {
+        bail!("max_rows must be at least 1");
+    }
+    retry_conflicts(|| {
+        let (mut def, status) = load_job(conn, job)?;
+        if let Some(i) = &a.epoch_interval {
+            def.epoch_interval = i.clone();
+        }
+        if let Some(m) = a.max_rows {
+            def.max_rows = m;
+        }
+        if let Some(m) = a.max_state_rows {
+            def.limits.max_state_rows = (m > 0).then_some(m);
+        }
+        if let Some(m) = a.max_late_rows {
+            def.limits.max_late_rows = (m > 0).then_some(m);
+        }
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            conn.execute(
+                &format!("UPDATE {CTL}.jobs SET definition = ?, version = version + 1, updated_at = now() WHERE job_id = ?"),
+                [&serde_json::to_string(&def)?, job],
+            )?;
+            if status == JobStatus::Running {
+                conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1", lease_table(job)))?;
+            }
+            Ok(())
+        })();
+        finish(conn, res)?;
+        Ok(def)
+    })
 }
 
 /// Sized so a typical epoch's sink rows land in the catalog instead of a tiny Parquet file (DuckLake's
@@ -544,6 +760,11 @@ fn set_status_once(conn: &Connection, job: &str, status: JobStatus, assign: Opti
             &format!("UPDATE {CTL}.jobs SET status = ?, updated_at = now() WHERE job_id = ?"),
             [status.as_str(), job],
         )?;
+        if assign.is_none() && status != JobStatus::Running {
+            // Fence the owner: an epoch it has in flight must not land after the view paused or stopped (a
+            // `drop` or `reset` may follow at once).
+            conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1", lease_table(job)))?;
+        }
         if let Some(a) = assign {
             let (owner, pin) = match a {
                 Assign::Pin(w) => (Some(w), Some(w)),

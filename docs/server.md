@@ -3,7 +3,7 @@
 ```sh
 cargo build --release
 target/release/duckwaked --worker w1 --quack-token secret      # Quack on quack:localhost:9494, metrics on :9464
-# or the published image (each v* release; amd64 and arm64):
+# or the published image (each v* release; amd64 and arm64; :X.Y.Z, :X.Y and :latest):
 docker pull ghcr.io/duckwake/duckwake:latest
 # or in Docker, with its own catalog database and data volume:
 docker compose --profile server up -d --build                 # token: duckwake-dev-token
@@ -49,6 +49,7 @@ stays out of process listings. Credentials for the catalog and the data files ar
 
 `GET :9464/metrics` serves per-view freshness, watermark delay, lag, epoch,
 stage time and row, late-row and dead-letter counters, plus commit time and conflicts, in the Prometheus
-format. A worker that fails restarts from its last checkpoint after 5 s, and the server stays up
+format; `duckwake run --metrics ADDR` serves the same. The series, the alerting rules and the Grafana dashboard
+in `deploy/` are described in [alerts.md](alerts.md). A worker that fails restarts from its last checkpoint after 5 s, and the server stays up
 (`duckwake_worker_status()` shows the restarts and the last error). `--quack none`
 or `--metrics none` turns either off; the worker flags (`--stage-threads`, `--pipeline`, ...) are those of `run`.

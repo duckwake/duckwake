@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
+#[derive(Clone)]
 pub struct WorkerConfig {
     pub worker_id: String,
     pub lake: LakeConfig,
@@ -91,7 +92,15 @@ struct JobRuntime {
     /// second of wall time. None until its first epoch commits.
     cost: Option<f64>,
     last_commit: Option<Instant>,
+    /// When the size of the job's state was last read (`check_limits`).
+    state_checked: Option<Instant>,
 }
+
+/// How often a worker reads the other workers' metrics addresses for service discovery.
+const TARGETS_EVERY: Duration = Duration::from_secs(15);
+
+/// How often a worker reads the size of its views' state, for `max_state_rows` and the metric.
+const STATE_CHECK_EVERY: Duration = Duration::from_secs(10);
 
 /// Weight of the newest epoch in a job's moving-average cost.
 const COST_ALPHA: f64 = 0.2;
@@ -217,6 +226,24 @@ struct StagedInput {
     snapshots_behind: i64,
 }
 
+/// A view's lease table is gone: the view was dropped while this worker still ran it. Its epoch is fenced,
+/// as if the lease had moved, and the others in the transaction commit without it.
+#[derive(Debug)]
+struct LeaseGone(String);
+
+impl std::fmt::Display for LeaseGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "view {} was dropped", self.0)
+    }
+}
+
+impl std::error::Error for LeaseGone {}
+
+fn is_missing_table(e: &duckdb::Error) -> bool {
+    let m = e.to_string();
+    m.contains("Catalog Error") && m.contains("does not exist")
+}
+
 /// A view input broke what the view relies on, such as an insert-only table that had rows updated or
 /// deleted: the view stops (status `failed`), the worker and its other views go on.
 #[derive(Debug)]
@@ -318,6 +345,17 @@ fn crash_point(point: &str) {
     }
 }
 
+/// Creates a worker's spill directory, or removes what DuckDB left in it when the worker last died.
+fn clear_spill_dir(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating the spill directory {}", dir.display()))?;
+    for e in std::fs::read_dir(dir)?.flatten() {
+        if e.file_name().to_string_lossy().starts_with("duckdb_temp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    Ok(())
+}
+
 pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> Result<()> {
     if cfg.lake.catalog.split_whitespace().any(|kv| kv.starts_with("password=")) {
         warn!(
@@ -334,12 +372,66 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         }
         cfg.lake.catalog = crate::lake::bound_idle_transactions(&cfg.lake.catalog, t);
     }
+    // Workers on one machine must not spill into each other's files, and a crashed one leaves its own behind.
+    let temp = std::path::Path::new(cfg.lake.temp_dir.as_deref().unwrap_or(".tmp")).join(&cfg.worker_id);
+    clear_spill_dir(&temp)?;
+    cfg.lake.temp_dir = Some(temp.to_string_lossy().into_owned());
+    // An epoch that does not fit in the memory limit fails; the worker then starts again from its checkpoints
+    // with half as many rows per epoch, in a fresh instance, instead of failing on the same epoch for ever.
+    let mut rows_cap: Option<usize> = None;
+    loop {
+        let mut w = start_worker(cfg.clone(), rt.clone(), rows_cap)?;
+        match w.run(&shutdown) {
+            Err(e) if is_out_of_memory(&e) && !shutdown.load(Ordering::Relaxed) => {
+                let largest = w.jobs.values().map(|j| j.def.max_rows).max().unwrap_or(100_000);
+                let cap = rows_cap.unwrap_or(largest).min(largest) / 2;
+                drop(w);
+                if cap < MIN_EPOCH_ROWS {
+                    return Err(e.context(format!(
+                        "out of memory even with {MIN_EPOCH_ROWS} rows per epoch: raise --memory-limit or run fewer views on this worker"
+                    )));
+                }
+                warn!(rows_per_epoch = cap, error = %format!("{e:#}"), "an epoch ran out of memory; starting again from the last checkpoints with smaller epochs");
+                if let Some(m) = &cfg.metrics {
+                    m.record_out_of_memory(cap);
+                }
+                clear_spill_dir(&temp)?;
+                rows_cap = Some(cap);
+            }
+            res => {
+                res?;
+                // The others take this worker's views over at once instead of after the lease timeout.
+                failover::deregister(&w.conns[0], &w.cfg.worker_id)?;
+                info!(worker = %w.cfg.worker_id, "worker stopped");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Views that must stop, with the reason.
+type Stopped = Vec<(String, String)>;
+
+/// Rows per epoch below which a worker out of memory gives up instead of halving its epochs again.
+const MIN_EPOCH_ROWS: usize = 1_000;
+
+fn is_out_of_memory(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("Out of Memory Error")
+}
+
+/// Opens the worker's instance, registers it and builds its scheduler; `rows_cap` caps every view's rows per
+/// epoch (after running out of memory).
+fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Result<Worker> {
     let conn = cfg.lake.open()?;
+    // Nothing a worker runs depends on the order rows were inserted in, and keeping it makes inserts buffer
+    // whole results: without it they stream, and stay inside the memory limit.
+    conn.execute_batch("SET preserve_insertion_order = false")?;
     crate::lake::bootstrap(&conn)?;
     catalog::set_control_inlining(&conn)?;
-    failover::register(&conn, &cfg.worker_id)?;
+    failover::register(&conn, &cfg.worker_id, cfg.metrics.as_ref().and_then(|m| m.advertised()).as_deref())?;
     if let Some(m) = &cfg.metrics {
         m.set_worker(&cfg.worker_id);
+        m.set_build(&conn.query_row("SELECT library_version FROM pragma_version()", [], |r| r.get::<_, String>(0))?);
         m.set_up(true);
     }
     let threads = match cfg.stage_threads {
@@ -362,6 +454,10 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         shared_readers = cfg.shared_readers,
         lean_commit = cfg.lean_commit,
         lease_timeout_s = cfg.lease_timeout.map(|t| t.as_secs_f64()),
+        memory_limit = %conns[0].query_row("SELECT current_setting('memory_limit')", [], |r| r.get::<_, String>(0))?,
+        duckdb_threads = conns[0].query_row("SELECT current_setting('threads')", [], |r| r.get::<_, i64>(0))?,
+        temp_dir = %cfg.lake.temp_dir.as_deref().unwrap_or_default(),
+        rows_per_epoch_cap = rows_cap,
         "worker started"
     );
     let liveness = failover::Liveness::new(
@@ -369,7 +465,9 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         cfg.stop_grace,
         heartbeat_every(cfg.lease_timeout),
     );
-    let mut w = Worker {
+    Ok(Worker {
+        rows_cap,
+        last_targets: None,
         liveness,
         last_heartbeat: Instant::now(),
         last_rebalance: Instant::now(),
@@ -385,12 +483,7 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
         drops: Vec::new(),
         waiting: HashSet::new(),
         load_rounds: 0,
-    };
-    w.run(&shutdown)?;
-    // The others take this worker's views over at once instead of after the lease timeout.
-    failover::deregister(&w.conns[0], &w.cfg.worker_id)?;
-    info!(worker = %w.cfg.worker_id, "worker stopped");
-    Ok(())
+    })
 }
 
 /// Runs a worker until `shutdown`, restarting it from its last checkpoint 5 s after it fails (a view that
@@ -444,6 +537,10 @@ struct Worker {
     waiting: HashSet<String>,
     /// Rebalance rounds in a row that found this worker carrying too much load.
     load_rounds: u32,
+    /// Most rows per epoch for any view, after an epoch ran out of memory; None: each view's `max_rows`.
+    rows_cap: Option<usize>,
+    /// When the scrape targets were last read from the lake.
+    last_targets: Option<Instant>,
 }
 
 /// How often a worker heartbeats: well inside the lease timeout, and at least every 5 s so workers with a
@@ -473,6 +570,7 @@ impl Worker {
             }
             if last_refresh.elapsed() >= self.cfg.refresh_every {
                 self.refresh()?;
+                self.check_limits()?;
                 last_refresh = Instant::now();
             }
             if self.jobs.is_empty() {
@@ -487,7 +585,12 @@ impl Worker {
                 continue;
             }
             last_epoch = Instant::now();
-            if let Some(mut batch) = self.stage_epoch()? {
+            let (batch, stopped) = self.stage_epoch()?;
+            // Views that stopped are out of the epoch; the others commit it.
+            for (id, why) in stopped {
+                self.fail_job(&id, &why)?;
+            }
+            if let Some(mut batch) = batch {
                 if self.committer.in_flight() {
                     crash_point("staged_ahead");
                 }
@@ -518,6 +621,64 @@ impl Worker {
         if let Some(c) = self.committer.finish()? {
             self.apply(c);
         }
+        Ok(())
+    }
+
+    /// Reads the size of each stateful view's state every `STATE_CHECK_EVERY` (the state as last committed),
+    /// and fails a view whose state has outgrown its `max_state_rows`: the worker and its other views go on.
+    fn check_limits(&mut self) -> Result<()> {
+        // Every worker with an endpoint serves the list of all of them (`GET /sd`): Prometheus needs one address.
+        if let Some(m) = self.cfg.metrics.as_ref().filter(|_| self.last_targets.is_none_or(|t| t.elapsed() >= TARGETS_EVERY)) {
+            m.set_targets(failover::scrape_targets(&self.conns[0])?);
+            self.last_targets = Some(Instant::now());
+        }
+        if let Some(m) = &self.cfg.metrics {
+            let (used, spilled, limit): (i64, i64, String) = self.conns[0].query_row(
+                "SELECT coalesce(sum(memory_usage_bytes), 0)::BIGINT, coalesce(sum(temporary_storage_bytes), 0)::BIGINT,
+                        current_setting('memory_limit') FROM duckdb_memory()",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            m.set_duckdb_memory(used.max(0) as u64, spilled.max(0) as u64, crate::process::parse_size(&limit).unwrap_or(0));
+        }
+        let due: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.def.plan.has_state() && j.state_checked.is_none_or(|t| t.elapsed() >= STATE_CHECK_EVERY))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut over = Vec::new();
+        for id in due {
+            let rows: i64 = self.conns[0].query_row(&format!("SELECT count(*) FROM {}", state_table(&id)), [], |r| r.get(0))?;
+            let j = self.jobs.get_mut(&id).unwrap();
+            j.state_checked = Some(Instant::now());
+            if let Some(m) = &self.cfg.metrics {
+                m.set_state_rows(&id, rows);
+            }
+            if let Some(max) = j.def.limits.max_state_rows.filter(|m| rows as u64 > *m) {
+                over.push((
+                    id,
+                    format!(
+                        "its state holds {rows} rows, over its max_state_rows of {max}: bound the view (a window, fewer \
+                         groups) or raise the limit (alter-view --max-state-rows), then start it again"
+                    ),
+                ));
+            }
+        }
+        for (id, why) in over {
+            self.fail_job(&id, &why)?;
+        }
+        Ok(())
+    }
+
+    /// Marks a view failed and drops it from this worker; the others go on.
+    fn fail_job(&mut self, id: &str, why: &str) -> Result<()> {
+        warn!(job = %id, error = %why, "view stopped: marking it failed");
+        catalog::set_status(&self.conns[0], id, crate::model::JobStatus::Failed, None)?;
+        if let Some(m) = &self.cfg.metrics {
+            m.record_view_failed();
+        }
+        self.remove_job(id);
         Ok(())
     }
 
@@ -572,6 +733,9 @@ impl Worker {
                 Err(e) => {
                     warn!(job = %id, error = %format!("{e:#}"), "cannot start job; marking failed");
                     catalog::set_status(&self.conns[0], &id, crate::model::JobStatus::Failed, None)?;
+                    if let Some(m) = &self.cfg.metrics {
+                        m.record_view_failed();
+                    }
                 }
             }
         }
@@ -728,7 +892,8 @@ impl Worker {
             }
             let source = Arc::new(sources.get(name).with_context(|| format!("source {name} of the view is gone"))?.clone());
             let decoder = source.options.arrow_decoder()?.map(Arc::new);
-            let (reader, offsets) = Reader::start(&self.rt, &source.options, &start, def.max_rows, decoder)?;
+            let max_rows = self.rows_cap.map_or(def.max_rows, |c| c.min(def.max_rows));
+            let (reader, offsets) = Reader::start(&self.rt, &source.options, &start, max_rows, decoder)?;
             let joined = self
                 .groups
                 .iter()
@@ -739,14 +904,14 @@ impl Worker {
                     // The group's reader is at the same position; this job's own is dropped unused.
                     let g = self.groups.get_mut(&gid).unwrap();
                     g.members.insert(id.to_string());
-                    g.max_rows = g.max_rows.min(def.max_rows);
+                    g.max_rows = g.max_rows.min(max_rows);
                     gid
                 }
                 None => {
                     let gid = self.next_group;
                     self.next_group += 1;
                     let members = BTreeSet::from([id.to_string()]);
-                    let g = Group { source: source.clone(), reader, offsets: offsets.clone(), members, max_rows: def.max_rows };
+                    let g = Group { source: source.clone(), reader, offsets: offsets.clone(), members, max_rows };
                     self.groups.insert(gid, g);
                     gid
                 }
@@ -777,6 +942,10 @@ impl Worker {
         };
         let Checkpoint { epoch, watermark_us, max_event_time_us, .. } = ckpt;
         info!(job = %id, lease, epoch, "job started");
+        if let Some(m) = &self.cfg.metrics {
+            let delay_us = inputs.iter().map(|i| i.delay_us).max().unwrap_or(0);
+            m.set_view_config(id, parse_duration(&def.epoch_interval)?.as_secs_f64(), delay_us as f64 / 1e6, def.limits.max_state_rows);
+        }
         let j = JobRuntime {
             interval: parse_duration(&def.epoch_interval)?,
             def: Arc::new(def),
@@ -791,6 +960,7 @@ impl Worker {
             started: Instant::now(),
             cost: None,
             last_commit: None,
+            state_checked: None,
         };
         self.jobs.insert(id.to_string(), j);
         Ok(true)
@@ -813,6 +983,9 @@ impl Worker {
                 self.drops.extend(group_tables(gid));
             } else {
                 g.max_rows = g.members.iter().map(|m| self.jobs[m].def.max_rows).min().unwrap();
+                if let Some(c) = self.rows_cap {
+                    g.max_rows = g.max_rows.min(c);
+                }
             }
         }
     }
@@ -820,7 +993,7 @@ impl Worker {
     /// Takes in a committed epoch: drops the jobs it fenced and logs the others.
     fn apply(&mut self, c: Committed) {
         for id in &c.fenced {
-            warn!(job = %id, "lease lost: another worker owns this job now; dropping it");
+            warn!(job = %id, "lease lost (the view was stopped, paused, replaced or taken over); dropping it");
             self.remove_job(id);
         }
         self.committed += 1;
@@ -896,7 +1069,10 @@ impl Worker {
 
     /// Polls and stages the next epoch of every job. Returns it for the commit, or None when there is nothing
     /// to commit: no new rows and no watermark moved.
-    fn stage_epoch(&mut self) -> Result<Option<CommitBatch>> {
+    /// Stages every job's next epoch. A job that must stop (a broken input promise, a limit) is left out and
+    /// returned with the reason, for the caller to fail once the batch is built: the events its group read
+    /// this epoch are the other members' too, so the epoch goes on without it rather than being dropped.
+    fn stage_epoch(&mut self) -> Result<(Option<CommitBatch>, Stopped)> {
         let t0 = Instant::now();
         let Worker { cfg, conns, jobs, groups, rounds, drops, .. } = self;
         let round = *rounds + 1;
@@ -954,24 +1130,23 @@ impl Worker {
             stage_view(conn, id, j, &srcs, parity, overlay).with_context(|| format!("job {id}: staging failed"))
         });
         // A view whose input broke a promise it relies on stops alone; any other failure fails the worker.
-        let mut staged = Vec::new();
+        let mut staged: Vec<(String, Staged)> = Vec::new();
         let mut stopped = Vec::new();
         for (id, r) in jobs.keys().zip(results) {
             match r {
-                Ok(s) => staged.push(s),
+                Ok(s) if jobs[id].def.limits.max_late_rows.is_some_and(|m| s.rows_late as u64 > m) => stopped.push((
+                    id.clone(),
+                    format!(
+                        "an epoch has {} late rows, over its max_late_rows of {}: check the source's event times and \
+                         watermark_delay, or raise the limit (alter-view --max-late-rows), then start it again",
+                        s.rows_late,
+                        jobs[id].def.limits.max_late_rows.unwrap_or_default()
+                    ),
+                )),
+                Ok(s) => staged.push((id.clone(), s)),
                 Err(e) if e.downcast_ref::<StopJob>().is_some() => stopped.push((id.clone(), format!("{e:#}"))),
                 Err(e) => return Err(e),
             }
-        }
-        if !stopped.is_empty() {
-            for (id, why) in &stopped {
-                warn!(job = %id, error = %why, "view stopped: marking it failed");
-                catalog::set_status(&conns[0], id, crate::model::JobStatus::Failed, None)?;
-            }
-            for (id, _) in &stopped {
-                self.remove_job(id);
-            }
-            return Ok(None);
         }
         // Nothing new and no window can close: skip the commit instead of writing an empty snapshot. A view
         // with lake inputs sees its watermark move with every snapshot, its own commits' included, so for it
@@ -980,8 +1155,9 @@ impl Worker {
             s.rows_in > 0
                 || (s.watermark_us != j.watermark_us && (j.def.lake_inputs.is_empty() || (j.def.plan.is_windowed() && s.closes)))
         };
-        if !jobs.values().zip(&staged).any(|(j, s)| worth(j, s)) {
-            return Ok(None);
+        // (Nothing worth it means no remaining job's group read events, so none are lost by skipping.)
+        if !staged.iter().any(|(id, s)| worth(&jobs[id], s)) {
+            return Ok((None, stopped));
         }
 
         // 4. This is every job's next epoch; the one after is staged from here.
@@ -992,7 +1168,8 @@ impl Worker {
             }
         }
         let mut batch = Vec::new();
-        for ((id, j), s) in jobs.iter_mut().zip(staged) {
+        for (id, s) in staged {
+            let j = jobs.get_mut(&id).unwrap();
             j.epoch += 1;
             for (input, si) in j.inputs.iter_mut().zip(&s.inputs) {
                 input.offsets = si.offsets.clone();
@@ -1034,7 +1211,7 @@ impl Worker {
         if cfg.shared_readers {
             merge_groups(groups, jobs, &mut drop_after);
         }
-        Ok(Some(CommitBatch { round, lean: cfg.lean_commit, jobs: batch, poll_stage_ms: t0.elapsed().as_millis(), drop_after }))
+        Ok((Some(CommitBatch { round, lean: cfg.lean_commit, jobs: batch, poll_stage_ms: t0.elapsed().as_millis(), drop_after }), stopped))
     }
 }
 
@@ -1620,10 +1797,20 @@ fn commit_loop(
 fn commit_epoch(conn: &Connection, worker: &str, mut batch: CommitBatch) -> Result<Committed> {
     let t = Instant::now();
     let mut attempt = 0;
+    let mut dropped: Vec<String> = Vec::new();
     loop {
         attempt += 1;
         let (mut fenced, mut timing) = (Vec::new(), CommitTiming::default());
-        match commit(conn, worker, &mut batch, &mut fenced, &mut timing) {
+        let res = if batch.jobs.is_empty() { Ok(()) } else { commit(conn, worker, &mut batch, &mut fenced, &mut timing) };
+        fenced.extend(dropped.iter().cloned());
+        match res {
+            Err(e) if e.downcast_ref::<LeaseGone>().is_some() => {
+                let id = e.downcast_ref::<LeaseGone>().unwrap().0.clone();
+                warn!(job = %id, "view dropped during its epoch; committing the others without it");
+                batch.jobs.retain(|c| c.id != id);
+                dropped.push(id);
+                attempt -= 1;
+            }
             Ok(()) => {
                 let visible_at = chrono::Utc::now();
                 crash_point("after_commit");
@@ -1701,7 +1888,8 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                     &format!("UPDATE {} SET last_epoch = ? WHERE owner_worker = ? AND lease_epoch = ?", lease_table(id)),
                     duckdb::params![epoch, worker, c.lease],
                 )
-            })?;
+            })
+            .map_err(|e| if is_missing_table(&e) { anyhow::Error::new(LeaseGone(id.clone())) } else { e.into() })?;
             if n == 0 {
                 fenced.push(id.clone());
                 continue;

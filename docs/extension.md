@@ -41,7 +41,8 @@ library (DuckDB's V1 C API, pinned to v1.5.6, which DuckDB 2.0 loads).
 `scripts/package_extension.sh` lays the build out as a DuckDB extension repository
 (`dist/extensions/v2.0.0/<platform>/duckwake.duckdb_extension.gz`); any static host (S3, GitHub Pages) can serve
 that folder, and `INSTALL duckwake FROM '<url>'` installs from it. `.github/workflows/release.yml` builds it for
-Linux and macOS (amd64, arm64) on a `v*` tag or a manual run, and attaches the merged repository to the release.
+Linux and macOS (amd64, arm64) on a `v*` tag or a manual run, attaches the merged repository to the release,
+and can publish it on the website ([releasing.md](releasing.md)).
 Until DuckWake is a signed community extension, hosts need `-unsigned`. DuckDB's community extension CI builds
 Rust extensions through `extension-template-rs`, which is still experimental and uses the V2 C API; DuckWake
 uses the V1 API, so it would move to the V2 entry point before being submitted.

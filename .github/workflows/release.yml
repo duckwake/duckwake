@@ -1,9 +1,16 @@
-# Builds the duckwake extension on each platform and lays it out as a DuckDB extension repository
-# (dist/extensions/v2.0.0/<platform>/duckwake.duckdb_extension.gz). On a v* tag, the merged repository is
-# attached to a GitHub release, and the duckwaked image is published to ghcr.io/<owner>/duckwake (amd64 and
-# arm64, each built natively). Publish the repository folder on any static host and users run
-#   INSTALL duckwake FROM 'https://your-host/extensions'; LOAD duckwake;   (with duckdb -unsigned)
-# Linux builds link against the runner's glibc, which may be newer than DuckDB's own Linux builds expect.
+# Release (docs/releasing.md). On a v* tag:
+#   check       the tag matches the crate version and CHANGELOG.md has its section; clippy and unit tests pass
+#   binaries    duckwake and duckwaked for Linux and macOS (amd64, arm64), each a .tar.gz
+#   extension   the duckwake extension per platform, merged into one DuckDB extension repository
+#               (extensions/v2.0.0/<platform>/duckwake.duckdb_extension.gz)
+#   release     a GitHub release with the archives, SHA256SUMS and the changelog section as notes; a tag with a
+#               pre-release suffix (v0.2.0-rc.1) makes a pre-release
+#   image       ghcr.io/<owner>/duckwake:<version> (amd64 and arm64), and :<major>.<minor> and :latest for releases
+#   pages       optional: copies the extension repository into the website repository, so that
+#               INSTALL duckwake FROM 'https://duckwake.github.io/extensions' works; runs only when the repository
+#               variable PUBLISH_EXTENSIONS is 'true' and the secret PAGES_TOKEN can push to it
+# A manual run (workflow_dispatch) builds everything and publishes nothing.
+# Linux builds link against the runner's glibc (Ubuntu 24.04: 2.39); older distributions should use the image.
 name: release
 on:
   push:
@@ -12,10 +19,63 @@ on:
 
 permissions:
   contents: write   # the GitHub release
-  packages: write   # the duckwaked image on ghcr.io
+  packages: write   # the image on ghcr.io
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          [[ $version == *-* ]] && echo "prerelease=true" >> "$GITHUB_OUTPUT" || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            [[ $GITHUB_REF_NAME == "v$version" ]] || { echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"; exit 1; }
+            grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  binaries:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04, platform: linux_amd64 }
+          - { os: ubuntu-24.04-arm, platform: linux_arm64 }
+          - { os: macos-14, platform: osx_arm64 }
+          - { os: macos-15-intel, platform: osx_amd64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p duckwake --bin duckwake --bin duckwaked
+      - run: |
+          name=duckwake-${{ needs.check.outputs.version }}-${{ matrix.platform }}
+          mkdir -p "dist/$name"
+          cp target/release/duckwake target/release/duckwaked README.md CHANGELOG.md "dist/$name/"
+          "dist/$name/duckwake" --version
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: dist/*.tar.gz
+
   extension:
+    needs: check
     strategy:
       matrix:
         include:
@@ -33,28 +93,44 @@ jobs:
           name: extension-${{ matrix.platform }}
           path: dist/extensions
 
-  repository:
-    needs: extension
+  release:
+    needs: [check, binaries, extension]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: extension-*
           path: dist/extensions
           merge-multiple: true
-      - run: find dist -type f | sort
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist/assets
+          merge-multiple: true
+      - run: |
+          version=${{ needs.check.outputs.version }}
+          find dist/extensions -type f | sort
+          tar -czf "dist/assets/duckwake-extensions-$version.tar.gz" -C dist extensions
+          (cd dist/assets && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          # The release notes: this version's section of the changelog.
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on' CHANGELOG.md > dist/notes.md
+          cat dist/notes.md
       - uses: actions/upload-artifact@v4
         with:
           name: duckwake-extension-repository
           path: dist/extensions
       - if: startsWith(github.ref, 'refs/tags/')
-        run: tar -czf duckwake-extensions-${{ github.ref_name }}.tar.gz -C dist extensions
-      - if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: duckwake-extensions-${{ github.ref_name }}.tar.gz
+          body_path: dist/notes.md
+          prerelease: ${{ needs.check.outputs.prerelease == 'true' }}
+          files: |
+            dist/assets/*.tar.gz
+            dist/assets/SHA256SUMS
 
   image:
+    needs: check
     if: startsWith(github.ref, 'refs/tags/')
     strategy:
       matrix:
@@ -71,12 +147,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       # The build compiles DuckDB from source (~15 min).
       - run: |
-          image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${{ matrix.arch }}
-          docker build -t "$image" .
+          image=ghcr.io/${GITHUB_REPOSITORY,,}:${{ needs.check.outputs.version }}-${{ matrix.arch }}
+          docker build -t "$image" \
+            --label org.opencontainers.image.version=${{ needs.check.outputs.version }} \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.title=duckwake .
+          docker run --rm --entrypoint duckwake "$image" --version
           docker push "$image"
 
   image-manifest:
-    needs: image
+    needs: [check, image]
     runs-on: ubuntu-24.04
     steps:
       - uses: docker/login-action@v3
@@ -87,5 +168,35 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - run: |
           image=ghcr.io/${GITHUB_REPOSITORY,,}
-          docker buildx imagetools create -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" \
-            "$image:${GITHUB_REF_NAME}-amd64" "$image:${GITHUB_REF_NAME}-arm64"
+          version=${{ needs.check.outputs.version }}
+          tags=(-t "$image:$version")
+          # Pre-releases keep :latest and :<major>.<minor> where they are.
+          if [[ ${{ needs.check.outputs.prerelease }} == false ]]; then
+            tags+=(-t "$image:${version%.*}" -t "$image:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "$image:$version-amd64" "$image:$version-arm64"
+
+  pages:
+    needs: [check, release]
+    if: startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_EXTENSIONS == 'true' && needs.check.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: duckwake-extension-repository
+          path: extensions
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ github.repository_owner }}.github.io
+          token: ${{ secrets.PAGES_TOKEN }}
+          path: site-repo
+      # Each DuckDB version's folder is replaced; the folders of other DuckDB versions stay.
+      - run: |
+          mkdir -p site-repo/site/extensions
+          for d in extensions/*/; do rm -rf "site-repo/site/extensions/$(basename "$d")"; cp -R "$d" site-repo/site/extensions/; done
+          cd site-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site/extensions
+          git commit -m "Extension repository for DuckWake ${{ needs.check.outputs.version }}" || exit 0
+          git push

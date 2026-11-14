@@ -11,6 +11,7 @@ pub mod lake;
 pub mod maintenance;
 pub mod metrics;
 pub mod model;
+pub mod process;
 pub mod secrets;
 pub mod sql_functions;
 pub mod verify;

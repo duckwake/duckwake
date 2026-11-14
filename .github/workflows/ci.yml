@@ -66,12 +66,18 @@ jobs:
           - { name: serve, run: scripts/serve_test.sh }
           - { name: extension, run: scripts/extension_test.sh }
           - { name: composed, run: scripts/composed_test.sh, duckdb_cli: true }
+          # P4: views and sources changed while they run, and limits that fail one view or shrink epochs.
+          - { name: schema, run: scripts/schema_test.sh }
+          - { name: limits, run: scripts/limits_test.sh }
+          - { name: monitoring, run: scripts/monitoring_test.sh }
           # The suites that kill workers mid-epoch, again with the four parallel-processing flags.
           - { name: crash pipelined, run: scripts/crash_test.sh, flags: true }
           - { name: failover pipelined, run: scripts/failover_test.sh, flags: true }
           - { name: rebalance pipelined, run: scripts/rebalance_test.sh, flags: true }
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
+          - { name: schema pipelined, run: scripts/schema_test.sh, flags: true }
+          - { name: limits pipelined, run: scripts/limits_test.sh, flags: true }
     name: suite (${{ matrix.name }})
     env:
       WORKER_FLAGS: ${{ matrix.flags && '--stage-threads 4 --pipeline --shared-readers --lean-commit' || '' }}
@@ -101,10 +107,23 @@ jobs:
             .lake/**/*.txt
           retention-days: 7
 
-  # One check for branch protection: green only when the build and every suite are.
+  # The alerting rules load and pass their unit tests; the dashboard is valid JSON. (That both name only
+  # series a worker exports is a unit test in crates/core/src/metrics.rs.)
+  monitoring:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker run --rm -v "$PWD/deploy:/d:ro" -w /d/prometheus --entrypoint promtool prom/prometheus:v3.1.0 check rules duckwake-alerts.yml
+          docker run --rm -v "$PWD/deploy:/d:ro" -w /d/prometheus --entrypoint promtool prom/prometheus:v3.1.0 test rules duckwake-alerts.test.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.1.0 check config /etc/prometheus/prometheus.yml
+          python3 -m json.tool deploy/grafana/dashboards/duckwake.json >/dev/null
+
+  # One check for branch protection: green only when the build, every suite and the monitoring checks are.
   ci-passed:
     if: always()
-    needs: [build, suite]
+    needs: [build, suite, monitoring]
     runs-on: ubuntu-24.04
     steps:
-      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success ]]'
+      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success && "${{ needs.monitoring.result }}" == success ]]'

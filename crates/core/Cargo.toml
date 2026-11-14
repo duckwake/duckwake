@@ -19,6 +19,7 @@ webpki-roots.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 rand.workspace = true
+libc = "0.2"
 
 [features]
 default = ["bundled"]

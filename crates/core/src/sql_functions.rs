@@ -98,6 +98,8 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     }
     action::<CreateSource>(conn, api)?;
     action::<CreateView>(conn, api)?;
+    action::<AddSourceColumn>(conn, api)?;
+    action::<AlterView>(conn, api)?;
     action::<Start>(conn, api)?;
     action::<Pause>(conn, api)?;
     action::<Stop>(conn, api)?;
@@ -155,6 +157,10 @@ impl Args {
 
     fn opt_num<T: std::str::FromStr>(&self, n: &str) -> Result<Option<T>> {
         self.opt(n).map(|v| v.parse().map_err(|_| anyhow!("{}: {n} must be a number, not {v:?}", self.name))).transpose()
+    }
+
+    fn flag(&self, n: &str) -> bool {
+        self.opt(n).is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 }
 
@@ -330,6 +336,9 @@ impl Spec for CreateView {
             ("max_rows", Bigint),
             ("checkpoint", Varchar),
             ("inline_row_limit", Bigint),
+            ("max_state_rows", Bigint),
+            ("max_late_rows", Bigint),
+            ("replace", Boolean),
         ]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
@@ -339,9 +348,46 @@ impl Spec for CreateView {
             epoch_interval: a.opt("epoch_interval").map(String::from),
             max_rows: a.opt_num("max_rows")?,
             inline_row_limit: a.opt_num("inline_row_limit")?,
+            max_state_rows: a.opt_num("max_state_rows")?,
+            max_late_rows: a.opt_num("max_late_rows")?,
+            replace: a.flag("replace"),
         };
         let (def, msg) = api.with(|c| api::create_view(c, a.arg(0), a.arg(1), &o, None))?;
         one(&def.job_id, msg)
+    }
+}
+
+/// `duckwake_add_source_column(source, column, type)`: views that read the source keep their columns.
+struct AddSourceColumn;
+impl Spec for AddSourceColumn {
+    const NAME: &'static str = "duckwake_add_source_column";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar, Varchar, Varchar]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        one(a.arg(0), api.with(|c| api::add_source_column(c, a.arg(0), a.arg(1), a.arg(2)))?)
+    }
+}
+
+/// `duckwake_alter_view(view, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=)`: how the
+/// view runs, not what it computes; a limit of 0 removes it.
+struct AlterView;
+impl Spec for AlterView {
+    const NAME: &'static str = "duckwake_alter_view";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar]
+    }
+    fn named() -> Vec<(&'static str, LogicalTypeId)> {
+        vec![("epoch_interval", Varchar), ("max_rows", Bigint), ("max_state_rows", Bigint), ("max_late_rows", Bigint)]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        let alter = crate::catalog::AlterView {
+            epoch_interval: a.opt("epoch_interval").map(String::from),
+            max_rows: a.opt_num("max_rows")?,
+            max_state_rows: a.opt_num("max_state_rows")?,
+            max_late_rows: a.opt_num("max_late_rows")?,
+        };
+        one(a.arg(0), api.with(|c| api::alter_view(c, a.arg(0), &alter))?)
     }
 }
 
@@ -414,7 +460,7 @@ impl Spec for DropView {
         vec![("keep_table", Boolean)]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
-        let keep = a.opt("keep_table").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let keep = a.flag("keep_table");
         one(a.arg(0), api.with(|c| api::drop(c, a.arg(0), keep))?)
     }
 }
