@@ -1,6 +1,7 @@
 # Performance: worker flags and benchmarks
 
-`run`, `serve` (`duckwaked`) and `playground` take four flags for parallel processing. They are off by
+`run`, `serve` (`duckwaked`) and `playground` take four flags from the
+[parallel processing plan](design/parallel-processing.md). They are off by
 default until a 24 h soak with them on has passed:
 - `--stage-threads N` stages views in parallel, each thread on its own DuckDB connection to the same
   instance (`0` = half the cores).

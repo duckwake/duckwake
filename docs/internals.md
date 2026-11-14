@@ -104,6 +104,9 @@ operator's semantics and a test oracle, not a dependency.
 
 ## Findings that should change the design doc
 
+The design doc is [design/streaming-extension.md](design/streaming-extension.md); its POC findings section
+records the ones it took up.
+
 1. **Fence on a per-job lease table, not on `jobs`.** In DuckLake, an UPDATE to one row conflicts with
    a concurrent UPDATE to any other row of the same table: "another transaction has deleted inlined data
    from it". The doc's per-epoch `UPDATE jobs ... WHERE lease_epoch = $lease` would make all workers
