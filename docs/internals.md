@@ -104,13 +104,13 @@ operator's semantics and a test oracle, not a dependency.
 
 ## Findings that should change the design doc
 
-The design doc is [design/streaming-extension.md](design/streaming-extension.md); its POC findings section
+The design doc is [design/streaming-extension.md](design/streaming-extension.md); its findings from the first build
 records the ones it took up.
 
 1. **Fence on a per-job lease table, not on `jobs`.** In DuckLake, an UPDATE to one row conflicts with
    a concurrent UPDATE to any other row of the same table: "another transaction has deleted inlined data
    from it". The doc's per-epoch `UPDATE jobs ... WHERE lease_epoch = $lease` would make all workers
-   collide every epoch, and also collide with every `start`/`pause`. The POC fences on
+   collide every epoch, and also collide with every `start`/`pause`. DuckWake fences on
    `__duckwake.lease_<job>`, and the worker never writes `jobs` during an epoch. Zombie fencing works:
    the stale commit fails at COMMIT with a conflict, or its fence UPDATE matches 0 rows.
 2. **A transaction can write only one attached database.** `Δ` temp tables cannot be filled inside the

@@ -342,7 +342,7 @@ The incrementalization rules look only at the class and the engine runs only ste
 
 Each stage widens the operator matrix on stock DuckDB toward Feldera's coverage (the parity table above) and ends at a gate from the spikes below.
 
-- **Stage 1 (done in the POC):** signed rows end to end. A weight column through the compiler, upsert sinks, and global `GROUP BY` with invertible aggregates.
+- **Stage 1 (done in v0.1.0):** signed rows end to end. A weight column through the compiler, upsert sinks, and global `GROUP BY` with invertible aggregates.
 - **Stage 2, the DBSP base:** compile views to an explicit DBSP operator graph. On top of it: `UNION ALL`, the remaining linear aggregates (`STDDEV`, `VAR`, `COVAR`, `REGR_*`), per-column `LATENESS` with waterline state cleanup, unbounded-state warnings, and exported aggregate states for `approx_count_distinct`, quantiles and `list`.
 - **Stage 3, retractions everywhere:** multiset state for `MIN` / `MAX`, `ARG_MIN` / `ARG_MAX` and `ARRAY_AGG`; `DISTINCT` and set operations; stream–stream inner, outer, semi and anti joins; `GROUPING SETS`; sources with updates and deletes (CDC, primary keys, DuckLake tables through `table_changes`).
 - **Stage 4, ordered operators:** top-k, `ROW_NUMBER` / `RANK` / `DENSE_RANK`, `LAG` / `LEAD`, rolling `OVER` aggregates, `ASOF` joins, and `emit_final` for any view with a waterline.

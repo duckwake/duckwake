@@ -1,4 +1,4 @@
-# Local stack for the DuckWake POC: DuckLake catalog on PostgreSQL, Kafka API on Redpanda.
+# Local stack for DuckWake: DuckLake catalog on PostgreSQL, Kafka API on Redpanda.
 # Lake data files live on the host under ./.lake/data (see README).
 services:
   postgres:

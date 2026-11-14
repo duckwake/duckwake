@@ -8,7 +8,7 @@ transaction, so a crash never loses or duplicates output. Views can filter, join
 tumbling and hopping windows, or keep running totals per group. Late events and undecodable messages go to
 their own tables.
 
-DuckWake is a proof of concept of streaming SQL for DuckDB, built on DuckDB 2.0 and DuckLake 1.1.
+DuckWake brings streaming SQL to DuckDB, built on DuckDB 2.0 and DuckLake 1.1.
 
 ## Quick start
 
@@ -58,7 +58,7 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 
 ## Status
 
-A proof of concept. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
+Version 0.1, on its [roadmap](docs/roadmap.md) to production. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
 across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`). A view can also read
 another view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with
 nothing to declare; when that table's rows are updated or deleted, the view retracts them (windowed views

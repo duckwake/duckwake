@@ -210,7 +210,7 @@ FROM duckwake_jobs();                 -- epoch, watermark, lag, freshness, dead 
 - A `<view>_live` view: the view's table unioned with still-open windows finalized from state, for users who want results so far.
 - No session to keep open: the session only writes definitions to `lake.__duckwake`. Workers run the jobs and claim them through leases (see Architecture), so any session can create, pause, reset or drop a view.
 
-The POC already has sources with snapshot reads, output written to plain DuckLake tables, lookup joins, create-time rejection and the control/worker split. Build order for the rest: EXPLAIN and teaching errors, column inference, `CHANGES()` and views over views, `_live` views, then the DDL shim.
+v0.1.0 already has sources with snapshot reads, output written to plain DuckLake tables, lookup joins, create-time rejection and the control/worker split. Build order for the rest: EXPLAIN and teaching errors, column inference, `CHANGES()` and views over views, `_live` views, then the DDL shim.
 
 ## Execution model
 
@@ -429,7 +429,7 @@ We build on [duckdb/extension-template-rs](https://github.com/duckdb/extension-t
 - [x] The daemon links the extension statically and exposes its functions over Quack.
 - [ ] Two instances in one process respect separate memory limits.
 
-**Built in the POC (Nov 4).** All three front-ends run on one SQL function API (`duckwake_create_source`, `duckwake_create_view`, `duckwake_start/pause/stop/reset/drop`, `duckwake_jobs()`, `duckwake_checkpoints()`, `duckwake_verify`, `duckwake_wait`), implemented once as DuckDB table functions.
+**Built in v0.1.0 (Nov 4).** All three front-ends run on one SQL function API (`duckwake_create_source`, `duckwake_create_view`, `duckwake_start/pause/stop/reset/drop`, `duckwake_jobs()`, `duckwake_checkpoints()`, `duckwake_verify`, `duckwake_wait`), implemented once as DuckDB table functions.
 
 - **duckwaked** registers the functions in its own DuckDB, which has the lake attached, and calls `quack_serve`. In the DuckDB 2.0 CLI, `ATTACH 'quack:host' AS dw (TOKEN ...)` then `CONNECT dw` runs every statement on the server (tested: queries, `duckwake_*` calls, reads of the views' tables). Clients that prepare every statement first, such as the Rust duckdb crate, fail under CONNECT, so they send statements through `quack_query(...)` instead. Prometheus metrics are served on `/metrics`.
 - **The extension** is built with the classic duckdb crate's loadable-extension feature rather than duckdb-neo. The same engine compiles against the host's DuckDB library and opens its private instance through the C API. DuckDB 2.0 loads it with the V1 C API pinned to v1.5.6 (footer ABI C\_STRUCT). C\_STRUCT\_UNSTABLE or the V2 API would need a `<name>_init_c_api_v2` entry point, which the Rust macros don't generate. `duckwake_worker_start()` runs a worker inside the session.
@@ -450,7 +450,7 @@ The plan is about 17 weeks for one to two engineers, front-loaded with a 2-week 
 
 Each phase ends at a gate that must pass before the next starts; Phase 1 alone is already useful for append-only ingestion into the lake.
 
-**Path to production (added Nov 4).** The POC (v0.1.0) has the engine, three front-ends and a release pipeline. These are what stand between it and production, in order; each stage ends at a gate.
+**Path to production (added Nov 4).** v0.1.0 has the engine, three front-ends and a release pipeline. These are what stand between it and production, in order; each stage ends at a gate.
 
 | Stage | Items | Gate |
 | --- | --- | --- |
@@ -480,9 +480,9 @@ After production, from user feedback: SQL authoring through dbt instead of `CREA
 | Kafka client (librdkafka) adds build and platform complexity | Low | Build only linux\_amd64 / linux\_arm64 first; host in a private extension repository |
 | Memory pressure from many jobs on one worker | Low | Per-job state caps, spill to object storage backend |
 
-**POC findings (2026-10-29)**
+**Findings from the first build (2026-10-29)**
 
-The POC (DuckDB v2.0.0, DuckLake 1.1, PostgreSQL 16 catalog, Redpanda) passed gates 0 and 1: crash tests with up to 16 kill -9 and injected aborts per run, a zombie-worker test, and 5k events/s of \~1 KB events, all verified exactly against batch SQL. Four findings change this design.
+The first build (DuckDB v2.0.0, DuckLake 1.1, PostgreSQL 16 catalog, Redpanda) passed gates 0 and 1: crash tests with up to 16 kill -9 and injected aborts per run, a zombie-worker test, and 5k events/s of \~1 KB events, all verified exactly against batch SQL. Four findings change this design.
 
 | Finding | Impact on the design | Change |
 | --- | --- | --- |

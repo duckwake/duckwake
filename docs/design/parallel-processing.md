@@ -6,7 +6,7 @@ A worker does almost everything one step at a time: it reads each view's source 
 
 ## Status and measurements (Nov 4)
 
-All four changes are built in the POC. Each sits behind a worker flag that is off by default: `--stage-threads N`, `--pipeline`, `--shared-readers` and `--lean-commit`. Global aggregates overlap through the overlay. Change 4 was chosen from the step 0 split: statements took about 85% of the commit and `COMMIT` about 15%, so the commit now skips writes with nothing to write (in most epochs no window closes) and writes all views' checkpoints and dead letters with one statement each.
+All four changes are built (v0.1.0). Each sits behind a worker flag that is off by default: `--stage-threads N`, `--pipeline`, `--shared-readers` and `--lean-commit`. Global aggregates overlap through the overlay. Change 4 was chosen from the step 0 split: statements took about 85% of the commit and `COMMIT` about 15%, so the commit now skips writes with nothing to write (in most epochs no window closes) and writes all views' checkpoints and dead letters with one statement each.
 
 **Ceiling.** One worker draining a 300k-event backlog with the playground's view mix (`scale_bench.sh` with `CATCHUP=1`, 10-core laptop):
 
@@ -105,7 +105,7 @@ After Changes 1–3 the commit is the limit, and we don't yet know where its 790
 
 1. **Measure first.** Log the time spent running statements and the time spent in `COMMIT` separately for each epoch.
 2. **If the statements dominate:** write the shared tables once per epoch (one `INSERT` for every view's checkpoint and one for dead letters), and skip writes with nothing to write: no dead letters, no late rows, or no window closing.
-3. **If `COMMIT` dominates:** its cost follows the number of tables touched. Each view's lease table stays, because DuckLake conflicts make fencing on a shared table impossible (POC finding 1). What remains is fewer, larger epochs, a longer `EPOCH INTERVAL` for views that can wait.
+3. **If `COMMIT` dominates:** its cost follows the number of tables touched. Each view's lease table stays, because DuckLake conflicts make fencing on a shared table impossible (finding 1 of the first build, in the design doc). What remains is fewer, larger epochs, a longer `EPOCH INTERVAL` for views that can wait.
 4. **Last resort: several commits per epoch**, one per group of views, each on its own connection and in parallel. Exactly-once holds per view, so this is safe. The cost is more snapshots and more load on the catalog.
 
 ## Expected effect

@@ -131,7 +131,7 @@ impl SourceOptions {
         }
         let o: SourceOptions = serde_json::from_value(v).context("parsing source options")?;
         if o.format != "json" {
-            bail!("only format 'json' is supported in this POC");
+            bail!("only format 'json' is supported for Kafka sources");
         }
         if !o.columns.iter().any(|(c, t)| c == &o.event_time && t.eq_ignore_ascii_case("TIMESTAMP")) {
             bail!("event_time column {:?} must be listed in columns with type TIMESTAMP", o.event_time);

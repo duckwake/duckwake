@@ -1,6 +1,6 @@
 # Contributing to DuckWake
 
-Thanks for your interest. DuckWake is a proof of concept, so issues that report what you tried, what broke and
+Thanks for your interest. DuckWake is on its way to production, so issues that report what you tried, what broke and
 what you expected are as useful as code.
 
 ## Before you start

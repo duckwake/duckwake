@@ -11,7 +11,7 @@ is published with credit to you unless you prefer otherwise.
 
 ## Supported versions
 
-DuckWake is a proof of concept before 1.0. Security fixes go into the latest release only.
+Until 1.0, security fixes go into the latest release only.
 
 ## Scope
 
