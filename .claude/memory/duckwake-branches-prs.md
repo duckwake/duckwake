@@ -16,6 +16,11 @@ commits in stack order:
 
 Next in the dbt plan is backfill of new views over lake inputs (F3); see [[duckwake-dbt-not-ddl]].
 
+On 2026-11-14, before open-sourcing (MIT), the history was rewritten with `git filter-repo` (the author's work
+email replaced by their personal one, claude.ai links replaced) and published to a fresh `duckwake/duckwake`
+repository. The PR numbers above refer to the old repository; they do not exist in the new one, and every commit
+hash changed. This was a one-time, user-approved exception to the no-force-push rule.
+
 **Why:** the user wants each piece of work on its own branch with its own PR, and decides when to merge.
 
 **How to apply:** start new work on a new branch from `main` (or stacked on an open branch), with its own

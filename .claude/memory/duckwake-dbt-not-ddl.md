@@ -6,8 +6,8 @@ metadata:
 ---
 
 On 2026-11-13 the user decided DDL support is not worth building now and chose a dbt package, dbt-duckwake,
-instead; `CREATE CONTINUOUS VIEW` moved to the "Long term" section of `docs/roadmap.md` and of the design doc's
-SQL surface.
+instead; `CREATE CONTINUOUS VIEW` moved to the "Long term" section of `docs/roadmap.md` and of the SQL surface in
+`docs/design/streaming-extension.md`.
 
 **Why:** DuckDB's C API has no parser hooks. A spike proved a C++ parser extension works against the DuckDB that
 `libduckdb-sys` bundles (headers via `DEP_DUCKDB_INCLUDE`; build with the same DEBUG/NDEBUG as DuckDB), but it
@@ -26,4 +26,4 @@ extension. dbt gives files, review, CI, `ref()` order, tests and docs with no C+
 4. Later: zero-downtime replace (build beside, catch up, swap in one DuckLake transaction).
 
 Open: whether dbt-duckdb can install our extension from a repository URL; how `ref()`'s quoted three-part
-names reach DuckWake's compiler. Full design: the design doc's dbt-duckwake tab ([[duckwake-design-doc]]).
+names reach DuckWake's compiler. Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).
