@@ -3,6 +3,10 @@ name = "duckwake_core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "DuckWake's engine: continuous SQL over Kafka into DuckLake, exactly once"
 
 [dependencies]
 duckwake_circuit = { path = "../circuit" }

@@ -121,9 +121,24 @@ jobs:
           python3 -m json.tool deploy/grafana/dashboards/duckwake.json >/dev/null
 
   # One check for branch protection: green only when the build, every suite and the monitoring checks are.
+  # Every dependency's license is on deny.toml's list, and THIRD_PARTY_LICENSES.md matches Cargo.lock.
+  licenses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20,cargo-about@0.9.3
+      - run: cargo deny check licenses
+      - run: |
+          cargo about generate about.hbs -o /tmp/THIRD_PARTY_LICENSES.md
+          diff -u THIRD_PARTY_LICENSES.md /tmp/THIRD_PARTY_LICENSES.md || {
+            echo "::error::THIRD_PARTY_LICENSES.md is out of date: run cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md"; exit 1; }
+
   ci-passed:
     if: always()
-    needs: [build, suite, monitoring]
+    needs: [build, suite, monitoring, licenses]
     runs-on: ubuntu-24.04
     steps:
-      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success && "${{ needs.monitoring.result }}" == success ]]'
+      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success && "${{ needs.monitoring.result }}" == success && "${{ needs.licenses.result }}" == success ]]'

@@ -54,6 +54,7 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 - [Monitoring and alerts](docs/alerts.md): the metrics, the Prometheus alerts and Grafana dashboard in `deploy/`, and what to do when each fires
 - [Releases](docs/releasing.md): versioning, what a release publishes, and how to make one; [changelog](CHANGELOG.md)
 - [Roadmap](docs/roadmap.md): what is done and what stands between it and production
+- [Design documents](docs/design/): the reasoning behind the engine, with comparisons to other streaming engines
 
 ## Status
 
@@ -68,3 +69,17 @@ Sources connect with SASL (PLAIN, SCRAM) and TLS, data files can live on S3, and
 credential is stored in the lake. Every test checks the views against the same SQL run as one batch query. Not yet:
 `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.
+
+## Contributing
+
+Issues and pull requests are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) explains how to build and test, and
+[SECURITY.md](SECURITY.md) how to report a vulnerability. Everyone taking part follows the
+[code of conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+DuckWake is released under the [MIT License](LICENSE). The licenses of the crates it includes are in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+DuckDB and DuckLake are trademarks of the DuckDB Foundation. DuckWake is an independent project, not affiliated
+with or endorsed by the DuckDB Foundation or DuckDB Labs.

@@ -3,6 +3,10 @@ name = "duckwake_extension"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "DuckWake as a loadable DuckDB extension"
 
 # Built on its own (see the workspace manifest): `scripts/build_extension.sh`.
 [lib]
