@@ -11,6 +11,10 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   definition in one transaction; the view recomputes from the start and keeps its status, worker and pin.
   `add-source-column` adds a column to a running source; views that read it keep their columns.
   `alter-view` changes a view's epoch interval, rows per epoch and limits without recomputing it.
+  `create-view --if-exists update` (`if_exists := 'update'`) makes rerunning a deploy safe: nothing when the
+  view is as requested, its settings altered in place when only they differ, and a refusal when its query
+  changed. `create_view`'s result now starts with what happened (`created`, `unchanged`, `altered`,
+  `replaced`).
 - **Limits.** `max_state_rows` and `max_late_rows` per view fail that view alone, with the reason in the log.
   A worker whose epoch runs out of DuckDB memory starts again from its checkpoints with half as many rows per
   epoch instead of exiting. `--temp-dir` places each worker's spill files in a directory of its own; `--threads` sets DuckDB's

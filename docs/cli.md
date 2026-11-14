@@ -67,6 +67,14 @@ Views and sources change while workers run them:
   The view keeps its status, worker and pin (a failed one becomes stopped). A worker still running the old
   definition is fenced and starts the new one at its next refresh. A view that other views read cannot be
   replaced: drop those first.
+- **`create-view NAME --if-exists update`** (`if_exists := 'update'`) makes an existing view match the command
+  without recomputing it, so a deploy script or dbt can run it again and again. When nothing differs it does
+  nothing (`unchanged`); when only the epoch interval, rows per epoch or limits differ it changes them as
+  `alter-view` does (`altered`); when what the view computes differs (its query, table, late-data table,
+  checkpoint or inlining) it fails and asks for `--replace`. Whitespace outside quotes and a trailing `;` do
+  not count as a change. Options left out take their defaults, as for a new view. `--if-exists fail` is the
+  default, and `--if-exists replace` is `--replace`. The first word of the output, and of the SQL function's
+  result, says what happened: `created`, `unchanged`, `altered` or `replaced`.
 - **`add-source-column SOURCE COLUMN TYPE`** (`duckwake_add_source_column`) adds a column to a source. The views
   that already read the source keep the columns they were created with, and keep running unchanged; replace a
   view to use the new column. Events without the field get NULL. Columns cannot be removed or retyped: create
@@ -79,6 +87,7 @@ Views and sources change while workers run them:
 $B add-source-column clicks country VARCHAR
 $B create-view analytics.big_spend --replace --sql "SELECT ts, game_id, country, amount FROM clicks WHERE amount >= 90"
 $B alter-view clicks_per_min --epoch-interval 30s
+$B create-view analytics.clicks_per_min --if-exists update --epoch-interval 30s --sql "..."   # unchanged
 ```
 
 `stop` and `pause` fence the view's worker at once: an epoch it has in flight does not land, so `drop` or

@@ -36,6 +36,16 @@ remote "CALL duckwake_create_source('purchases', 'kafka', '{\"brokers\":\"localh
 remote "CALL duckwake_create_view('analytics.all_events', 'SELECT ts, game_id, user_id, amount, ''click'' AS kind FROM clicks WHERE amount >= 80
    UNION ALL SELECT ts, game_id, user_id, amount, ''purchase'' FROM purchases', epoch_interval := '2s')"
 remote "CALL duckwake_create_view('analytics.active_users', 'SELECT DISTINCT game_id, user_id FROM clicks WHERE amount >= 50', epoch_interval := '2s')"
+log "if_exists := 'update' over SQL, as dbt reruns a model"
+GT="'SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
+   FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5'"
+out=$(remote "CALL duckwake_create_view('analytics.game_totals', $GT, epoch_interval := '2s', if_exists := 'update')" 2>&1)
+[[ $out == *"unchanged view game_totals"* ]] && echo "rerun: unchanged" || { echo "FAIL: a rerun said: $out"; exit 1; }
+if out=$(remote "CALL duckwake_create_view('analytics.game_totals', 'SELECT game_id, count(*) AS n FROM clicks GROUP BY ALL',
+    epoch_interval := '2s', if_exists := 'update')" 2>&1); then
+  echo "FAIL: a changed query was accepted: $out"; exit 1
+fi
+echo "changed query refused: $(echo "$out" | grep -o 'its query changed' | head -1)"
 for v in "${VIEWS[@]}"; do remote "CALL duckwake_start('$v')"; done
 
 log "produce $((RATE * DURATION)) events at $RATE/s"

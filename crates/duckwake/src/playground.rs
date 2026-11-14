@@ -697,7 +697,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
         let name = if name.contains('.') { name.to_string() } else { format!("analytics.{name}") };
         let (job_id, table) = catalog::view_names(&name, r.sink.as_deref().map(str::trim).filter(|s| !s.is_empty()))?;
         let late = r.late_data.filter(|s| !s.trim().is_empty());
-        let def = catalog::create_view(
+        let (def, _) = catalog::create_view(
             conn,
             &catalog::CreateView {
                 job_id: &job_id,
@@ -709,7 +709,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
                 max_rows: 100_000,
                 inline_row_limit: 10_000,
                 limits: Default::default(),
-                replace: false,
+                if_exists: catalog::IfExists::Fail,
             },
         )?;
         if r.start.unwrap_or(true) {

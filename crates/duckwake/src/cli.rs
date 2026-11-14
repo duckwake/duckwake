@@ -56,7 +56,8 @@ enum Cmd {
         options: String,
     },
     /// duckwake_create_view(name, sql, options): NAME is the table the view maintains, e.g.
-    /// analytics.clicks_per_min (a bare name means the main schema). It must not exist yet.
+    /// analytics.clicks_per_min (a bare name means the main schema). The first word of the output says what
+    /// happened: created, unchanged, altered or replaced.
     CreateView {
         name: String,
         #[arg(long)]
@@ -80,8 +81,12 @@ enum Cmd {
         /// Fail the view when one epoch writes more late rows than this (a broken watermark or clock).
         #[arg(long)]
         max_late_rows: Option<u64>,
-        /// Replace the view if it exists (CREATE OR REPLACE): it recomputes from the start, keeping its
-        /// status and worker.
+        /// When the view exists: fail (the default); update, which changes its settings without recomputing
+        /// it, does nothing when nothing changed, and fails when its query changed; or replace.
+        #[arg(long, value_parser = ["fail", "update", "replace"])]
+        if_exists: Option<String>,
+        /// Replace the view if it exists (CREATE OR REPLACE, --if-exists replace): it recomputes from the
+        /// start, keeping its status and worker.
         #[arg(long)]
         replace: bool,
     },
@@ -386,6 +391,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             inline_row_limit,
             max_state_rows,
             max_late_rows,
+            if_exists,
             replace,
         } => {
             if sink.is_some() {
@@ -399,11 +405,16 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 inline_row_limit: Some(inline_row_limit),
                 max_state_rows,
                 max_late_rows,
-                replace,
+                if_exists: api::if_exists(if_exists.as_deref(), replace)?,
             };
-            let (def, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
-            println!("{msg} {:?}", def.plan.sink_columns);
-            println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
+            let (def, outcome, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
+            use duckwake_core::catalog::Outcome;
+            if matches!(outcome, Outcome::Created | Outcome::Replaced) {
+                println!("{msg} {:?}", def.plan.sink_columns);
+                println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
+            } else {
+                println!("{msg}");
+            }
         }
         Cmd::AddSourceColumn { source, column, r#type } => {
             println!("{}", api::add_source_column(&open()?, &source, &column, &r#type)?)

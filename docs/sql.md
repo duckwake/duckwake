@@ -20,7 +20,7 @@ reads is refused.
 | Function | Does |
 | --- | --- |
 | `duckwake_create_source(name, kind, options_json)` | register a Kafka source |
-| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=, replace :=)` | create the table `name` and its job; `replace := true` replaces an existing view, which recomputes from the start ([details](cli.md#changing-views-and-sources)) |
+| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=, if_exists :=, replace :=)` | create the table `name` and its job. When the view exists, `if_exists := 'update'` changes only its settings (or nothing) and refuses a changed query, and `replace := true` (`if_exists := 'replace'`) replaces it, which recomputes from the start; the result starts with `created`, `unchanged`, `altered` or `replaced` ([details](cli.md#changing-views-and-sources)) |
 | `duckwake_add_source_column(source, column, type)` | add a column to a source; views that read it keep their columns |
 | `duckwake_alter_view(view, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=)` | change how a view runs without recomputing it; a limit of 0 removes it ([limits](cli.md#limits)) |
 | `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` puts the view on the server's worker, `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it |
@@ -48,7 +48,7 @@ Only in the extension:
 | SQL function (server, extension) | CLI |
 | --- | --- |
 | `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
-| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--replace]` |
+| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--if-exists fail\|update\|replace] [--replace]` |
 | `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |
 | `duckwake_alter_view(view, ...)` | `alter-view NAME [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows]` |
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME [--worker W]` (default `any`) / `stop` / `pause` |
