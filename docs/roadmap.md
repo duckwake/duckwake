@@ -78,7 +78,19 @@ default.
 
 ## After production, driven by feedback
 
-- `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL (needs a C++ parser shim; DuckDB's C API has no parser hooks)
+- **SQL authoring through dbt, not DDL.** A `CREATE CONTINUOUS VIEW` parser works only in `duckwaked` and
+  `duckwake sql`, through DuckDB's unstable C++ API (a spike proved it; DDL stays long term, below), so instead a dbt package,
+  dbt-duckwake, on dbt-duckdb: `streaming_source` and `streaming_view` models become `duckwake_*` calls,
+  with dbt's `ref()` order, tests and docs. A plain `dbt run` never recomputes a view: unchanged does nothing,
+  settings go through `alter_view`, a changed query fails until `--full-refresh`. In order:
+  1. `create_view` reports what changed (`if_exists := 'fail' | 'update' | 'replace'`), also in the CLI.
+  2. Backfill of new views over lake inputs (F3, below): without it a view added over a running one misses
+     the rows before it.
+  3. The package, an example project and a CI suite against the compose stack; later, replacing a view
+     without downtime (build beside it, catch up, swap in one DuckLake transaction).
+
+  Design, and how dbt-risingwave does it, in the design doc's
+  [dbt-duckwake tab](https://github.com/duckwake/duckwake/tree/main/docs/design).
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
 - `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
   stream–stream joins
@@ -106,3 +118,12 @@ default.
 - Splitting one topic's partitions across workers
 - A Windows build
 - A signed community extension (`INSTALL duckwake FROM community`), once DuckDB's Rust extension path supports it
+
+## Long term
+
+- **`CREATE CONTINUOUS VIEW` DDL**, mapped 1:1 onto the `duckwake_*` functions (`CREATE SOURCE`,
+  `CREATE [OR REPLACE] CONTINUOUS VIEW`, `EXPLAIN` and `DROP CONTINUOUS VIEW`), only if users still ask for it
+  once dbt-duckwake exists. DuckDB's C API has no parser hooks, so it needs a C++ parser shim over DuckDB's
+  internal API, which carries no stability promise, and it works only in `duckwaked` and `duckwake sql`, not
+  the loadable extension. Syntax in the design doc's
+  [SQL surface](https://github.com/duckwake/duckwake/tree/main/docs/design).
