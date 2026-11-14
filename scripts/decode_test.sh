@@ -9,14 +9,17 @@ SEED=${SEED:-7}
 VIEWS=(all_sql all_arrow)
 
 log "fresh lake and topic"; reset_env
-cargo run -q --release -p duckwake_core --example phase_a_arrow_decode -- produce localhost:19092 "$TOPIC" "$MESSAGES" "$SEED"
+# The generator is an example of duckwake_core; CI ships it prebuilt next to the binaries.
+GEN=target/release/examples/phase_a_arrow_decode
+[[ -x $GEN ]] || cargo build -q --release -p duckwake_core --example phase_a_arrow_decode
+"$GEN" produce localhost:19092 "$TOPIC" "$MESSAGES" "$SEED"
 
 for d in sql arrow; do
   "$BIN" create-source "src_$d" --options "{\"brokers\":\"localhost:19092\",\"topic\":\"$TOPIC\",\"event_time\":\"ts\",
     \"decode\":\"$d\",\"columns\":{\"ts\":\"TIMESTAMP\",\"game_id\":\"VARCHAR\",\"user_id\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\"}}"
   # A small max_rows makes many epochs, so chunk boundaries and partial drains are exercised too.
   "$BIN" create-view "analytics.all_$d" --epoch-interval 1s --max-rows 5000 \
-    --sql "SELECT ts, game_id, user_id, amount FROM src_$d" | head -1
+    --sql "SELECT ts, game_id, user_id, amount FROM src_$d" | sed -n 1p
   "$BIN" start "all_$d" --worker w1
 done
 

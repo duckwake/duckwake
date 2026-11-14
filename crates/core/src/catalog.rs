@@ -5,7 +5,7 @@
 //! in DuckLake, an UPDATE of one row in a table conflicts with a concurrent UPDATE of any other row of the
 //! same table, so per-epoch fencing on `jobs` would make every worker conflict with every other one.
 use crate::lake::{ident, lit, quote_table, CTL, LAKE};
-use crate::model::{parse_duration, JobDef, JobStatus, SourceDef, SourceOptions};
+use crate::model::{parse_duration, Input, JobDef, JobStatus, LakeInput, SourceDef, SourceOptions, COMMIT_TS};
 use crate::plan;
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
@@ -22,7 +22,7 @@ pub use duckwake_circuit::sql::state_table;
 pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<String, SourceDef>)> {
     let (mut def, _) = load_job(conn, job)?;
     let sources = load_sources(conn)?;
-    let plan = plan::compile(conn, job, &def.sql, &sources)?;
+    let plan = compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
     if plan.state_columns != def.plan.state_columns || plan.sink_columns != def.plan.sink_columns {
         bail!(
             "view {job} was created by a DuckWake version whose state or table layout differs from this one's; \
@@ -31,6 +31,140 @@ pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<St
     }
     def.plan = plan;
     Ok((def, sources))
+}
+
+/// Compiles a view whose FROM names Kafka sources, and lake tables and views resolved to `lakes`.
+pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &[LakeInput]) -> Result<plan::Plan> {
+    let mut inputs: HashMap<String, Input> = sources.iter().map(|(n, s)| (n.clone(), Input::Kafka(s))).collect();
+    inputs.extend(lakes.iter().map(|l| (l.name.clone(), Input::Lake(l))));
+    plan::compile(conn, job, sql, &inputs)
+}
+
+/// Compiles a new view and settles how it reads each lake input it streams. A window is final once the
+/// watermark passes it, so a later change to one of its rows could not be applied: a windowed view reads lake
+/// tables insert-only (an update or delete then stops it), and refuses a view's table whose rows change.
+/// Every other view takes updates and deletes as retractions.
+fn compile_new(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &mut [LakeInput]) -> Result<plan::Plan> {
+    // The view's shape first, every input insert-only: over retracting ones some windowed aggregates are refused.
+    let inserts: Vec<LakeInput> = lakes.iter().map(|l| LakeInput { retracts: false, ..l.clone() }).collect();
+    let plan = compile(conn, job, sql, sources, &inserts)?;
+    let streams = plan.sources();
+    let retracting = |l: &LakeInput| l.retracts && streams.contains(&l.name);
+    if plan.is_windowed() {
+        if let Some(l) = lakes.iter().find(|l| retracting(l) && l.view.is_some()) {
+            bail!(
+                "{} is the table of view {}, whose rows are replaced or removed as they change; windows over it are \
+                 not supported yet (a window is final once the watermark passes it). Group by a time_bucket of a \
+                 column instead: the view then keeps every bucket up to date",
+                l.name,
+                l.view.as_deref().unwrap_or_default()
+            );
+        }
+        lakes.iter_mut().for_each(|l| l.retracts = false);
+        return Ok(plan);
+    }
+    if !lakes.iter().any(retracting) {
+        return Ok(plan);
+    }
+    compile(conn, job, sql, sources, lakes)
+}
+
+/// The columns of a view input named `name`: a Kafka source's or a lake input's.
+pub fn input_columns<'a>(name: &str, sources: &'a HashMap<String, SourceDef>, lakes: &'a [LakeInput]) -> Result<&'a [(String, String)]> {
+    if let Some(s) = sources.get(name) {
+        return Ok(&s.options.columns);
+    }
+    lakes.iter().find(|l| l.name == name).map(|l| l.columns.as_slice()).with_context(|| format!("input {name} of the view is gone"))
+}
+
+/// Resolves the names a view's FROM uses that are not Kafka sources: first to a view (by job id, or by the
+/// table it writes), then to a lake table. Names that are neither are left to DuckDB, which binds them or
+/// fails. Every such table becomes a lake input of the view; the compiler decides which of them it reads as
+/// a change feed and which it joins as a lookup.
+fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>) -> Result<Vec<LakeInput>> {
+    let mut out = Vec::new();
+    for name in plan::table_names(conn, sql)? {
+        if sources.contains_key(&name) {
+            continue;
+        }
+        let upstream = if name.contains('.') { resolve_view(conn, &name).ok() } else { job_status(conn, &name)?.map(|_| name.clone()) };
+        if let Some(up) = upstream {
+            if up == job || reads_transitively(conn, &up, job)? {
+                bail!("view {job} would read itself through {name}: cycles between views are not allowed");
+            }
+            let (def, _) = load_job(conn, &up)?;
+            if def.plan.sink_columns.iter().any(|(c, _)| c == COMMIT_TS) {
+                bail!("view {up} has a column named {COMMIT_TS}, which DuckWake adds to every lake input; rename it in {up}");
+            }
+            let (_, schema, table) = crate::lake::qualified_table(&def.sink)?;
+            let table_id = crate::lake::table_id(conn, &schema, &table)?.with_context(|| format!("the table of view {up} is missing"))?;
+            let windowed = def.plan.window.as_ref().filter(|_| {
+                ["window_start", "window_end"].iter().all(|w| def.plan.sink_columns.iter().any(|(c, _)| c == w))
+            });
+            // An append-only view's table only ever gains rows; any other has rows replaced or removed.
+            let retracts = def.plan.sink_mode() != plan::SinkMode::Append || def.plan.retracts();
+            out.push(LakeInput {
+                name,
+                table: def.sink.clone(),
+                table_id,
+                columns: def.plan.sink_columns.iter().cloned().chain([(COMMIT_TS.to_string(), "TIMESTAMP".to_string())]).collect(),
+                view: Some(up),
+                window_size_us: windowed.map(|w| w.size_us),
+                retracts,
+                counted: crate::circuit::Circuit::compile(&def.view())?.counts_rows(),
+            });
+            continue;
+        }
+        let (catalog, schema, table) = match name.split('.').collect::<Vec<_>>().as_slice() {
+            [t] => (LAKE.to_string(), "main".to_string(), t.to_string()),
+            _ => match crate::lake::qualified_table(&name) {
+                Ok(parts) => parts,
+                Err(_) => continue,
+            },
+        };
+        if schema == CTL.rsplit('.').next().unwrap_or(CTL) {
+            bail!("views cannot read DuckWake's control tables ({name})");
+        }
+        let Some(table_id) = crate::lake::table_id(conn, &schema, &table)? else { continue };
+        let qualified = format!("{catalog}.{schema}.{table}");
+        let mut columns = crate::lake::describe(conn, &quote_table(&qualified)?)?;
+        if columns.iter().any(|(c, _)| c == COMMIT_TS) {
+            bail!("{name} has a column named {COMMIT_TS}, which DuckWake adds to every lake input");
+        }
+        columns.push((COMMIT_TS.to_string(), "TIMESTAMP".to_string()));
+        // Any lake table may have rows updated or deleted; `create_view` holds a windowed view to insert-only.
+        out.push(LakeInput { name, table: qualified, table_id, columns, view: None, window_size_us: None, retracts: true, counted: false });
+    }
+    Ok(out)
+}
+
+/// Whether view `from` reads view `to`, directly or through other views.
+fn reads_transitively(conn: &Connection, from: &str, to: &str) -> Result<bool> {
+    let mut stack = vec![from.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v.clone()) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!("SELECT upstream_job FROM {CTL}.dependencies WHERE job_id = ? AND upstream_job IS NOT NULL"))?;
+        for up in stmt.query_map([&v], |r| r.get::<_, String>(0))? {
+            let up = up?;
+            if up == to {
+                return Ok(true);
+            }
+            stack.push(up);
+        }
+    }
+    Ok(false)
+}
+
+/// The views that read `job`'s table.
+pub fn readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT job_id FROM {CTL}.dependencies WHERE upstream_job = ? AND job_id <> ? ORDER BY job_id"
+    ))?;
+    let rows = stmt.query_map([job, job], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<duckdb::Result<Vec<_>>>()?)
 }
 
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_json::Value) -> Result<SourceDef> {
@@ -117,11 +251,16 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         bail!("view {:?} already exists", v.job_id);
     }
     let sources = load_sources(conn)?;
-    let plan = plan::compile(conn, v.job_id, v.sql, &sources)?;
+    let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
+    let plan = compile_new(conn, v.job_id, v.sql, &sources, &mut lake_inputs)?;
     if v.late_data.is_some() && !plan.is_windowed() {
         bail!("only windowed views have late data; drop --late-data for a {} view", plan.kind_name());
     }
-    let src = &sources[&plan.source];
+    // Tables the view joins to a Kafka source are lookups, read whole every epoch; only the streams are inputs.
+    let streams = plan.sources();
+    lake_inputs.retain(|l| streams.contains(&l.name));
+    let start_snapshot = (!lake_inputs.is_empty()).then(|| crate::lake::current_snapshot(conn)).transpose()?;
+    let src_columns = input_columns(&plan.source, &sources, &lake_inputs)?.to_vec();
     let def = JobDef {
         job_id: v.job_id.into(),
         sql: v.sql.into(),
@@ -132,16 +271,19 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         max_rows: v.max_rows,
         inline_row_limit: v.inline_row_limit,
         plan,
+        lake_inputs,
+        start_snapshot,
     };
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
-    crate::circuit::Circuit::compile(&def.view())?;
+    let circuit = crate::circuit::Circuit::compile(&def.view())?;
     let sink = quote_table(&def.sink)?;
     let (_, sink_schema, sink_name) = crate::lake::qualified_table(&def.sink)?;
 
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&sink_schema)))?;
-        let mut cols: Vec<String> = def.plan.sink_columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+        let mut cols: Vec<String> =
+            def.plan.sink_columns.iter().chain(&circuit.sink_extra_columns()).map(|(c, t)| format!("{} {t}", ident(c))).collect();
         cols.push("_duckwake_epoch BIGINT".into());
         // The view owns its table: creating one over an existing table would mix in rows no epoch wrote.
         if table_exists(conn, &sink_schema, &sink_name)? {
@@ -157,7 +299,11 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
             let (_, ls, lt) = crate::lake::qualified_table(late)?;
             conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&ls)))?;
             if !table_exists(conn, &ls, &lt)? {
-                let mut cols: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+                let mut cols: Vec<String> = src_columns
+                    .iter()
+                    .filter(|(c, _)| !crate::circuit::codegen::is_window_column(c))
+                    .map(|(c, t)| format!("{} {t}", ident(c)))
+                    .collect();
                 cols.extend(
                     ["window_start TIMESTAMP", "window_end TIMESTAMP", "_source_partition INTEGER", "_source_offset BIGINT", "_duckwake_epoch BIGINT"]
                         .map(String::from),
@@ -175,9 +321,18 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
             lt = lease_table(v.job_id)
         ))?;
         conn.execute(
-            &format!("INSERT INTO {CTL}.jobs VALUES (?, ?, 1, 'created', now(), now())"),
+            &format!(
+                "INSERT INTO {CTL}.jobs (job_id, definition, version, status, created_at, updated_at)
+                 VALUES (?, ?, 1, 'created', now(), now())"
+            ),
             [v.job_id, &serde_json::to_string(&def)?],
         )?;
+        for l in &def.lake_inputs {
+            conn.execute(
+                &format!("INSERT INTO {CTL}.dependencies VALUES (?, ?, ?, ?)"),
+                duckdb::params![v.job_id, l.name, l.table_id, l.view],
+            )?;
+        }
         Ok(())
     })();
     finish(conn, res)?;
@@ -185,19 +340,58 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
     Ok(def)
 }
 
-/// Sized so a typical epoch's sink rows land in the catalog instead of a tiny Parquet file. Must run after
-/// the sink is committed (DuckLake rejects options on tables created in the same transaction), and the
-/// worker re-applies it on its own connection: an attached lake does not see options set later by
-/// another connection, so its epochs would keep writing one small file each.
+/// Sized so a typical epoch's sink rows land in the catalog instead of a tiny Parquet file (DuckLake's
+/// default inlines at most 10 rows). Must run after the sink is committed (DuckLake rejects options on tables
+/// created in the same transaction), and the worker re-applies it on its own connection: an attached lake
+/// does not see options set later by another connection, so its epochs would keep writing one small file each.
 pub fn set_sink_inlining(conn: &Connection, def: &JobDef) -> Result<()> {
     let (_, schema, table) = crate::lake::qualified_table(&def.sink)?;
-    conn.execute_batch(&format!(
-        "CALL {LAKE}.set_option('data_inlining_row_limit', {}, schema => {}, table_name => {})",
-        def.inline_row_limit,
-        lit(&schema),
-        lit(&table)
-    ))?;
-    Ok(())
+    set_inlining(conn, &schema, &table, def.inline_row_limit)
+}
+
+/// Rows per insert the checkpoint table inlines. With `lean_commit` one INSERT carries the checkpoint rows of
+/// every job on the worker, more than DuckLake's default of 10 once a worker runs more than 10 jobs.
+const CHECKPOINT_INLINE_ROWS: usize = 1_000;
+
+/// Inlining for the checkpoint table, set by each worker on its own connection at start (see
+/// `set_sink_inlining`). Dead letters and late rows keep DuckLake's default: they come in thousands per
+/// epoch, which cost more as catalog rows than as one Parquet file (16-view bench, `docs/internals.md`).
+/// Lease and state tables keep it too: a lease write is one row, and state is rewritten every epoch.
+pub fn set_control_inlining(conn: &Connection) -> Result<()> {
+    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
+    set_inlining(conn, schema, "checkpoints", CHECKPOINT_INLINE_ROWS)
+}
+
+/// Skips the write when this connection already sees the option: several workers starting at once would
+/// otherwise all update the same catalog row, and DuckLake reports the losers' failures as errors that are not
+/// conflicts. The write is idempotent, so a failed one is retried.
+fn set_inlining(conn: &Connection, schema: &str, table: &str, rows: usize) -> Result<()> {
+    let set: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM ducklake_options({}) WHERE option_name = 'data_inlining_row_limit'
+               AND scope = 'TABLE' AND scope_entry = ? AND value = ?",
+            lit(LAKE)
+        ),
+        [format!("{schema}.{table}"), rows.to_string()],
+        |r| r.get(0),
+    )?;
+    if set > 0 {
+        return Ok(());
+    }
+    let sql = format!(
+        "CALL {LAKE}.set_option('data_inlining_row_limit', {rows}, schema => {}, table_name => {})",
+        lit(schema),
+        lit(table)
+    );
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match conn.execute_batch(&sql) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(100 * attempt)),
+            Err(e) => return Err(e).with_context(|| format!("setting inlining on {schema}.{table}")),
+        }
+    }
 }
 
 fn finish(conn: &Connection, res: Result<()>) -> Result<()> {
@@ -237,14 +431,42 @@ pub fn load_job(conn: &Connection, job: &str) -> Result<(JobDef, JobStatus)> {
     Ok((serde_json::from_str(&def)?, JobStatus::parse(&status)?))
 }
 
-/// Running jobs and their current lease owner.
-pub fn running_jobs(conn: &Connection) -> Result<Vec<(String, Option<String>, i64)>> {
-    let mut stmt = conn.prepare(&format!("SELECT job_id FROM {CTL}.jobs WHERE status = 'running' ORDER BY job_id"))?;
-    let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
+/// A running view and where it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningJob {
+    pub id: String,
+    /// The lease owner; None while unassigned.
+    pub owner: Option<String>,
+    pub lease: i64,
+    /// The worker `start --worker` pinned it to: never moved by rebalancing, and moved back there after a
+    /// failover once that worker is live again.
+    pub pinned_to: Option<String>,
+}
+
+/// Running jobs, their current lease owner and pin.
+pub fn running_jobs(conn: &Connection) -> Result<Vec<RunningJob>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT job_id, pinned_to FROM {CTL}.jobs WHERE status = 'running' ORDER BY job_id"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<duckdb::Result<Vec<_>>>()?;
     let mut out = Vec::new();
-    for id in ids {
+    for (id, pinned_to) in rows {
         let (owner, lease) = lease(conn, &id)?;
-        out.push((id, owner, lease));
+        out.push(RunningJob { id, owner, lease, pinned_to });
+    }
+    Ok(out)
+}
+
+/// The sources (Kafka sources, lake tables, views) each running view reads, by view: workers that already
+/// read a source are the better place for another view of it (one reader serves both).
+pub fn running_sources(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs WHERE status = 'running'"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<duckdb::Result<Vec<_>>>()?;
+    let mut out = HashMap::new();
+    for (id, def) in rows {
+        // A definition this version cannot read only loses its affinity, not the rebalance.
+        if let Ok(def) = serde_json::from_str::<JobDef>(&def) {
+            out.insert(id, def.plan.sources());
+        }
     }
     Ok(out)
 }
@@ -294,23 +516,44 @@ pub fn retry_conflicts<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
-/// `start` assigns the job to `worker` and bumps the lease, which fences the previous owner's next commit.
-pub fn set_status(conn: &Connection, job: &str, status: JobStatus, worker: Option<&str>) -> Result<()> {
-    job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
-    retry_conflicts(|| set_status_once(conn, job, status, worker))
+/// Where `start` puts a view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Assign<'a> {
+    /// On this worker, and kept there: rebalancing never moves it, and after a failover it goes back once the
+    /// worker is live again.
+    Pin(&'a str),
+    /// On this worker for now; rebalancing may move it.
+    Prefer(&'a str),
+    /// Unassigned: the next live worker to claim it takes it (see `failover`).
+    Any,
 }
 
-fn set_status_once(conn: &Connection, job: &str, status: JobStatus, worker: Option<&str>) -> Result<()> {
+/// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
+pub fn set_status(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
+    job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
+    if let Some(Assign::Pin(w) | Assign::Prefer(w)) = assign {
+        crate::failover::check_worker_id(w)?;
+    }
+    retry_conflicts(|| set_status_once(conn, job, status, assign))
+}
+
+fn set_status_once(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute(
             &format!("UPDATE {CTL}.jobs SET status = ?, updated_at = now() WHERE job_id = ?"),
             [status.as_str(), job],
         )?;
-        if let Some(w) = worker {
+        if let Some(a) = assign {
+            let (owner, pin) = match a {
+                Assign::Pin(w) => (Some(w), Some(w)),
+                Assign::Prefer(w) => (Some(w), None),
+                Assign::Any => (None, None),
+            };
+            conn.execute(&format!("UPDATE {CTL}.jobs SET pinned_to = ? WHERE job_id = ?"), duckdb::params![pin, job])?;
             conn.execute(
                 &format!("UPDATE {} SET owner_worker = ?, lease_epoch = lease_epoch + 1", lease_table(job)),
-                [w],
+                [owner],
             )?;
         }
         Ok(())
@@ -384,6 +627,11 @@ pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<()> {
     } else {
         None
     };
+    // Its deletes from the shared control tables can lose to a running job's checkpoint insert.
+    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot))
+}
+
+fn reset_once(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64, snapshot: Option<i64>) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         let sink = quote_table(&def.sink)?;
@@ -422,11 +670,21 @@ pub fn drop_view(conn: &Connection, job: &str, keep_table: bool) -> Result<()> {
     if status == JobStatus::Running {
         bail!("stop {job:?} before dropping it");
     }
+    let readers = readers(conn, job)?;
+    if !readers.is_empty() {
+        bail!("view {job} is read by {}; drop those views first", readers.join(", "));
+    }
+    // Like `reset`, its deletes from the shared control tables can lose to a running job's inserts.
+    retry_conflicts(|| drop_view_once(conn, job, &def, keep_table))
+}
+
+fn drop_view_once(conn: &Connection, job: &str, def: &JobDef, keep_table: bool) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
         conn.execute(&format!("DELETE FROM {CTL}.jobs WHERE job_id = ?"), [job])?;
         conn.execute(&format!("DELETE FROM {CTL}.checkpoints WHERE job_id = ?"), [job])?;
         conn.execute(&format!("DELETE FROM {CTL}.dead_letter WHERE job_id = ?"), [job])?;
+        conn.execute(&format!("DELETE FROM {CTL}.dependencies WHERE job_id = ?"), [job])?;
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};", lease_table(job), state_table(job)))?;
         if !keep_table {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_table(&def.sink)?))?;
@@ -480,7 +738,7 @@ pub fn jobs_query(conn: &Connection) -> Result<String> {
                     FROM {CTL}.checkpoints GROUP BY ALL)
          SELECT j.job_id, j.status, l.owner_worker AS worker, l.lease_epoch AS lease, c.epoch, c.watermark,
                 round(epoch(now()::TIMESTAMP - c.max_event_time), 1) AS freshness_s, c.lag,
-                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit
+                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit, j.pinned_to
          FROM {CTL}.jobs j LEFT JOIN leases l USING (job_id) LEFT JOIN last c USING (job_id) LEFT JOIN totals t USING (job_id)
          ORDER BY j.job_id",
         leases.join(" UNION ALL ")

@@ -69,9 +69,14 @@ enum Cmd {
     /// duckwake_start(view): assign to a worker (bumps the lease, fencing the previous owner).
     Start {
         name: String,
-        #[arg(long)]
+        /// The worker to pin it to (rebalancing never moves it; after a failover it goes back there); `any`
+        /// (the default) leaves it to whichever live worker claims it, and lets rebalancing move it.
+        #[arg(long, default_value = "any")]
         worker: String,
     },
+    /// duckwake_drain(worker): the worker hands all its views to the others and takes none, before it is
+    /// taken out for good. A restart ends the drain.
+    Drain { worker: String },
     /// duckwake_pause(view)
     Pause { name: String },
     /// duckwake_stop(view)
@@ -91,6 +96,8 @@ enum Cmd {
     },
     /// duckwake_jobs(): status, epoch, watermark, freshness, lag.
     Jobs,
+    /// duckwake_workers(): every worker that ran on this lake, its state, views and last heartbeat.
+    Workers,
     /// duckwake_checkpoints(view)
     Checkpoints {
         name: String,
@@ -204,6 +211,26 @@ pub struct WorkerArgs {
     pub prune_every: String,
     #[arg(long, default_value_t = 1000)]
     pub keep_checkpoints: i64,
+    /// Failover: a worker whose heartbeat has not moved for this long is dead and its views move to live
+    /// workers; `off` keeps this worker from taking over others' views.
+    #[arg(long, default_value = "30s", env = "DUCKWAKE_LEASE_TIMEOUT")]
+    pub lease_timeout: String,
+    /// How long the views of a cleanly stopped worker wait for it to come back (a restart) before they move.
+    /// Take a worker out for good with `drain` first.
+    #[arg(long, default_value = "60s", env = "DUCKWAKE_STOP_GRACE")]
+    pub stop_grace: String,
+    /// How often a worker checks the balance; `off` moves views only on failover, drain and pins.
+    #[arg(long, default_value = "30s", env = "DUCKWAKE_REBALANCE_EVERY")]
+    pub rebalance_every: String,
+    /// A view runs at least this long on a worker before rebalancing moves it again.
+    #[arg(long, default_value = "5m", env = "DUCKWAKE_REBALANCE_COOLDOWN")]
+    pub rebalance_cooldown: String,
+    /// Most views the busiest worker gives away per round.
+    #[arg(long, default_value_t = 2, env = "DUCKWAKE_REBALANCE_MAX_MOVES")]
+    pub rebalance_max_moves: usize,
+    /// Imbalance tolerated: the busiest worker may carry up to (1 + this) times the average load.
+    #[arg(long, default_value_t = 0.2, env = "DUCKWAKE_REBALANCE_EPSILON")]
+    pub rebalance_epsilon: f64,
     /// Stage views in parallel on this many threads, each with its own connection (0 = half the cores).
     #[arg(long, default_value_t = 1, env = "DUCKWAKE_STAGE_THREADS")]
     pub stage_threads: usize,
@@ -235,6 +262,20 @@ impl WorkerArgs {
             },
             max_epochs: self.max_epochs,
             refresh_every: Duration::from_secs(2),
+            lease_timeout: match self.lease_timeout.as_str() {
+                "off" | "0" => None,
+                t => Some(parse_duration(t)?),
+            },
+            stop_grace: parse_duration(&self.stop_grace)?,
+            rebalance: match self.rebalance_every.as_str() {
+                "off" | "0" => None,
+                every => Some(duckwake_core::failover::RebalanceConfig {
+                    every: parse_duration(every)?,
+                    cooldown: parse_duration(&self.rebalance_cooldown)?,
+                    max_moves: self.rebalance_max_moves.max(1),
+                    epsilon: self.rebalance_epsilon.max(0.0),
+                }),
+            },
             stage_threads: self.stage_threads,
             pipeline: self.pipeline,
             shared_readers: self.shared_readers,
@@ -303,7 +344,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             println!("{msg} {:?}", def.plan.sink_columns);
             println!("  its circuit and per-epoch SQL: duckwake explain {}", def.job_id);
         }
-        Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, &worker)?),
+        Cmd::Start { name, worker } => println!("{}", api::start(&open()?, &name, api::assign_named(&worker))?),
+        Cmd::Drain { worker } => println!("{}", api::drain(&open()?, &worker)?),
         Cmd::Pause { name } => println!("{}", api::pause(&open()?, &name)?),
         Cmd::Stop { name } => println!("{}", api::stop(&open()?, &name)?),
         Cmd::Reset { name, to_epoch } => println!("{}", api::reset(&open()?, &name, to_epoch)?),
@@ -314,6 +356,10 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 Some(sql) => print_query(&conn, &sql)?,
                 None => println!("no views"),
             }
+        }
+        Cmd::Workers => {
+            let conn = open()?;
+            print_query(&conn, &api::workers_sql(&conn)?)?;
         }
         Cmd::Checkpoints { name, limit } => {
             let conn = open()?;
@@ -341,8 +387,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 bail!("VERIFY FAILED for {name}");
             }
             let scope = match r.from_epoch {
-                Some(e) => format!("the {} retained events (output after epoch {e})", r.kafka_rows),
-                None => format!("all {} events", r.kafka_rows),
+                Some(e) => format!("the retained {} (output after epoch {e})", r.inputs()),
+                None => format!("all {}", r.inputs()),
             };
             println!("VERIFY OK: {name} output matches batch recomputation over {scope} (epoch {}, watermark {})", r.epoch, r.watermark);
         }
@@ -462,7 +508,7 @@ async fn produce(
     eos: bool,
 ) -> Result<()> {
     use rand::Rng;
-    let client = kafka::client(brokers).await?;
+    let client = kafka::plain_client(brokers).await?;
     kafka::ensure_topic(&client, topic, partitions).await?;
     let parts = kafka::partitions(&client, topic).await?;
     let tick = Duration::from_millis(100);

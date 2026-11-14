@@ -9,13 +9,15 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
     pub name: String,
-    /// Whether its rows are only ever inserted (Kafka without CDC).
+    /// Whether its rows are only ever inserted (Kafka without CDC). Otherwise each staged row has its weight.
     pub append_only: bool,
+    /// Read through a DuckLake change feed (a lake table or view) rather than from Kafka.
+    pub change_feed: bool,
 }
 
 impl Operator for Source {
     fn name(&self) -> String {
-        format!("Source({})", self.name)
+        if self.change_feed { format!("ChangeFeed({})", self.name) } else { format!("Source({})", self.name) }
     }
 
     fn class(&self) -> Class {
@@ -27,9 +29,10 @@ impl Operator for Source {
     }
 
     fn stage(&self, cx: &mut Cx, _inputs: &[Rel]) -> Result<Vec<Rel>> {
-        // Kafka rows are inserts: weight +1.
+        // Kafka rows are inserts: weight +1. A retracting source stages each row's weight.
         let input = cx.x.source(&self.name)?;
         let cols = input.columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
-        Ok(vec![Rel::Sql(format!("(SELECT _partition, _offset, {cols}, 1::INTEGER AS __w FROM {} WHERE _err IS NULL)", input.typed))])
+        let w = if self.append_only { "1::INTEGER" } else { "__w::INTEGER" };
+        Ok(vec![Rel::Sql(format!("(SELECT _partition, _offset, {cols}, {w} AS __w FROM {} WHERE _err IS NULL)", input.typed))])
     }
 }

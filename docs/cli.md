@@ -38,7 +38,77 @@ functions would goes through the SQL decode instead, so the rows and dead letter
 `"decode": "sql"` decodes everything in SQL; `"decode": "arrow"` refuses a source whose column types Arrow
 can't decode.
 
+A source reaches its brokers in plaintext unless its options say otherwise, with the names Kafka clients use:
+`security_protocol` (`plaintext`, `ssl`, `sasl_plaintext` or `sasl_ssl`), `sasl_mechanism` (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`), `sasl_username` and `sasl_password`, and with TLS `ssl_ca_location`
+(a PEM file of CAs; the public roots otherwise) and, for brokers that want client certificates,
+`ssl_certificate_location` and `ssl_key_location`. The password is never stored in the lake: it must be
+`env:NAME` or `file:/path`, read by each worker when it connects, so every worker that may run the view needs
+that variable or file, and so do the paths. A source whose brokers cannot be reached within 10 s when a view
+starts (a wrong password or certificate, or the wrong address) marks the view `failed`, with the reason;
+`start` it again once fixed.
+
+```sh
+$B create-source clicks --options '{"brokers":"kafka-1:9094","topic":"clicks","event_time":"ts",
+  "security_protocol":"sasl_ssl","sasl_mechanism":"SCRAM-SHA-512","sasl_username":"duckwake",
+  "sasl_password":"env:KAFKA_PASSWORD","columns":{"ts":"TIMESTAMP","game_id":"VARCHAR"}}'
+```
+
 `run`, `serve` and `playground` take the worker flags described in [performance.md](performance.md).
+
+## Storage and credentials
+
+`--catalog` (`DUCKWAKE_CATALOG`) is the DuckLake catalog and `--data-path` (`DUCKWAKE_DATA_PATH`) where its
+Parquet files go: a local path, or `s3://bucket/prefix/` on S3 or any S3-compatible store. None of the
+credentials below are stored in the lake; each process that opens the lake reads them from its environment.
+
+- **Catalog password.** Leave `password=` out of the connection string and set `PGPASSWORD`, or use a
+  `.pgpass` file (`passfile=` in the string names another one); PostgreSQL's client library reads them. A
+  worker started with the password in the string warns, since process listings and shell history show it.
+- **S3.** The standard AWS variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `AWS_REGION`. Without keys the AWS credential chain is used (config files, instance and container roles).
+  For MinIO, GCS's S3 API and the like, `AWS_ENDPOINT_URL` (`http://` turns TLS off) switches to path-style
+  URLs; `DUCKWAKE_S3_URL_STYLE=vhost` keeps virtual-host style.
+- **Kafka.** In the source's options as `env:` or `file:` references (above).
+
+```sh
+export DUCKWAKE_CATALOG="postgres:dbname=lake host=pg.internal user=duckwake" PGPASSWORD=...
+export DUCKWAKE_DATA_PATH=s3://analytics-lake/duckwake/ AWS_REGION=eu-west-1   # keys from the instance role
+$B run --worker w1
+```
+
+Anything else that reads the lake, such as a DuckDB session that attaches it, needs the same access: its
+own S3 secret (`CREATE SECRET (TYPE s3, ...)`) and catalog credentials.
+
+## Workers, failover and rebalancing
+
+Every worker heartbeats into the lake, and the workers move views between themselves:
+
+- **A view's topic does not exist yet**: the view waits for it (logged once) and starts when it appears.
+- **A worker dies** (killed, frozen, its machine gone): its views move to the live workers once its heartbeat
+  has not moved for `--lease-timeout` (default `30s`), and continue from their last checkpoint. Only time
+  in which the watching worker's own heartbeats land counts, so a catalog stall that holds everyone up (a
+  PostgreSQL failover, a slow disk) moves nothing.
+- **A worker stops cleanly** (Ctrl-C, SIGTERM): it is taken to be restarting, so its views wait
+  `--stop-grace` (default `60s`) for it and do not move during a rolling restart. To take a worker out for
+  good, `drain` it first: `duckwake drain w3` (or `CALL duckwake_drain('w3')`) hands all its views to the
+  others within a refresh or two, and it takes none until it restarts.
+- **A worker joins, or loads drift apart**: every `--rebalance-every` (default `30s`) the busiest worker
+  that has a view it may move gives up to `--rebalance-max-moves` (2) views to the least loaded one, when it
+  holds two views more than that worker, or when for three rounds in a row it carries more than
+  `1 + --rebalance-epsilon` (1.2) times the average load and at least a tenth of a worker above it. Load is what each view costs (its staging, source and commit time per second, a moving average),
+  and a target that already reads the view's source is preferred. A view that just moved or started stays
+  put for `--rebalance-cooldown` (default `5m`). `--rebalance-every off` turns this off.
+
+`start NAME` leaves the view to whichever live worker claims it, and lets rebalancing move it.
+`start NAME --worker W` pins it to W: rebalancing never moves it, and after a failover it goes back to W once
+W is live again. `workers` lists every worker with its state (`running`, `draining`, `stopped`), views,
+load and last heartbeat; `duckwake_view_cost`, `duckwake_worker_load`, `duckwake_failover_claims_total` and
+`duckwake_handoffs_total` are in `/metrics`. `--lease-timeout off` keeps a worker from taking over other
+workers' views, and turns rebalancing off for it. With a PostgreSQL catalog, a worker also has PostgreSQL
+end any of its sessions that stalls inside a transaction for longer than the lease timeout, so a frozen
+worker cannot block the others' commits; if your catalog string already passes `options`, add
+`-c idle_in_transaction_session_timeout=30000` to it.
 
 ## Playground
 

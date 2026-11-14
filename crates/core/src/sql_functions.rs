@@ -107,6 +107,8 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     action::<Wait>(conn, api)?;
     query::<Explain>(conn, api)?;
     query::<Jobs>(conn, api)?;
+    query::<Workers>(conn, api)?;
+    action::<Drain>(conn, api)?;
     query::<Checkpoints>(conn, api)?;
     query::<Sources>(conn, api)?;
     query::<MetricsFn>(conn, api)?;
@@ -343,7 +345,8 @@ impl Spec for CreateView {
     }
 }
 
-/// `duckwake_start(view, worker :=)`: without a worker, the server's own.
+/// `duckwake_start(view, worker :=)`: a named worker pins the view there; `worker := 'any'` leaves it to
+/// whichever live worker claims it; without a worker, the server's own, unpinned.
 struct Start;
 impl Spec for Start {
     const NAME: &'static str = "duckwake_start";
@@ -354,11 +357,14 @@ impl Spec for Start {
         vec![("worker", Varchar)]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
-        let worker = match a.opt("worker").map(String::from).or_else(|| api.default_worker()) {
-            Some(w) => w,
-            None => bail!("duckwake_start: name the worker, e.g. duckwake_start('{}', worker := 'w1')", a.arg(0)),
+        let named = a.opt("worker").map(String::from);
+        let default = api.default_worker();
+        let assign = match (&named, &default) {
+            (Some(w), _) => api::assign_named(w),
+            (None, Some(w)) => crate::catalog::Assign::Prefer(w),
+            (None, None) => bail!("duckwake_start: name the worker, e.g. duckwake_start('{}', worker := 'w1')", a.arg(0)),
         };
-        one(a.arg(0), api.with(|c| api::start(c, a.arg(0), &worker))?)
+        one(a.arg(0), api.with(|c| api::start(c, a.arg(0), assign))?)
     }
 }
 
@@ -426,7 +432,7 @@ impl Spec for Verify {
             crate::verify::verify(c, &api.rt, &job)
         })?;
         let msg = if r.ok() {
-            format!("VERIFY OK: output matches batch recomputation over {} events (epoch {})", r.kafka_rows, r.epoch)
+            format!("VERIFY OK: output matches batch recomputation over {} (epoch {})", r.inputs(), r.epoch)
         } else {
             format!("VERIFY FAILED: {r:?}")
         };
@@ -462,22 +468,47 @@ impl Spec for Wait {
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
         let timeout = std::time::Duration::from_secs(a.opt_num("timeout_s")?.unwrap_or(60));
-        let (job, sources) = api.with(|c| {
+        // Every input's end now: a Kafka source's offsets, a lake input's current snapshot.
+        let (job, def, ends) = api.with(|c| {
             let job = crate::catalog::resolve_view(c, a.arg(0))?;
             let (def, _) = crate::catalog::load_job(c, &job)?;
             let mut all = crate::catalog::load_sources(c)?;
-            let sources = def.plan.sources().iter().map(|n| all.remove(n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))).collect::<Result<Vec<_>>>()?;
-            Ok((job, sources))
+            let snapshot = crate::lake::current_snapshot(c)?;
+            let mut ends = Vec::new();
+            for n in def.plan.sources() {
+                if def.lake_inputs.iter().any(|l| l.name == n) {
+                    ends.push((n.clone(), std::collections::BTreeMap::from([(0, snapshot)])));
+                } else {
+                    let s = all.remove(&n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))?;
+                    ends.push((n.clone(), api.rt.block_on(crate::kafka::latest_offsets(&s.options))?));
+                }
+            }
+            Ok((job, def, ends))
         })?;
-        // Every source's end now; caught up once one checkpoint covers all of them.
-        let ends = sources.iter().map(|s| Ok((s.name.clone(), api.rt.block_on(crate::kafka::latest_offsets(&s.options))?))).collect::<Result<Vec<_>>>()?;
         let t = std::time::Instant::now();
         loop {
             let mut ckpt = None;
             let mut done = true;
             for (name, end) in &ends {
                 let ck = api.with(|c| crate::catalog::latest_checkpoint(c, &job, name))?;
-                done &= ck.as_ref().is_some_and(|ck| end.iter().all(|(p, o)| ck.offsets.get(p).is_some_and(|c| c >= o)));
+                done &= match def.lake_inputs.iter().find(|l| &l.name == name) {
+                    // A view skips epochs with no changes, so its position can stay behind the lake's newest
+                    // snapshot: caught up once no change to the table lies between the two.
+                    Some(l) => {
+                        let p = ck.as_ref().and_then(|ck| ck.offsets.get(&0).copied()).or(def.start_snapshot).unwrap_or(0);
+                        let s = end[&0];
+                        p >= s || api.with(|c| {
+                            let Some((schema, table)) = crate::lake::table_by_id(c, l.table_id)? else { return Ok(false) };
+                            let n: i64 = c.query_row(
+                                &format!("SELECT count(*) FROM ducklake_table_changes({}, ?, ?, ?, ?)", crate::lake::lit(crate::lake::LAKE)),
+                                duckdb::params![schema, table, p + 1, s],
+                                |r| r.get(0),
+                            )?;
+                            Ok(n == 0)
+                        })?
+                    }
+                    None => ck.as_ref().is_some_and(|ck| end.iter().all(|(p, o)| ck.offsets.get(p).is_some_and(|c| c >= o))),
+                };
                 ckpt = ck;
             }
             if done {
@@ -500,6 +531,31 @@ impl Spec for Jobs {
     }
     fn run(api: &Api, _: &Args) -> Result<Out> {
         Ok(Out::Query(api.with(crate::catalog::jobs_query)?))
+    }
+}
+
+/// `duckwake_workers()`: every worker that ran on this lake, its state, views and last heartbeat.
+struct Workers;
+impl Spec for Workers {
+    const NAME: &'static str = "duckwake_workers";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![]
+    }
+    fn run(api: &Api, _: &Args) -> Result<Out> {
+        Ok(Out::Query(api.with(api::workers_sql)?))
+    }
+}
+
+/// `duckwake_drain(worker)`: the worker hands all its views to the others and takes none, before it is
+/// taken out for good.
+struct Drain;
+impl Spec for Drain {
+    const NAME: &'static str = "duckwake_drain";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        one(a.arg(0), api.with(|c| api::drain(c, a.arg(0)))?)
     }
 }
 
@@ -618,6 +674,9 @@ impl Spec for WorkerStart {
                 maintenance: crate::maintenance::MaintenanceConfig::default(),
                 max_epochs: None,
                 refresh_every: std::time::Duration::from_secs(1),
+                lease_timeout: Some(std::time::Duration::from_secs(30)),
+                stop_grace: std::time::Duration::from_secs(60),
+                rebalance: Some(crate::failover::RebalanceConfig::default()),
                 stage_threads,
                 pipeline,
                 shared_readers,

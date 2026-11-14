@@ -23,7 +23,8 @@ pub struct ServeArgs {
     /// machines, keep localhost and put a TLS reverse proxy in front.
     #[arg(long, env = "DUCKWAKE_QUACK", default_value = "quack:localhost:9494")]
     pub quack: String,
-    /// Token Quack clients must send. Without one, Quack generates a token and the server prints it once.
+    /// Token Quack clients must send, or a reference to it (`file:/run/secrets/quack`, `env:NAME`) so it
+    /// stays out of process listings. Without one, Quack generates a token and the server prints it once.
     #[arg(long, env = "DUCKWAKE_QUACK_TOKEN", hide_env_values = true)]
     pub quack_token: Option<String>,
     /// Address of the HTTP endpoint (`GET /metrics`, `GET /healthz`); `none` turns it off.
@@ -60,7 +61,8 @@ fn serve_quack(conn: &duckdb::Connection, s: &ServeArgs) -> Result<()> {
     let host = s.quack.trim_start_matches("quack:").rsplit_once(':').map_or(s.quack.trim_start_matches("quack:"), |(h, _)| h);
     let mut opts = String::new();
     if let Some(t) = &s.quack_token {
-        opts.push_str(&format!(", token = {}", lit(t)));
+        let t = if duckwake_core::secrets::is_reference(t) { duckwake_core::secrets::resolve("quack token", t)? } else { t.clone() };
+        opts.push_str(&format!(", token = {}", lit(&t)));
     }
     if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
         opts.push_str(", allow_other_hostname = true");

@@ -24,7 +24,7 @@ pub use from::From;
 pub use integrate::Integrate;
 pub use late_split::LateSplit;
 pub use map::Map;
-pub use sink::{Sink, SinkKind};
+pub use sink::{Sink, SinkKind, COUNT_COLUMN};
 pub use source::Source;
 pub use union::Union;
 pub use window::Window;

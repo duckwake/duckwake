@@ -46,7 +46,7 @@ impl<'a> Cx<'a> {
         Cx {
             x,
             plan: x.plan,
-            cols: x.primary().columns.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", "),
+            cols: x.stream_columns().iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", "),
             set: format!("{}_{}", x.job, x.parity),
             emits_final,
             steps: Vec::new(),
@@ -58,6 +58,11 @@ impl<'a> Cx<'a> {
         let cols: Vec<String> = self.plan.sink_columns.iter().map(|(c, _)| ident(c)).chain(["_duckwake_epoch".into()]).collect();
         cols.join(", ")
     }
+}
+
+/// `window_start` or `window_end`.
+pub fn is_window_column(c: &str) -> bool {
+    c == "window_start" || c == "window_end"
 }
 
 /// A source of the view, as one epoch reads it.
@@ -100,6 +105,13 @@ impl EpochCtx<'_> {
     /// The view's first source: a windowed view's only one.
     pub fn primary(&self) -> &SourceInput<'_> {
         &self.sources[0]
+    }
+
+    /// The primary source's columns as the view's rows carry them on: in a windowed view the window's
+    /// `window_start` and `window_end` replace any the source has (a windowed view's table, read by another).
+    pub fn stream_columns(&self) -> Vec<&(String, String)> {
+        let windowed = self.plan.is_windowed();
+        self.primary().columns.iter().filter(|(c, _)| !(windowed && is_window_column(c))).collect()
     }
 
     /// A context with placeholders instead of values, for showing the SQL. `sources` holds each source's

@@ -111,8 +111,18 @@ impl Circuit {
         self.has(&Op::Delta(Box::new(Op::Aggregate(Aggregate { grouping: Grouping::Windowed }))))
     }
 
-    /// Whether the output rows are the changed groups (an upsert sink) rather than rows inserted.
+    /// Whether the output rows are the changed keys or rows (an upsert or counted sink) rather than rows inserted.
     pub fn upserts(&self) -> bool {
-        self.has(&Op::Sink(Sink { kind: SinkKind::Upsert }))
+        self.has(&Op::Sink(Sink { kind: SinkKind::Upsert })) || self.counts_rows()
+    }
+
+    /// Whether the view's table counts each row's multiplicity in `_duckwake_count`.
+    pub fn counts_rows(&self) -> bool {
+        self.has(&Op::Sink(Sink { kind: SinkKind::Counted }))
+    }
+
+    /// Columns the view's table has besides the view's own and `_duckwake_epoch`.
+    pub fn sink_extra_columns(&self) -> Vec<(String, String)> {
+        if self.counts_rows() { vec![(crate::ops::COUNT_COLUMN.to_string(), "BIGINT".to_string())] } else { vec![] }
     }
 }

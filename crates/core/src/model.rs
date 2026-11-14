@@ -31,6 +31,26 @@ pub struct SourceOptions {
     /// `auto` (Arrow when every column type has an Arrow decoder, else SQL), `arrow` or `sql`.
     #[serde(default = "default_decode")]
     pub decode: String,
+    /// How to reach the brokers, named as Kafka clients name it: `plaintext` (default), `ssl`,
+    /// `sasl_plaintext` or `sasl_ssl`.
+    #[serde(default = "default_security_protocol")]
+    pub security_protocol: String,
+    /// With SASL: `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_mechanism: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_username: Option<String>,
+    /// `env:NAME` or `file:/path`, resolved by the worker when it connects (`secrets`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_password: Option<String>,
+    /// With TLS: a PEM file of CA certificates to trust instead of the public roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_ca_location: Option<String>,
+    /// With TLS and a broker that wants client certificates: PEM files of the certificate chain and its key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_certificate_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_key_location: Option<String>,
 }
 
 fn default_format() -> String {
@@ -47,6 +67,47 @@ fn default_start() -> String {
 }
 fn default_decode() -> String {
     "auto".into()
+}
+fn default_security_protocol() -> String {
+    "plaintext".into()
+}
+
+impl SourceOptions {
+    /// Checks the connection settings: protocol and mechanism names, credentials with SASL, a password given
+    /// as a reference, files only with TLS.
+    fn check_security(&self) -> Result<()> {
+        let (tls, sasl) = match self.security_protocol.to_ascii_lowercase().as_str() {
+            "plaintext" => (false, false),
+            "ssl" => (true, false),
+            "sasl_plaintext" => (false, true),
+            "sasl_ssl" => (true, true),
+            p => bail!("security_protocol must be plaintext, ssl, sasl_plaintext or sasl_ssl, not {p:?}"),
+        };
+        if sasl {
+            match self.sasl_mechanism.as_deref().map(str::to_ascii_uppercase).as_deref() {
+                Some("PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512") => {}
+                Some(m) => bail!("sasl_mechanism must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512, not {m:?}"),
+                None => bail!("security_protocol {} needs sasl_mechanism", self.security_protocol),
+            }
+            if self.sasl_username.as_deref().is_none_or(str::is_empty) {
+                bail!("security_protocol {} needs sasl_username", self.security_protocol);
+            }
+            let Some(p) = &self.sasl_password else {
+                bail!("security_protocol {} needs sasl_password (env:NAME or file:/path)", self.security_protocol)
+            };
+            crate::secrets::check_reference("sasl_password", p)?;
+        } else if self.sasl_mechanism.is_some() || self.sasl_username.is_some() || self.sasl_password.is_some() {
+            bail!("sasl_* options need security_protocol sasl_plaintext or sasl_ssl");
+        }
+        let files = [&self.ssl_ca_location, &self.ssl_certificate_location, &self.ssl_key_location];
+        if !tls && files.iter().any(|f| f.is_some()) {
+            bail!("ssl_* options need security_protocol ssl or sasl_ssl");
+        }
+        if self.ssl_certificate_location.is_some() != self.ssl_key_location.is_some() {
+            bail!("ssl_certificate_location and ssl_key_location go together");
+        }
+        Ok(())
+    }
 }
 
 impl SourceOptions {
@@ -93,6 +154,7 @@ impl SourceOptions {
             "arrow" => {}
             d => bail!("decode must be 'auto', 'arrow' or 'sql', not {d:?}"),
         }
+        o.check_security()?;
         Ok(o)
     }
 }
@@ -110,6 +172,112 @@ pub struct JobDef {
     #[serde(default = "default_inline_row_limit")]
     pub inline_row_limit: usize,
     pub plan: crate::plan::Plan,
+    /// The lake tables and views the view reads through their change feeds (not lookups), in the order
+    /// `create_view` resolved them.
+    #[serde(default)]
+    pub lake_inputs: Vec<LakeInput>,
+    /// With lake inputs: the snapshot current when the view was created. The view reads the changes after it
+    /// (`start: latest`); its first checkpoint starts from here.
+    #[serde(default)]
+    pub start_snapshot: Option<i64>,
+}
+
+/// The column every lake input adds: the commit time of the change, as the running maximum of
+/// `snapshot_time` by snapshot id, in UTC. Monotone in commit order, so it gives an exact watermark.
+pub const COMMIT_TS: &str = "_commit_ts";
+
+/// A lake table, or another view's table, that a view reads through its DuckLake change feed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LakeInput {
+    /// The name the view's SQL uses for it, and its key in the checkpoint's offsets.
+    pub name: String,
+    /// `lake.schema.table` when the view was created.
+    pub table: String,
+    /// DuckLake table id: a renamed table keeps working, and a dropped and recreated one has a new id and
+    /// fails the job.
+    pub table_id: i64,
+    /// Its columns when the view was created, then `_commit_ts`.
+    pub columns: Vec<(String, String)>,
+    /// The view whose table this is, if any.
+    pub view: Option<String>,
+    /// A windowed view's table: its window size. Windows over its `window_start` or `window_end` then get
+    /// an exact watermark from the view's own.
+    pub window_size_us: Option<i64>,
+    /// Whether the view takes its updates and deletes: each change then carries a weight `__w` (inserts and
+    /// new versions +1, deletes and old versions -1) and the view retracts what it no longer holds.
+    /// Otherwise the view needs it insert-only, and an update or delete stops the view.
+    #[serde(default)]
+    pub retracts: bool,
+    /// A view's table that keeps each row once with its multiplicity in `_duckwake_count`: a change of such
+    /// a row weighs that many rows.
+    #[serde(default)]
+    pub counted: bool,
+}
+
+impl LakeInput {
+    /// The time column a window over this input may use, and the watermark source it implies.
+    pub fn window_columns(&self) -> Vec<String> {
+        let mut out = vec![COMMIT_TS.to_string()];
+        if self.window_size_us.is_some() {
+            out.extend(["window_start".into(), "window_end".into()]);
+        }
+        out
+    }
+}
+
+impl crate::circuit::SourceSchema for LakeInput {
+    fn event_time(&self) -> &str {
+        COMMIT_TS
+    }
+    fn columns(&self) -> &[(String, String)] {
+        &self.columns
+    }
+    fn append_only(&self) -> bool {
+        !self.retracts
+    }
+    fn is_lake(&self) -> bool {
+        true
+    }
+    fn time_columns(&self) -> Vec<String> {
+        self.window_columns()
+    }
+}
+
+/// Anything a view names in FROM that the compiler treats as a stream: a declared Kafka source, or a lake
+/// table or view read through its change feed.
+pub enum Input<'a> {
+    Kafka(&'a SourceDef),
+    Lake(&'a LakeInput),
+}
+
+impl crate::circuit::SourceSchema for Input<'_> {
+    fn event_time(&self) -> &str {
+        match self {
+            Input::Kafka(s) => s.event_time(),
+            Input::Lake(l) => l.event_time(),
+        }
+    }
+    fn columns(&self) -> &[(String, String)] {
+        match self {
+            Input::Kafka(s) => s.columns(),
+            Input::Lake(l) => l.columns(),
+        }
+    }
+    fn append_only(&self) -> bool {
+        match self {
+            Input::Kafka(s) => s.append_only(),
+            Input::Lake(l) => l.append_only(),
+        }
+    }
+    fn is_lake(&self) -> bool {
+        matches!(self, Input::Lake(_))
+    }
+    fn time_columns(&self) -> Vec<String> {
+        match self {
+            Input::Kafka(s) => s.time_columns(),
+            Input::Lake(l) => l.time_columns(),
+        }
+    }
 }
 
 fn default_inline_row_limit() -> usize {
@@ -165,20 +333,6 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration("30 seconds").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("1 minute").unwrap(), Duration::from_secs(60));
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert!(parse_duration("1 fortnight").is_err());
-    }
-}
-
 impl JobDef {
     /// The view as the circuit compiler needs it.
     pub fn view(&self) -> crate::circuit::View<'_> {
@@ -192,5 +346,19 @@ impl crate::circuit::SourceSchema for SourceDef {
     }
     fn columns(&self) -> &[(String, String)] {
         &self.options.columns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("30 seconds").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("1 minute").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert!(parse_duration("1 fortnight").is_err());
     }
 }

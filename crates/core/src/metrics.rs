@@ -23,6 +23,8 @@ struct State {
     commit_seconds_sum: f64,
     last_commit_seconds: f64,
     last_stage_seconds: f64,
+    claims: u64,
+    handoffs: u64,
 }
 
 #[derive(Default, Clone)]
@@ -37,6 +39,7 @@ struct Job {
     rows_dead: u64,
     stage_seconds: f64,
     commit_freshness_seconds: Option<f64>,
+    cost: Option<f64>,
 }
 
 /// One series' value: `view` is set for per-view series, None for worker-wide ones.
@@ -51,7 +54,7 @@ pub struct Sample {
 type PerView = (&'static str, &'static str, &'static str, fn(&Job, &dyn Fn(i64) -> f64) -> Option<f64>);
 
 /// The per-view series: name, type, help, and how to read it off a view's numbers.
-const PER_VIEW: [PerView; 10] = [
+const PER_VIEW: [PerView; 11] = [
     ("duckwake_freshness_seconds", "gauge", "Now minus the newest event time committed (alert above 3x the epoch interval).", |j, secs| j.max_event_time_us.map(secs)),
     ("duckwake_commit_freshness_seconds", "gauge", "At the last commit: newest event time to the moment its epoch became visible.", |j, _| j.commit_freshness_seconds),
     ("duckwake_watermark_delay_seconds", "gauge", "Now minus the view's watermark (alert above 2x watermark_delay).", |j, secs| j.watermark_us.map(secs)),
@@ -62,6 +65,7 @@ const PER_VIEW: [PerView; 10] = [
     ("duckwake_rows_out_total", "counter", "Rows written to the view's table.", |j, _| Some(j.rows_out as f64)),
     ("duckwake_late_rows_total", "counter", "Rows routed to the late-data table.", |j, _| Some(j.rows_late as f64)),
     ("duckwake_dead_letters_total", "counter", "Events that could not be decoded.", |j, _| Some(j.rows_dead as f64)),
+    ("duckwake_view_cost", "gauge", "Share of a worker the view uses (moving average of its staging, source and commit time per second).", |j, _| j.cost),
 ];
 
 /// What one view's committed epoch adds.
@@ -109,6 +113,21 @@ impl Metrics {
         st.last_stage_seconds = poll_stage_ms as f64 / 1000.0;
     }
 
+    /// The view's cost, the share of the worker it uses.
+    pub fn set_cost(&self, job: &str, cost: f64) {
+        self.lock().jobs.entry(job.to_string()).or_default().cost = Some(cost);
+    }
+
+    /// This worker took over an orphaned view (failover).
+    pub fn record_claim(&self) {
+        self.lock().claims += 1;
+    }
+
+    /// This worker handed one of its views to another (rebalance, drain or pin).
+    pub fn record_move(&self) {
+        self.lock().handoffs += 1;
+    }
+
     /// A view that left this worker (paused, stopped, reassigned or fenced).
     pub fn forget(&self, job: &str) {
         self.lock().jobs.remove(job);
@@ -146,7 +165,8 @@ impl Metrics {
                 }
             }
         }
-        let worker: [(&'static str, &'static str, &'static str, f64); 8] = [
+        let load: f64 = st.jobs.values().filter_map(|j| j.cost).fold(0.0, |a, c| a + c);
+        let worker: [(&'static str, &'static str, &'static str, f64); 11] = [
             ("duckwake_worker_up", "gauge", "1 while the worker runs, 0 while it waits to restart after a failure.", if st.up { 1.0 } else { 0.0 }),
             ("duckwake_worker_restarts_total", "counter", "Times the worker failed and restarted from its last checkpoint.", st.restarts as f64),
             ("duckwake_views", "gauge", "Views this worker runs.", st.jobs.len() as f64),
@@ -155,6 +175,9 @@ impl Metrics {
             ("duckwake_commit_seconds", "gauge", "Duration of the last epoch commit.", st.last_commit_seconds),
             ("duckwake_poll_stage_seconds", "gauge", "Poll and stage time of the last epoch, all views.", st.last_stage_seconds),
             ("duckwake_commit_conflicts_total", "counter", "DuckLake write conflicts retried by epoch commits.", st.commit_conflicts as f64),
+            ("duckwake_worker_load", "gauge", "Sum of the view costs: the share of the worker its views use.", load),
+            ("duckwake_failover_claims_total", "counter", "Orphaned views this worker took over from dead or unassigned owners.", st.claims as f64),
+            ("duckwake_handoffs_total", "counter", "Views this worker handed to another worker (rebalance, drain, pins).", st.handoffs as f64),
         ];
         out.extend(worker.into_iter().map(|(name, kind, help, value)| Sample { name, kind, help, view: None, value }));
         out

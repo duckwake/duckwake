@@ -17,7 +17,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
-rskafka = { version = "0.6", default-features = false, features = ["compression-lz4", "compression-snappy", "compression-zstd", "compression-gzip"] }
+rskafka = { version = "0.6", default-features = false, features = ["compression-lz4", "compression-snappy", "compression-zstd", "compression-gzip", "transport-tls"] }
+# TLS to Kafka: the same rustls (with ring) rskafka uses, Mozilla's roots, and PEM parsing for CA and client certs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+webpki-roots = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }

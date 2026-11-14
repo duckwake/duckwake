@@ -4,7 +4,7 @@
 use crate::catalog;
 use crate::lake::{lit, CTL};
 use crate::model::{JobDef, JobStatus};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use duckdb::Connection;
 
 /// Options of `duckwake_create_view`; `None` takes the default.
@@ -46,20 +46,55 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
         },
     )?;
     let kind = match def.plan.kind_name() {
-        "windowed" => "windowed aggregate, append sink",
-        "aggregate" => "global aggregate, upsert sink",
-        "distinct" => "distinct, append sink",
-        _ => "stateless, append sink",
+        "windowed" => "windowed aggregate",
+        "aggregate" => "global aggregate",
+        k => k,
     };
-    let msg = format!("view {}: {kind}, table {}", def.job_id, def.sink);
+    let circuit = crate::circuit::Circuit::compile(&def.view())?;
+    let sink = if circuit.counts_rows() {
+        "counted sink"
+    } else if circuit.upserts() {
+        "upsert sink"
+    } else {
+        "append sink"
+    };
+    // A lake table a windowed view reads must stay insert-only: say so up front.
+    let insert_only: Vec<&str> = def.lake_inputs.iter().filter(|l| !l.retracts && l.view.is_none()).map(|l| l.name.as_str()).collect();
+    let insert_only =
+        if insert_only.is_empty() { String::new() } else { format!(" ({} must stay insert-only)", insert_only.join(", ")) };
+    let msg = format!("view {}: {kind}, {sink}{insert_only}, table {}", def.job_id, def.sink);
     Ok((def, msg))
 }
 
-/// Assigns the view to `worker` and bumps its lease, which fences the previous owner's next commit.
-pub fn start(conn: &Connection, name: &str, worker: &str) -> Result<String> {
+/// Starts the view where `assign` says and bumps its lease, which fences the previous owner's next commit.
+pub fn start(conn: &Connection, name: &str, assign: catalog::Assign) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    catalog::set_status(conn, &job, JobStatus::Running, Some(worker))?;
-    Ok(format!("{job}: running on {worker}"))
+    catalog::set_status(conn, &job, JobStatus::Running, Some(assign))?;
+    Ok(match assign {
+        catalog::Assign::Any => format!("{job}: running on the next live worker to claim it"),
+        catalog::Assign::Prefer(w) => format!("{job}: running on {w}"),
+        catalog::Assign::Pin(w) => format!("{job}: running on {w} (pinned)"),
+    })
+}
+
+/// How the CLI and SQL name a placement: `any` (or nothing, in the CLI) floats; a worker id pins.
+pub fn assign_named(worker: &str) -> catalog::Assign<'_> {
+    if worker == crate::failover::ANY_WORKER {
+        catalog::Assign::Any
+    } else {
+        catalog::Assign::Pin(worker)
+    }
+}
+
+/// The query behind `duckwake_workers()`.
+pub fn workers_sql(conn: &Connection) -> Result<String> {
+    crate::failover::workers_query(conn)
+}
+
+/// Asks `worker` to hand all its views to the other workers and take none, before it is taken out.
+pub fn drain(conn: &Connection, worker: &str) -> Result<String> {
+    crate::failover::drain(conn, worker)?;
+    Ok(format!("{worker}: draining; its views move to the other workers within a refresh or two"))
 }
 
 pub fn pause(conn: &Connection, name: &str) -> Result<String> {
@@ -116,7 +151,7 @@ pub fn explain(conn: &Connection, name: &str) -> Result<String> {
         .plan
         .sources()
         .into_iter()
-        .map(|n| Ok((n.clone(), sources.get(&n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))?.options.columns.clone())))
+        .map(|n| Ok((n.clone(), catalog::input_columns(&n, &sources, &def.lake_inputs)?.to_vec())))
         .collect::<Result<_>>()?;
     crate::circuit::explain(def.view(), &columns)
 }

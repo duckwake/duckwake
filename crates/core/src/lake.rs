@@ -33,7 +33,12 @@ impl LakeConfig {
         if let Some(limit) = &self.memory_limit {
             conn.execute_batch(&format!("SET memory_limit = {}", lit(limit)))?;
         }
-        if !self.data_path.contains("://") {
+        if self.data_path.starts_with("s3://") {
+            conn.execute_batch(&s3_secret_sql(&self.data_path, &|k| std::env::var(k).ok())?)
+                .context("setting up S3 access for the data path")?;
+        } else if self.data_path.contains("://") {
+            bail!("data path {}: only local paths and s3:// are supported", self.data_path);
+        } else {
             std::fs::create_dir_all(&self.data_path).with_context(|| format!("creating {}", self.data_path))?;
         }
         conn.execute_batch(&format!(
@@ -47,6 +52,62 @@ impl LakeConfig {
         conn.execute_batch(&format!("USE {LAKE}"))?;
         Ok(conn)
     }
+}
+
+/// Loads httpfs and creates a temporary (never stored) DuckDB secret for the data path's bucket from the
+/// standard AWS variables of this process: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+/// `AWS_SESSION_TOKEN`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT_URL` (or
+/// `AWS_ENDPOINT_URL_S3`) for S3-compatible stores such as MinIO or GCS's S3 API, which also switches to
+/// path-style URLs unless `DUCKWAKE_S3_URL_STYLE` says `vhost`. Without keys, the AWS credential chain
+/// (environment, config files, instance and container roles) through DuckDB's `aws` extension.
+pub fn s3_secret_sql(data_path: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let rest = data_path.trim_start_matches("s3://");
+    let bucket = rest.split('/').next().filter(|b| !b.is_empty()).context("data path s3://BUCKET/... has no bucket")?;
+    let mut opts = vec!["TYPE s3".to_string(), format!("SCOPE {}", lit(&format!("s3://{bucket}")))];
+    let mut sql = String::from("INSTALL httpfs; LOAD httpfs;");
+    match (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY")) {
+        (Some(k), Some(v)) => {
+            opts.push(format!("KEY_ID {}", lit(&k)));
+            opts.push(format!("SECRET {}", lit(&v)));
+            if let Some(t) = env("AWS_SESSION_TOKEN") {
+                opts.push(format!("SESSION_TOKEN {}", lit(&t)));
+            }
+        }
+        (None, None) => {
+            sql.push_str(" INSTALL aws; LOAD aws;");
+            opts.push("PROVIDER credential_chain".into());
+        }
+        _ => bail!("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or neither (to use the AWS credential chain)"),
+    }
+    if let Some(r) = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")) {
+        opts.push(format!("REGION {}", lit(&r)));
+    }
+    if let Some(url) = env("AWS_ENDPOINT_URL_S3").or_else(|| env("AWS_ENDPOINT_URL")) {
+        let (ssl, host) = match url.split_once("://") {
+            Some(("http", h)) => (false, h),
+            Some(("https", h)) => (true, h),
+            Some((s, _)) => bail!("AWS_ENDPOINT_URL {url:?}: scheme {s:?} is not http or https"),
+            None => (true, url.as_str()),
+        };
+        opts.push(format!("ENDPOINT {}", lit(host.trim_end_matches('/'))));
+        opts.push(format!("USE_SSL {ssl}"));
+        let style = env("DUCKWAKE_S3_URL_STYLE").unwrap_or_else(|| "path".into());
+        opts.push(format!("URL_STYLE {}", lit(&style)));
+    }
+    sql.push_str(&format!(" CREATE OR REPLACE TEMPORARY SECRET duckwake_lake ({});", opts.join(", ")));
+    Ok(sql)
+}
+
+/// A PostgreSQL catalog connection whose sessions PostgreSQL ends when they sit idle inside a transaction for
+/// longer than `timeout`. Every DuckLake commit inserts the next snapshot id, so a worker frozen inside its
+/// commit (a paused VM, a stopped process, a half-open connection) holds a lock every other writer waits on;
+/// ending its session rolls the commit back and frees the lake. Unchanged for other catalogs, and when the
+/// string already passes `options` (libpq takes only one).
+pub fn bound_idle_transactions(catalog: &str, timeout: std::time::Duration) -> String {
+    if !catalog.starts_with("postgres:") || catalog.contains("options=") {
+        return catalog.to_string();
+    }
+    format!("{catalog} options='-c idle_in_transaction_session_timeout={}'", timeout.as_millis())
 }
 
 /// Another connection to the instance behind `conn`: it shares the attached lake and the in-memory `memory`
@@ -74,18 +135,39 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
            max_event_time TIMESTAMP, lag BIGINT, worker VARCHAR, committed_at TIMESTAMPTZ, rows_sql BIGINT);
          CREATE TABLE IF NOT EXISTS {CTL}.dead_letter (
            job_id VARCHAR, epoch BIGINT, source VARCHAR, source_partition INTEGER, source_offset BIGINT,
-           payload VARCHAR, error VARCHAR, failed_at TIMESTAMPTZ);"
+           payload VARCHAR, error VARCHAR, failed_at TIMESTAMPTZ);
+         CREATE TABLE IF NOT EXISTS {CTL}.dependencies (
+           job_id VARCHAR, input VARCHAR, table_id BIGINT, upstream_job VARCHAR);"
     ))
     .context("bootstrapping __duckwake schema")?;
     // Lakes bootstrapped before the Arrow decode lack `rows_sql` (messages decoded in SQL per epoch).
-    let has_rows_sql: i64 = conn.query_row(
-        "SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lake' AND schema_name = '__duckwake'
-           AND table_name = 'checkpoints' AND column_name = 'rows_sql'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_rows_sql == 0 {
-        conn.execute_batch(&format!("ALTER TABLE {CTL}.checkpoints ADD COLUMN rows_sql BIGINT"))?;
+    add_column(conn, "checkpoints", "rows_sql", "BIGINT")?;
+    // Before rebalancing: the worker a view is pinned to (`start --worker W`), NULL when it may move.
+    add_column(conn, "jobs", "pinned_to", "VARCHAR")?;
+    Ok(())
+}
+
+/// Adds a column to a control table unless it has it. Several processes may bootstrap the same lake at
+/// once: one that loses the race finds the column there and goes on.
+pub fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    let schema = CTL.rsplit('.').next().unwrap_or(CTL);
+    let has = || -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM duckdb_columns() WHERE database_name = ? AND schema_name = ? AND table_name = ? AND column_name = ?",
+            [LAKE, schema, table, column],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    for attempt in 1..=5u64 {
+        if has()? {
+            return Ok(());
+        }
+        match conn.execute_batch(&format!("ALTER TABLE {CTL}.{} ADD COLUMN {} {ty}", ident(table), ident(column))) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(100 * attempt)),
+            Err(e) => return Err(e).with_context(|| format!("adding {column} to {CTL}.{table}")),
+        }
     }
     Ok(())
 }
@@ -172,8 +254,72 @@ pub fn query_opt_string(conn: &Connection, sql: &str) -> Result<Option<String>> 
     Ok(conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0))?)
 }
 
+/// The lake's newest committed snapshot id. Cheaper than `max(snapshot_id)` over `ducklake_snapshots`, and
+/// it always shows what other processes have just committed (F0, internals item 9).
+pub fn current_snapshot(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(&format!("SELECT id FROM ducklake_current_snapshot({})", lit(LAKE)), [], |r| r.get(0))?)
+}
+
+/// The DuckLake metadata schema of the lake, which holds `ducklake_table` and `ducklake_schema`.
+fn metadata() -> String {
+    format!("__ducklake_metadata_{LAKE}")
+}
+
+/// The id of a live lake table, or None when there is no such table.
+pub fn table_id(conn: &Connection, schema: &str, table: &str) -> Result<Option<i64>> {
+    let m = metadata();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.table_id FROM {m}.ducklake_table t JOIN {m}.ducklake_schema s USING (schema_id)
+         WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL AND s.schema_name = ? AND t.table_name = ?"
+    ))?;
+    let mut rows = stmt.query([schema, table])?;
+    Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+}
+
+/// The current schema and name of a live lake table by id, or None once it has been dropped.
+pub fn table_by_id(conn: &Connection, id: i64) -> Result<Option<(String, String)>> {
+    let m = metadata();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.schema_name, t.table_name FROM {m}.ducklake_table t JOIN {m}.ducklake_schema s USING (schema_id)
+         WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL AND t.table_id = ?"
+    ))?;
+    let mut rows = stmt.query([id])?;
+    Ok(rows.next()?.map(|r| Ok::<_, duckdb::Error>((r.get(0)?, r.get(1)?))).transpose()?)
+}
+
 /// True when a DuckLake commit failed because another transaction touched the same table.
 pub fn is_conflict(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
     msg.contains("Transaction conflict") || msg.contains("conflict")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_secret_from_env() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let minio = env(&[("AWS_ACCESS_KEY_ID", "k"), ("AWS_SECRET_ACCESS_KEY", "s"), ("AWS_ENDPOINT_URL", "http://localhost:19900/")]);
+        let sql = s3_secret_sql("s3://duckwake/lake/", &minio).unwrap();
+        assert!(sql.contains("SCOPE 's3://duckwake'"), "{sql}");
+        assert!(sql.contains("ENDPOINT 'localhost:19900', USE_SSL false, URL_STYLE 'path'"), "{sql}");
+        let chain = s3_secret_sql("s3://b", &env(&[("AWS_REGION", "eu-west-1")])).unwrap();
+        assert!(chain.contains("PROVIDER credential_chain") && chain.contains("REGION 'eu-west-1'") && !chain.contains("ENDPOINT"), "{chain}");
+        assert!(s3_secret_sql("s3://b", &env(&[("AWS_ACCESS_KEY_ID", "k")])).is_err());
+        assert!(s3_secret_sql("s3:///x", &env(&[])).is_err());
+    }
+
+    #[test]
+    fn idle_transactions_bounded_on_postgres_only() {
+        let t = std::time::Duration::from_secs(30);
+        assert_eq!(
+            bound_idle_transactions("postgres:dbname=lake host=pg", t),
+            "postgres:dbname=lake host=pg options='-c idle_in_transaction_session_timeout=30000'"
+        );
+        assert_eq!(bound_idle_transactions("postgres:dbname=lake options='-c x=1'", t), "postgres:dbname=lake options='-c x=1'");
+        assert_eq!(bound_idle_transactions("sqlite:lake.db", t), "sqlite:lake.db");
+    }
 }

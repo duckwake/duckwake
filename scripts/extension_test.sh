@@ -4,6 +4,8 @@
 # and the three test views, runs a worker inside the session until the views have committed the topic, and
 # reads their tables by attaching the same lake. The views must then match the batch recomputation.
 source "$(dirname "$0")/lib.sh"
+# The session creates three of the test views.
+VIEWS=(clicks_per_window big_spend game_totals)
 EVENTS=${EVENTS:-30000}
 EXT=${EXT:-target/release/duckwake.duckdb_extension}
 [[ -f $EXT ]] || bash scripts/build_extension.sh

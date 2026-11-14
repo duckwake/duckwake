@@ -100,14 +100,109 @@ impl Chunk {
     }
 }
 
-pub async fn client(brokers: &str) -> Result<Client> {
-    let brokers = brokers.split(',').map(|b| b.trim().to_string()).collect();
-    ClientBuilder::new(brokers).build().await.context("connecting to Kafka")
+/// A client for a source's brokers, with its TLS and SASL settings.
+pub async fn client(opts: &SourceOptions) -> Result<Client> {
+    let mut b = ClientBuilder::new(broker_list(&opts.brokers));
+    let protocol = opts.security_protocol.to_ascii_lowercase();
+    if protocol.ends_with("ssl") {
+        b = b.tls_config(Arc::new(tls_config(opts)?));
+    }
+    if protocol.starts_with("sasl") {
+        b = b.sasl_config(sasl_config(opts)?);
+    }
+    // rskafka retries a failed connection forever, a refused SASL handshake included, which would hang the
+    // worker on a source with a wrong password or certificate; bound the first connection instead (later
+    // requests keep retrying, so a broker restart is ridden out). rskafka logs each attempt's error.
+    match tokio::time::timeout(CONNECT_TIMEOUT, b.build()).await {
+        Ok(c) => c.with_context(|| format!("connecting to Kafka at {} ({protocol})", opts.brokers)),
+        Err(_) => bail!(
+            "could not connect to Kafka at {} ({protocol}) within {} s: check the address, credentials and \
+             certificates (the worker log has each attempt's error)",
+            opts.brokers,
+            CONNECT_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// How long a source's first connection to its brokers may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A plaintext client, for the test tools (`produce`, the playground's topics).
+pub async fn plain_client(brokers: &str) -> Result<Client> {
+    ClientBuilder::new(broker_list(brokers)).build().await.context("connecting to Kafka")
+}
+
+fn broker_list(brokers: &str) -> Vec<String> {
+    brokers.split(',').map(|b| b.trim().to_string()).collect()
+}
+
+/// rustls with the public (Mozilla) roots, or the CAs in `ssl_ca_location`, and a client certificate when
+/// one is given.
+fn tls_config(opts: &SourceOptions) -> Result<rustls::ClientConfig> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    let mut roots = rustls::RootCertStore::empty();
+    match &opts.ssl_ca_location {
+        Some(path) => {
+            for cert in CertificateDer::pem_file_iter(path).with_context(|| format!("ssl_ca_location {path}"))? {
+                roots.add(cert.with_context(|| format!("ssl_ca_location {path}"))?)?;
+            }
+            if roots.is_empty() {
+                bail!("ssl_ca_location {path} holds no certificate");
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let b = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots);
+    Ok(match (&opts.ssl_certificate_location, &opts.ssl_key_location) {
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_file_iter(cert)
+                .with_context(|| format!("ssl_certificate_location {cert}"))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| format!("ssl_certificate_location {cert}"))?;
+            let key = PrivateKeyDer::from_pem_file(key).with_context(|| format!("ssl_key_location {key}"))?;
+            b.with_client_auth_cert(chain, key)?
+        }
+        _ => b.with_no_client_auth(),
+    })
+}
+
+fn sasl_config(opts: &SourceOptions) -> Result<rskafka::client::SaslConfig> {
+    use rskafka::client::{Credentials, SaslConfig};
+    let user = opts.sasl_username.clone().context("sasl_username")?;
+    let password = crate::secrets::resolve("sasl_password", opts.sasl_password.as_deref().context("sasl_password")?)?;
+    let creds = Credentials::new(user, password);
+    Ok(match opts.sasl_mechanism.as_deref().map(str::to_ascii_uppercase).as_deref() {
+        Some("PLAIN") => SaslConfig::Plain(creds),
+        Some("SCRAM-SHA-256") => SaslConfig::ScramSha256(creds),
+        Some("SCRAM-SHA-512") => SaslConfig::ScramSha512(creds),
+        m => bail!("unsupported sasl_mechanism {m:?}"),
+    })
+}
+
+/// A source's topic does not exist (yet): a view waits for it rather than failing, as Kafka consumers do.
+#[derive(Debug)]
+pub struct TopicMissing(pub String);
+
+impl std::fmt::Display for TopicMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "topic {:?} not found", self.0)
+    }
+}
+
+impl std::error::Error for TopicMissing {}
+
+/// Whether `e` (anywhere in its chain) is a missing topic.
+pub fn is_topic_missing(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<TopicMissing>().is_some())
 }
 
 pub async fn partitions(client: &Client, topic: &str) -> Result<Vec<i32>> {
     let topics = client.list_topics().await?;
-    let t = topics.into_iter().find(|t| t.name == topic).ok_or_else(|| anyhow!("topic {topic:?} not found"))?;
+    let t = topics.into_iter().find(|t| t.name == topic).ok_or_else(|| TopicMissing(topic.to_string()))?;
     Ok(t.partitions.into_iter().collect())
 }
 
@@ -152,7 +247,7 @@ impl Reader {
         let committed = committed.clone();
         let hw = high_watermarks.clone();
         let (clients, start) = rt.block_on(async move {
-            let c = client(&opts2.brokers).await?;
+            let c = client(&opts2).await?;
             let mut clients = Vec::new();
             let mut start = BTreeMap::new();
             for p in partitions(&c, &opts2.topic).await? {
@@ -326,7 +421,7 @@ async fn read_partition(pc: PartitionClient, p: i32, mut next: i64, feed: Feed, 
 /// Reads every message in `[from[p], upto[p])` for each partition, starting at the earliest retained
 /// offset where `from` has none (used by verification).
 pub async fn read_between(opts: &SourceOptions, from: &BTreeMap<i32, i64>, upto: &BTreeMap<i32, i64>) -> Result<Vec<Msg>> {
-    let c = client(&opts.brokers).await?;
+    let c = client(opts).await?;
     let mut out = Vec::new();
     for (&p, &end) in upto {
         let pc = partition_client(&c, &opts.topic, p).await?;
@@ -341,7 +436,7 @@ pub async fn read_between(opts: &SourceOptions, from: &BTreeMap<i32, i64>, upto:
 
 /// Earliest offset still retained by the broker, per partition.
 pub async fn earliest_offsets(opts: &SourceOptions) -> Result<BTreeMap<i32, i64>> {
-    let c = client(&opts.brokers).await?;
+    let c = client(opts).await?;
     let mut out = BTreeMap::new();
     for p in partitions(&c, &opts.topic).await? {
         out.insert(p, partition_client(&c, &opts.topic, p).await?.get_offset(OffsetAt::Earliest).await?);
@@ -351,7 +446,7 @@ pub async fn earliest_offsets(opts: &SourceOptions) -> Result<BTreeMap<i32, i64>
 
 /// Next offset to be written, per partition (the end of the topic now).
 pub async fn latest_offsets(opts: &SourceOptions) -> Result<BTreeMap<i32, i64>> {
-    let c = client(&opts.brokers).await?;
+    let c = client(opts).await?;
     let mut out = BTreeMap::new();
     for p in partitions(&c, &opts.topic).await? {
         out.insert(p, partition_client(&c, &opts.topic, p).await?.get_offset(OffsetAt::Latest).await?);
@@ -361,7 +456,7 @@ pub async fn latest_offsets(opts: &SourceOptions) -> Result<BTreeMap<i32, i64>> 
 
 /// Reads the newest `limit` messages of the topic, split evenly across partitions (ad-hoc queries).
 pub async fn read_tail(opts: &SourceOptions, limit: usize) -> Result<Vec<Msg>> {
-    let c = client(&opts.brokers).await?;
+    let c = client(opts).await?;
     let parts = partitions(&c, &opts.topic).await?;
     let per_part = limit.div_ceil(parts.len().max(1)) as i64;
     let mut out = Vec::new();

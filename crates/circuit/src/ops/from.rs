@@ -19,7 +19,8 @@ impl Operator for From {
         if self.lookups.is_empty() {
             format!("From({})", self.alias)
         } else {
-            format!("From({} ⋈ {})", self.alias, self.lookups.join(", "))
+            let lookups: Vec<String> = self.lookups.iter().map(|t| format!("Lookup({t})")).collect();
+            format!("From({} ⋈ {})", self.alias, lookups.join(", "))
         }
     }
 

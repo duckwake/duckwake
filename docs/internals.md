@@ -10,7 +10,8 @@
 | JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
 | Views as DBSP circuits: operator graph, incrementalization, SQL per operator | the `duckwake_circuit` crate (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
-| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>` |
+| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>`; `failover.rs`: `worker_<id>` |
+| Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
 
@@ -35,8 +36,8 @@ Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model
 `__w`, +1 for Kafka), `Window`, `LateSplit`, `From` (the stream under the view's alias, joined with its lookup
 tables), `Filter` (`WHERE`, `HAVING`), `Map` (a select list), `Aggregate`, `Sink`. The frontend cuts the view
 into these pieces from DuckDB's parse tree, each kept as SQL text in the view's own names. An analysis
-marks which edges are append-only; a view whose operators assume append-only input (windowed partials, `MIN`/`MAX`,
-append sinks) is refused when that input can retract. `incrementalize`
+marks which edges are append-only; a view whose operators assume append-only input (append sinks, late-data
+tables) is refused when that input can retract. `incrementalize`
 wraps it as D ∘ Q ∘ I and pushes every integrator (I) forward until it meets a differentiator (D), the way
 Feldera's `OptimizeIncrementalVisitor` does:
 
@@ -51,6 +52,24 @@ epoch's transaction) and `commit_steps` (inside it). Linear operators fuse: a ch
 A global aggregate's output is its change as a Z-set, the touched groups' old rows with weight −1 and their
 new rows with +1; the upsert sink consolidates it, so a group whose row did not change cancels out. The
 engine runs the steps generically: counts, lean-commit skips and crash points are step attributes.
+
+**Retractions (C1).** A source whose `SourceSchema::append_only` is false stages each row's weight, and every
+operator then sums weights instead of counting rows, choosing the weighted form only when the input can
+retract, as Feldera's `ExpandAggregates` does (Kafka views keep the cheaper partials):
+
+| Operator | Over a retracting source |
+| --- | --- |
+| Stateless view | sink `Counted`: one row per distinct row with its multiplicity in `_duckwake_count`; changes move the count, and a row whose count reaches 0 is deleted |
+| `DISTINCT` | the state sums weights; a row leaves with −1 when its weight returns to 0; sink `Upsert` by the whole row |
+| Global `count`, `sum`, `avg` | already weighted |
+| Global `MIN`/`MAX` | value rows in the state table (`__i` the aggregate, `__v<i>` the value, `__n` its count); the extreme is recomputed for the epoch's groups from the values still present |
+| Windowed `count`, `sum`, `avg` | partials `sum(__w)`, `sum(x * __w)` and a weighted non-NULL count; a window and group whose weight returns to 0 is not emitted |
+| Windowed `MIN`/`MAX` | refused for now |
+| Late-data table | refused for now: late rows would need their weights (C4) |
+
+A window is still emitted once, when it closes; a retraction into a closed window is a late row. The
+harness's `changes` source deletes and updates rows of the previous epoch and cancels rows within an epoch,
+and every view kind over it matches the batch query over the net rows after every epoch.
 
 The tests in `crates/circuit/src/tests/` run each view kind epoch by epoch through its circuit's own SQL,
 against an in-memory lake, and compare the view's table with the batch query after every epoch, with epochs
@@ -122,12 +141,146 @@ operator's semantics and a test oracle, not a dependency.
      visible. A checkpoint's `committed_at` is the worker's clock once the view's writes are done, which
      leaves out only the COMMIT call; the epoch log's `freshness_ms` and the
      `duckwake_commit_freshness_seconds` metric measure to the moment COMMIT returned.
+8. **DuckLake inlines an insert of at most 10 rows by default** (DuckDB v2.0.0, DuckLake format 1.1); one of
+   11 rows writes a Parquet file. With `--lean-commit` one INSERT carries the checkpoint rows of every job on
+   the worker, so a worker with more than 10 jobs wrote one small checkpoint file per epoch (27 files after
+   the 16-view bench). Each worker now sets the checkpoint table's limit to 1000 at start. Inlining the dead
+   letters and late rows as well removed their files too, but at thousands of rows per epoch it raised the
+   bench's commit p50 from 321–329 ms to 382 ms (the COMMIT call from 82 to 113 ms): writing them into the
+   Postgres catalog costs more than one local Parquet file. They keep the default, and maintenance merges
+   their files.
+9. **Reading a table's change feed by snapshot position is exact** (spike F0,
+   `crates/core/examples/phase_f0_change_feed.rs`, Postgres catalog, one machine). What views over lake
+   tables rely on:
+   - With 4 writers committing 600 inserts concurrently (12s, inlined and file-backed), a reader that read
+     `ducklake_table_changes` over (P, newest] about every 125 ms saw all 12,240 inserts exactly once, and
+     the visible snapshot ids had no gap at any of 97 polls: an id is taken as the catalog's max + 1 under
+     its primary key, so N + 1 is never visible before N.
+   - `ducklake_current_snapshot('lake')` returns the newest snapshot another process committed, in 6–8 ms.
+     `max(snapshot_id)` over `ducklake_snapshots` takes 20–38 ms and grows with the snapshot count.
+   - Paging a table at an old snapshot by `rowid` (`AT (VERSION => s) WHERE rowid > r ORDER BY rowid LIMIT
+     n`) returns exactly that version after later deletes, updates and inserts. The `rowid` filter is
+     pushed into the scan, and every page of 200k rows takes 40–65 ms.
+   - One snapshot's changes cost 45–55 ms warm whatever the table's file count (10 to 1000 files), against
+     16–20 ms for a full scan of 100k–1M rows: a fixed cost of catalog round trips, not file reads. Cold, and
+     on a table with 30 deletes, it was 150–170 ms. Every lake input of every view pays it each epoch, so
+     views reading the same table should read its range once (F4).
+   - `snapshot_time` never ran backwards against snapshot ids (0 of 599 pairs). Writers on other machines
+     may still disagree on the clock, so the change time stays a running maximum.
+10. **Views over lake tables and other views (F1)** need a few more DuckLake details, checked on the
+   Postgres catalog:
+   - `ducklake_table_changes(lake, schema, table, from, to)` fails when `to` is not a snapshot ("No snapshot
+     found at version 99") and when `from > to`, so a job reads the current snapshot S first and skips an
+     empty range (P = S) instead of querying it.
+   - `ducklake_merge_adjacent_files` keeps every row's `snapshot_id`, and its own snapshot has no changes:
+     3 files merged into 1, the change feed over the old range returned the same 4 inserts, and over the
+     merge's snapshot none. Maintenance does not disturb a change feed.
+   - Table ids come from `__ducklake_metadata_lake.ducklake_table` (joined to `ducklake_schema`, rows with
+     `end_snapshot IS NULL`); `ducklake_table_info` has the id but no schema name.
+   - A table alias goes before the version: `FROM t AS x AT (VERSION => n)`.
+   - A view's own commits add snapshots that move every lake input's watermark (`_commit_ts`). Committing
+     every time it moved would keep a worker writing an empty snapshot every epoch forever, so a view with
+     lake inputs commits only for new rows or a window that closes. When the whole lake is idle no snapshot
+     comes, the watermark stands, and the last window stays open, as for an idle Kafka partition.
+11. **Lake inputs that retract (F2)** weigh each change: `insert` and `update_postimage` +1, `delete` and
+   `update_preimage` -1, times `_duckwake_count` for a counted view's table. To cancel the row the view took
+   in, a retraction must carry that version's `_commit_ts`, not the time of the delete. DuckLake makes the
+   version easy to find:
+   - A row keeps its `rowid` through updates, and row ids are never reused; the `snapshot_id` column of a
+     row is the snapshot that wrote its current version (probed on inlined and Parquet data, and after
+     `ducklake_merge_adjacent_files`).
+   - Within one snapshot, a row changes at most once: an update's old and new versions, or one delete, or
+     one insert. A transaction that updates then deletes a row shows a single delete of the version before
+     it; an insert then update, a single insert of the final version.
+   - So a retraction's version is the newest earlier write of its `rowid` in the epoch's range, or else its
+     version at P, the snapshot read up to: `t AT (VERSION => P) WHERE rowid BETWEEN lo AND hi AND rowid IN
+     (...)`, which DuckLake prunes by row-id range. Its `_commit_ts` is the running maximum of
+     `snapshot_time` up to that version's snapshot, as when the row was staged.
+   - A view holds the rows written after it was created (snapshot S0), which is also what `verify` compares
+     against (`snapshot_id > S0` at P). A retraction of a version written at or before S0 is dropped: the
+     view never had that row. An update of such a row adds its new version.
+   - A window is final once the watermark passes it, and a lake input's watermark is exact, so the delete
+     of an old row always arrives after its window closed. A windowed view therefore reads lake tables
+     insert-only (checked every epoch; an update or delete stops it), and refuses a view's table whose rows
+     change. A view that groups by `time_bucket(...)` of a column instead keeps every bucket up to date.
+   - `reset` of a view restores an upsert or counted table with time travel (delete all, insert the old
+     version), which its retracting readers see as ordinary deletes and inserts: they follow the reset
+     through the change feed. A windowed reader of an append-only view stops instead (F3 cascades reset).
+12. **Failover needs heartbeats in tables of their own, and dead workers judged on the observer's clock.**
+   A shared `workers` table would conflict the way `jobs` would (finding 1), so each worker owns
+   `__duckwake.worker_<id>`, one row it updates every `lease_timeout / 5` (at most every 5 s), inlined in the
+   catalog. A worker is dead when its `beat` counter has not moved for `--lease-timeout` (default 30 s) as
+   timed by the worker watching it, so clocks need not agree, and only over time in which the watcher's own
+   heartbeats landed: it must write half a timeout's worth of them (at least 2) meanwhile. A catalog stall
+   stops every heartbeat at once; in CI a 12 s stall on a 2-core runner (every commit waited, none failed)
+   made the worker that came out of it first claim the views of both its live peers, and in a larger
+   cluster every worker would have claimed every other's. A stall everyone shares now kills no one, and a
+   real death is still seen in the lease timeout. A worker that stops cleanly marks itself
+   `stopped` and is dead once `--stop-grace` has passed (finding 15). In each refresh (every 2 s) a worker reads the heartbeats and the
+   running views' leases, and claims its share of the orphans: views unassigned (`start` without a worker)
+   or owned by a dead worker. Orphans go largest first, each to the live worker with the least load (finding
+   15), so every worker computes the same plan. A claim is `UPDATE lease SET owner_worker = me, lease_epoch =
+   lease_epoch + 1 WHERE owner_worker = <old> AND lease_epoch = <read>`; two workers claiming one view
+   conflict and the first committer wins. The new owner starts from the last checkpoint as after any
+   restart, and the bumped lease fences the old owner if it was only stalled (`scripts/failover_test.sh`
+   freezes one with SIGSTOP and thaws it: its in-flight commit is rejected and it lets go). The heartbeat
+   runs on the scheduler thread, so a worker whose epoch loop is stuck looks dead too; a commit that takes
+   longer than the timeout moves views needlessly but never breaks exactly-once. Each heartbeat is one
+   catalog snapshot (17,280 a day per worker at the default 5 s), expired with the epochs' snapshots.
+   A frozen worker can block more than its own views: every DuckLake commit on PostgreSQL inserts the next
+   `snapshot_id`, so a worker stopped inside its commit holds a row lock that every other commit waits on,
+   claims and heartbeats included, for as long as it stays frozen (seen under load in CI: 16 minutes). A
+   worker therefore adds `options='-c idle_in_transaction_session_timeout=<lease timeout>'` to its catalog
+   connection (unless the string already passes `options`): PostgreSQL ends the stalled session, which rolls
+   its commit back, and the lake moves again within the lease timeout. Thawed, that worker's commit fails and
+   it exits (`duckwaked` restarts it). Workers that start together also race on `set_option` (each sets
+   inlining on the shared checkpoint table, one catalog row): DuckLake reports the losers' failures as
+   plain errors, not conflicts, and the worker died. A worker now skips an option its connection already
+   sees, and retries the idempotent write.
+13. **Kafka credentials stay out of the lake.** Source definitions live in `__duckwake.sources`, readable by
+   anyone who can read the lake, so `sasl_password` must be `env:NAME` or `file:/path` (`secrets.rs`),
+   resolved by each worker when it connects. TLS uses rustls with ring, the same stack rskafka uses, with the
+   Mozilla roots unless `ssl_ca_location` names CAs. rskafka retries a failed connection forever, a refused
+   SASL handshake included, so the first connection of a source is bounded (10 s): without it, one source
+   with a wrong password hung its worker and every view on it. `scripts/kafka_auth_test.sh` runs the test
+   views over SCRAM in plaintext, SCRAM over TLS and TLS with a client certificate against the local
+   Redpanda's authenticated listeners (`docker/kafka`), and checks the refusals.
+14. **Object storage needs only an S3 secret.** DuckLake writes, reads, time-travels, merges and deletes data
+   files through DuckDB's httpfs, so a data path of `s3://bucket/prefix/` works once the instance has a
+   secret: `lake.rs` creates a temporary one, scoped to the bucket, from the standard AWS variables (or the
+   AWS credential chain), before attaching. Nothing about object storage reaches the lake, and the catalog
+   password comes from libpq's `PGPASSWORD` or `.pgpass`. The suites run against MinIO with
+   `LAKE_STORAGE=s3` (Chainguard's image: MinIO no longer publishes community images to Docker Hub).
 
+15. **Rebalancing moves a view between epochs, from the busiest worker only.** Moving a view is cheap here:
+   its state and checkpoint are in the lake, so the new owner restores nothing (Kafka Streams needs warm-up
+   replicas for that) and the cost of a move is a refresh, the job start and one epoch of latency. Each
+   worker publishes, per view, its cost (a moving average of staging, its share of the source read and of the
+   commit, per second of wall time) and whether it is within the cooldown. Every `--rebalance-every` the
+   busiest worker with a view it may move compares itself with the least loaded one: above the average by
+   `ε` times it and by at least a tenth of a worker, for three rounds in a row (lightly loaded workers are not
+   worth balancing, and a view catching up after a restart is a spike, not a trend), or two views ahead
+   (a worker joined; counts are not noisy, so no wait), it gives the view that best
+   evens out the pair, a little against targets that do not read the view's source (one reader serves all
+   views of a source on a worker), and never one that only shifts the imbalance. Only one worker gives at a
+   time, so two never pile onto one target, and a moved view stays put for the cooldown, so nothing
+   ping-pongs. The handoff waits for the view's epoch in flight to commit, then moves the lease with the same
+   compare-and-set as a claim: nothing is fenced, nothing staged is lost. Kafka Connect's lesson applies to
+   restarts: a clean stop is a restart, so its views wait `--stop-grace` instead of moving away and back;
+   `drain` is the explicit way out. Pins (`start --worker W`) are stored in `jobs.pinned_to`: never balanced
+   away, failed over when W dies, handed back when W is live. `scripts/rebalance_test.sh` is the gate:
+   joining workers, a settled cluster making no moves, a rolling restart keeping every view in place, drain,
+   a pinned view failing over and going home, and a `kill -9` in the middle of a drain, with exact output.
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
   parser hooks, so it needs a C++ shim. The extension is unsigned and built per platform. The server's Quack token is one shared secret; there are no users or roles.
-- **Sources.** Kafka only, JSON only, with declared columns. Unknown fields are dropped; there is no
+- **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
+  certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
+  view is marked failed, so a view starting while its brokers are down needs `start` again; once
+  connected, readers retry through broker restarts. A view whose topic does not exist yet waits for it, as
+  Kafka consumers do: its worker checks every refresh (before taking the lease, so waiting commits nothing)
+  and logs once. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.
 - **Partitions and readers.** A job reads all partitions of its topic, so there is no partition split
   across workers. Without `--shared-readers` each job has its own readers: two jobs on one source read it
@@ -139,10 +292,32 @@ operator's semantics and a test oracle, not a dependency.
   epoch and commits all their offsets in one checkpoint row. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
   row is written the first time its count turns positive. `HAVING` in windowed views, `DISTINCT` over
   windows and aggregates, `DISTINCT ON`, `count(DISTINCT ...)`, `approx_count_distinct` and stream-stream
-  joins are rejected at create time. `min`/`max` in global aggregates and `DISTINCT` assume append-only
-  input, which holds while sources are Kafka topics; retracting inputs need weights through them (milestone 3).
+  joins are rejected at create time. Every operator handles retracting input (see Retractions above) except
+  `MIN`/`MAX` in windows and late-data tables. Lake tables, and views whose tables change, are the
+  retracting inputs; Kafka sources only insert (no CDC yet).
+- **Storage.** Local disk or `s3://` (S3 and S3-compatible stores); not `gs://` or Azure natively (GCS through
+  its S3 API works). Credentials come from the environment of each process; there is no secret store
+  integration (Vault, cloud secret managers) beyond files and variables.
 - **State and maintenance.** DuckLake state backend only; object-storage state is not built.
   Maintenance has no time budget and no lag-based skip.
+- **Lake inputs (F1, F2).** A view reads a lake table, or another view's table, through its change feed when
+  no Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. A view without windows
+  takes the input's updates and deletes as retractions (finding 11): a stateless view's table counts each
+  row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view reads lake tables insert-only
+  (an update or delete stops it, status `failed`) and refuses a view's table whose rows change. A view reads
+  the changes after the snapshot current when it was created (`start: latest`) and holds the rows written
+  after it; backfill of existing rows (`earliest`) is F3. Retention does not yet keep the oldest position
+  (P_min, F3): maintenance can expire snapshots a paused view still needs. `reset` reaches retracting
+  readers through the change feed, but not windowed ones (F3). Windows over a lake input use `_commit_ts`,
+  or a windowed view's `window_start`/`window_end`; windows on another column of a lake input are not
+  supported yet. Joins of two lake inputs, and fused chains on one worker (one hop per epoch now), come
+  later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`, so it
+  compares with Kafka event times. A view reading a lake table polls its change feed every epoch even when
+  the table is idle; views on one table should share that read (F4).
+- **Placement.** Load assumes workers of equal size: a bigger machine is not given more views. A view's
+  cost is measured on the worker that runs it, so a view that has not run yet counts as the average view.
+  Every worker that ever ran keeps its `worker_<id>` table (state `stopped` after a clean stop); nothing
+  drops old ones yet, and `workers` lists them all.
 - **Watermark after restart.** Per-partition maxima are not checkpointed. After a restart the watermark
   holds at the checkpointed value until every active partition reports again.
 
@@ -151,11 +326,12 @@ operator's semantics and a test oracle, not a dependency.
 ```
 crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
                  operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
-crates/core      duckwake_core: engine, catalog, Kafka, decode, maintenance, verify
+crates/core      duckwake_core: engine, catalog, failover, Kafka, secrets, decode, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
 crates/extension  the loadable extension (built on its own: scripts/build_extension.sh)
 Dockerfile       the duckwaked image (docker compose --profile server)
-scripts/         crash, fencing, reset, retention, decode, shared-reader, server and extension tests; benchmark
+docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
+scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, reset, retention, decode, shared-reader, server and extension tests; benchmark
 ```

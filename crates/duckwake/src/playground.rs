@@ -206,6 +206,9 @@ fn spawn_worker(app: Shared) -> std::thread::JoinHandle<()> {
                 },
                 max_epochs: None,
                 refresh_every: Duration::from_secs(1),
+                lease_timeout: Some(Duration::from_secs(30)),
+                stop_grace: Duration::from_secs(60),
+                rebalance: Some(duckwake_core::failover::RebalanceConfig::default()),
                 stage_threads: app.opts.stage_threads,
                 pipeline: app.opts.pipeline,
                 shared_readers: app.opts.shared_readers,
@@ -437,7 +440,7 @@ async fn create_source(State(app): State<Shared>, Json(r): Json<CreateSourceReq>
     let parts = r.partitions.unwrap_or(3);
     app.rt
         .spawn(async move {
-            let c = kafka::client(&brokers).await?;
+            let c = kafka::plain_client(&brokers).await?;
             kafka::ensure_topic(&c, &t2, parts).await
         })
         .await
@@ -482,7 +485,7 @@ async fn source_detail(State(app): State<Shared>, Path(name): Path<String>) -> A
     let offsets = app
         .rt
         .spawn(async move {
-            let c = kafka::client(&opts.brokers).await?;
+            let c = kafka::client(&opts).await?;
             let mut out = Vec::new();
             for p in kafka::partitions(&c, &opts.topic).await? {
                 let pc = c.partition_client(&opts.topic, p, rskafka::client::partition::UnknownTopicHandling::Retry).await?;
@@ -564,7 +567,7 @@ fn fake_event(opts: &SourceOptions, late: bool) -> Value {
 
 async fn generate(opts: SourceOptions, rate: u64, late_pct: f64, bad_pct: f64, produced: Arc<AtomicU64>) {
     let run = async {
-        let c = kafka::client(&opts.brokers).await?;
+        let c = kafka::client(&opts).await?;
         let parts = kafka::partitions(&c, &opts.topic).await?;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut carry = 0.0;
@@ -625,7 +628,7 @@ async fn send_events(State(app): State<Shared>, Path(name): Path<String>, Json(r
     let n = payloads.len();
     app.rt
         .spawn(async move {
-            let c = kafka::client(&opts.brokers).await?;
+            let c = kafka::client(&opts).await?;
             let parts = kafka::partitions(&c, &opts.topic).await?;
             let mut by_part: Vec<Vec<Vec<u8>>> = vec![Vec::new(); parts.len()];
             for (i, p) in payloads.into_iter().enumerate() {
@@ -691,7 +694,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
             },
         )?;
         if r.start.unwrap_or(true) {
-            catalog::set_status(conn, &job_id, JobStatus::Running, Some(&app.worker_id))?;
+            catalog::set_status(conn, &job_id, JobStatus::Running, Some(catalog::Assign::Prefer(&app.worker_id)))?;
         }
         Ok(json!({ "ok": true, "job_id": job_id, "kind": def.plan.kind_name(), "explain": duckwake_core::api::explain(conn, &job_id).unwrap_or_else(|e| format!("{e:#}")) }))
     })
@@ -769,7 +772,7 @@ async fn view_action(
     }
     with_conn(&app, move |app, conn| {
         match action.as_str() {
-            "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(&app.worker_id))?,
+            "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(catalog::Assign::Prefer(&app.worker_id)))?,
             "pause" => catalog::set_status(conn, &name, JobStatus::Paused, None)?,
             "stop" => catalog::set_status(conn, &name, JobStatus::Stopped, None)?,
             "reset" => catalog::reset(conn, &name, req.to_epoch.ok_or_else(|| anyhow!("to_epoch is required"))?)?,
