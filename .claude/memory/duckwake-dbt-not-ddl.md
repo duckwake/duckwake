@@ -15,7 +15,7 @@ uses DuckDB's unstable internal C++ API and works only in `duckwaked` and `duckw
 extension. dbt gives files, review, CI, `ref()` order, tests and docs with no C++.
 
 **How to apply:** the plan, in order, each its own PR:
-1. `create_view` `if_exists` with the outcome reported - built on branch `create-view-if-exists`.
+1. `create_view` `if_exists` with the outcome reported - merged in PR #5 (2026-11-14).
 2. Backfill of new views over lake inputs (F3): today a view over a lake table or view reads only changes
    after its creation. Until F3, the package creates views stopped and starts them in `on-run-end`, and
    refuses a new view over a running one unless `-s +x --full-refresh`.
