@@ -6,7 +6,7 @@ that covers it instead of adding a duplicate, and keep this index in step.
 
 - [DuckWake goes to production](.claude/memory/duckwake-production-grade.md): every item production grade, with failures, ops controls and CI tests
 - [P3 waits for a VPS](.claude/memory/duckwake-p3-vps.md): P3 starts when the user has a VPS; spec and open items
-- [Branches and PRs](.claude/memory/duckwake-branches-prs.md): stacked draft PRs #3, #4 and the create-view-if-exists branch
+- [Branches and PRs](.claude/memory/duckwake-branches-prs.md): PRs #3, #4, #5 merged into main; how new work is branched and merged
 - [dbt, not DDL](.claude/memory/duckwake-dbt-not-ddl.md): SQL authoring through dbt-duckwake; DDL is long term; the plan
 - [Working rules](.claude/memory/duckwake-working-rules.md): what needs the user's go-ahead; files never to commit
 - [Design doc](.claude/memory/duckwake-design-doc.md): the Claude Doc and its tabs; keep it in step with docs/roadmap.md
