@@ -322,7 +322,8 @@ impl Spec for CreateSource {
 }
 
 /// `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, checkpoint :=,
-/// inline_row_limit :=)`: the table `name` and the job that maintains it.
+/// inline_row_limit :=, max_state_rows :=, max_late_rows :=, if_exists :=, replace :=)`: the table `name` and the
+/// job that maintains it. The result starts with what happened: created, unchanged, altered or replaced.
 struct CreateView;
 impl Spec for CreateView {
     const NAME: &'static str = "duckwake_create_view";
@@ -338,6 +339,7 @@ impl Spec for CreateView {
             ("inline_row_limit", Bigint),
             ("max_state_rows", Bigint),
             ("max_late_rows", Bigint),
+            ("if_exists", Varchar),
             ("replace", Boolean),
         ]
     }
@@ -350,9 +352,9 @@ impl Spec for CreateView {
             inline_row_limit: a.opt_num("inline_row_limit")?,
             max_state_rows: a.opt_num("max_state_rows")?,
             max_late_rows: a.opt_num("max_late_rows")?,
-            replace: a.flag("replace"),
+            if_exists: api::if_exists(a.opt("if_exists"), a.flag("replace"))?,
         };
-        let (def, msg) = api.with(|c| api::create_view(c, a.arg(0), a.arg(1), &o, None))?;
+        let (def, _, msg) = api.with(|c| api::create_view(c, a.arg(0), a.arg(1), &o, None))?;
         one(&def.job_id, msg)
     }
 }

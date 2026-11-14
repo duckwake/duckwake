@@ -23,8 +23,19 @@ pub struct ViewOptions {
     /// Most rows the view's state may hold, and most late rows one epoch may write (`model::Limits`).
     pub max_state_rows: Option<u64>,
     pub max_late_rows: Option<u64>,
-    /// Replace the view if it exists (`CREATE OR REPLACE`).
-    pub replace: bool,
+    /// What to do when the view exists: refuse, update it in place, or replace it (`CREATE OR REPLACE`).
+    pub if_exists: catalog::IfExists,
+}
+
+/// `if_exists := ...` and the older `replace := true` (`--if-exists`, `--replace`) as one setting.
+pub fn if_exists(named: Option<&str>, replace: bool) -> Result<catalog::IfExists> {
+    use catalog::IfExists;
+    match (named.map(IfExists::parse).transpose()?, replace) {
+        (None, false) => Ok(IfExists::Fail),
+        (None, true) | (Some(IfExists::Replace), _) => Ok(IfExists::Replace),
+        (Some(m), false) => Ok(m),
+        (Some(m), true) => anyhow::bail!("replace conflicts with if_exists {m:?}; give one of them"),
+    }
 }
 
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -> Result<String> {
@@ -34,11 +45,17 @@ pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -
 }
 
 /// Creates a continuous view: the table `name` (a bare name means the `main` schema) and its job. `sink` is the
-/// deprecated form that names the table separately, with `name` as the job id.
-pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, sink: Option<&str>) -> Result<(JobDef, String)> {
+/// deprecated form that names the table separately, with `name` as the job id. The message starts with what
+/// happened (`created`, `unchanged`, `altered` or `replaced`), for scripts and dbt to act on.
+pub fn create_view(
+    conn: &Connection,
+    name: &str,
+    sql: &str,
+    o: &ViewOptions,
+    sink: Option<&str>,
+) -> Result<(JobDef, catalog::Outcome, String)> {
     let (job_id, table) = catalog::view_names(name, sink)?;
-    let replaced = o.replace && catalog::job_status(conn, &job_id)?.is_some();
-    let def = catalog::create_view(
+    let (def, outcome) = catalog::create_view(
         conn,
         &catalog::CreateView {
             job_id: &job_id,
@@ -53,9 +70,20 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
                 max_state_rows: o.max_state_rows.filter(|m| *m > 0),
                 max_late_rows: o.max_late_rows.filter(|m| *m > 0),
             },
-            replace: o.replace,
+            if_exists: o.if_exists,
         },
     )?;
+    match outcome {
+        catalog::Outcome::Unchanged => {
+            let msg = format!("unchanged view {}", def.job_id);
+            return Ok((def, outcome, msg));
+        }
+        catalog::Outcome::Altered => {
+            let msg = format!("altered view {}", settings(&def));
+            return Ok((def, outcome, msg));
+        }
+        _ => {}
+    }
     let kind = match def.plan.kind_name() {
         "windowed" => "windowed aggregate",
         "aggregate" => "global aggregate",
@@ -73,9 +101,22 @@ pub fn create_view(conn: &Connection, name: &str, sql: &str, o: &ViewOptions, si
     let insert_only: Vec<&str> = def.lake_inputs.iter().filter(|l| !l.retracts && l.view.is_none()).map(|l| l.name.as_str()).collect();
     let insert_only =
         if insert_only.is_empty() { String::new() } else { format!(" ({} must stay insert-only)", insert_only.join(", ")) };
-    let msg = format!("view {}: {kind}, {sink}{insert_only}, table {}", def.job_id, def.sink);
-    let msg = if replaced { format!("{msg} (replaced: it recomputes from the start)") } else { msg };
-    Ok((def, msg))
+    let msg = format!("{} view {}: {kind}, {sink}{insert_only}, table {}", outcome.as_str(), def.job_id, def.sink);
+    let msg = if outcome == catalog::Outcome::Replaced { format!("{msg}; it recomputes from the start") } else { msg };
+    Ok((def, outcome, msg))
+}
+
+/// A view's settings, as `alter_view` and an altering `create_view` report them.
+fn settings(def: &JobDef) -> String {
+    let limit = |v: Option<u64>| v.map_or("none".to_string(), |n| n.to_string());
+    format!(
+        "{}: epoch_interval {}, max_rows {}, max_state_rows {}, max_late_rows {}",
+        def.job_id,
+        def.epoch_interval,
+        def.max_rows,
+        limit(def.limits.max_state_rows),
+        limit(def.limits.max_late_rows)
+    )
 }
 
 /// Adds a column to a source; the views that read it keep their columns.
@@ -90,15 +131,7 @@ pub fn add_source_column(conn: &Connection, source: &str, column: &str, ty: &str
 /// Changes a view's epoch interval, rows per epoch or limits, without recomputing it.
 pub fn alter_view(conn: &Connection, name: &str, a: &catalog::AlterView) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    let def = catalog::alter_view(conn, &job, a)?;
-    let limit = |v: Option<u64>| v.map_or("none".to_string(), |n| n.to_string());
-    Ok(format!(
-        "{job}: epoch_interval {}, max_rows {}, max_state_rows {}, max_late_rows {}",
-        def.epoch_interval,
-        def.max_rows,
-        limit(def.limits.max_state_rows),
-        limit(def.limits.max_late_rows)
-    ))
+    Ok(settings(&catalog::alter_view(conn, &job, a)?))
 }
 
 /// Starts the view where `assign` says and bumps its lease, which fences the previous owner's next commit.

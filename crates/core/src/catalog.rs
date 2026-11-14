@@ -305,14 +305,61 @@ pub struct CreateView<'a> {
     pub max_rows: usize,
     pub inline_row_limit: usize,
     pub limits: Limits,
-    /// Replace the view if it exists (`CREATE OR REPLACE`): see `replace_view`.
-    pub replace: bool,
+    /// What to do when the view exists.
+    pub if_exists: IfExists,
+}
+
+/// What `create_view` does when a view of that name exists.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum IfExists {
+    /// Refuse.
+    #[default]
+    Fail,
+    /// Make the view match the request without recomputing it: nothing when it already does, `alter_view` when
+    /// only settings differ; refuse when what it computes differs (its query, table, late-data table,
+    /// checkpoint or inlining), since only a replace recomputes.
+    Update,
+    /// Replace it (`CREATE OR REPLACE`): see `replace_view`.
+    Replace,
+}
+
+impl IfExists {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "fail" => Ok(Self::Fail),
+            "update" => Ok(Self::Update),
+            "replace" => Ok(Self::Replace),
+            _ => bail!("if_exists {s:?}: expected 'fail', 'update' or 'replace'"),
+        }
+    }
+}
+
+/// What `create_view` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Created,
+    /// `IfExists::Update` found the view as requested.
+    Unchanged,
+    /// `IfExists::Update` changed its settings.
+    Altered,
+    Replaced,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Unchanged => "unchanged",
+            Self::Altered => "altered",
+            Self::Replaced => "replaced",
+        }
+    }
 }
 
 /// Compiles the view, creates its sink / late-data / state / lease tables and registers the job, in one
-/// transaction. The job starts in status `created`; `start` assigns it to a worker. With `replace`, an existing
-/// view of that name is replaced instead (`replace_view`).
-pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
+/// transaction. The job starts in status `created`; `start` assigns it to a worker. An existing view of that
+/// name is refused, updated or replaced as `if_exists` says.
+pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
     crate::lake::check_name("view", v.job_id)?;
     if v.checkpoint != "ducklake" {
         bail!("CHECKPOINT {:?}: only the ducklake backend is implemented (object storage state is phase 3)", v.checkpoint);
@@ -322,8 +369,14 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         bail!("max_rows must be at least 1");
     }
     let existing = job_status(conn, v.job_id)?;
-    if existing.is_some() && !v.replace {
-        bail!("view {:?} already exists; replace it with CREATE OR REPLACE (`--replace`, `replace := true`)", v.job_id);
+    match (existing, v.if_exists) {
+        (Some(_), IfExists::Fail) => bail!(
+            "view {:?} already exists; update it in place with if_exists := 'update' (`--if-exists update`), or \
+             replace it with CREATE OR REPLACE (`--replace`, `replace := true`)",
+            v.job_id
+        ),
+        (Some(_), IfExists::Update) => return update_view(conn, v),
+        _ => {}
     }
     let sources = load_sources(conn)?;
     let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
@@ -360,6 +413,7 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         .collect();
     // Refuse at create time what the worker would refuse at start: operators fed rows they cannot handle.
     let circuit = crate::circuit::Circuit::compile(&def.view())?;
+    let outcome = if existing.is_some() { Outcome::Replaced } else { Outcome::Created };
     match existing {
         None => {
             conn.execute_batch("BEGIN")?;
@@ -384,7 +438,87 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<JobDef> {
         Some(_) => replace_view(conn, &def, &circuit, &src_columns)?,
     }
     set_sink_inlining(conn, &def)?;
-    Ok(def)
+    Ok((def, outcome))
+}
+
+/// `IfExists::Update` on an existing view: compares the request with the stored definition.
+fn update_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
+    let (old, _) = load_job(conn, v.job_id)?;
+    let same_table = |a: &str, b: &str| -> Result<bool> {
+        let (_, sa, ta) = crate::lake::qualified_table(a)?;
+        let (_, sb, tb) = crate::lake::qualified_table(b)?;
+        Ok(sa == sb && ta == tb)
+    };
+    let same_late = match (old.late_data.as_deref(), v.late_data) {
+        (Some(a), Some(b)) => same_table(a, b)?,
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    let mut changed = Vec::new();
+    if normalize_sql(&old.sql) != normalize_sql(v.sql) {
+        changed.push("its query".to_string());
+    }
+    if !same_table(&old.sink, v.sink)? {
+        changed.push(format!("its table ({} -> {})", old.sink, v.sink));
+    }
+    if !same_late {
+        let show = |l: Option<&str>| l.unwrap_or("none").to_string();
+        changed.push(format!("its late-data table ({} -> {})", show(old.late_data.as_deref()), show(v.late_data)));
+    }
+    if old.checkpoint != v.checkpoint {
+        changed.push(format!("its checkpoint ({} -> {})", old.checkpoint, v.checkpoint));
+    }
+    if old.inline_row_limit != v.inline_row_limit {
+        changed.push(format!("inline_row_limit ({} -> {})", old.inline_row_limit, v.inline_row_limit));
+    }
+    if !changed.is_empty() {
+        bail!(
+            "view {}: {} changed, and only a replace recomputes it: if_exists := 'replace' (`--replace`; dbt run \
+             --full-refresh) recomputes it from the start",
+            v.job_id,
+            changed.join(", ")
+        );
+    }
+    let limit = |old: Option<u64>, new: Option<u64>| (old != new).then_some(new.unwrap_or(0));
+    let alter = AlterView {
+        epoch_interval: (old.epoch_interval != v.epoch_interval).then(|| v.epoch_interval.to_string()),
+        max_rows: (old.max_rows != v.max_rows).then_some(v.max_rows),
+        max_state_rows: limit(old.limits.max_state_rows, v.limits.max_state_rows),
+        max_late_rows: limit(old.limits.max_late_rows, v.limits.max_late_rows),
+    };
+    if alter.epoch_interval.is_none() && alter.max_rows.is_none() && alter.max_state_rows.is_none() && alter.max_late_rows.is_none() {
+        return Ok((old, Outcome::Unchanged));
+    }
+    Ok((alter_view(conn, v.job_id, &alter)?, Outcome::Altered))
+}
+
+/// A query's text for comparing two definitions: runs of whitespace outside quotes become one space, and
+/// surrounding whitespace and trailing semicolons go, so reformatting a model is not a change.
+fn normalize_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut space = false;
+    for c in sql.trim().trim_end_matches(|c: char| c == ';' || c.is_whitespace()).chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None; // a doubled quote closes and reopens: same result
+                }
+            }
+            None if c.is_whitespace() => space = true,
+            None => {
+                if space {
+                    out.push(' ');
+                    space = false;
+                }
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Creates a view's table, late-data table (unless it exists, with the columns this view writes) and state
@@ -964,4 +1098,36 @@ pub fn jobs_query(conn: &Connection) -> Result<String> {
          ORDER BY j.job_id",
         leases.join(" UNION ALL ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reformatting_a_query_is_not_a_change() {
+        let a = "SELECT game_id, count(*) AS n\n       FROM clicks   GROUP BY ALL;\n";
+        let b = "  SELECT game_id, count(*) AS n FROM clicks GROUP BY ALL";
+        assert_eq!(normalize_sql(a), normalize_sql(b));
+        assert_ne!(normalize_sql(a), normalize_sql("SELECT game_id, count(*) AS n FROM clicks WHERE true GROUP BY ALL"));
+    }
+
+    #[test]
+    fn whitespace_inside_quotes_is_kept() {
+        assert_ne!(normalize_sql("SELECT 'a  b' AS x"), normalize_sql("SELECT 'a b' AS x"));
+        assert_ne!(normalize_sql(r#"SELECT 1 AS "a  b""#), normalize_sql(r#"SELECT 1 AS "a b""#));
+        assert_eq!(normalize_sql("SELECT 'it''s'   AS x"), "SELECT 'it''s' AS x");
+        assert_eq!(normalize_sql("SELECT ';' AS x;;"), "SELECT ';' AS x");
+    }
+
+    #[test]
+    fn if_exists_parses() {
+        assert_eq!(IfExists::parse("update").unwrap(), IfExists::Update);
+        assert!(IfExists::parse("upsert").is_err());
+        let both = crate::api::if_exists;
+        assert_eq!(both(None, false).unwrap(), IfExists::Fail);
+        assert_eq!(both(None, true).unwrap(), IfExists::Replace);
+        assert_eq!(both(Some("replace"), true).unwrap(), IfExists::Replace);
+        assert!(both(Some("update"), true).is_err());
+    }
 }

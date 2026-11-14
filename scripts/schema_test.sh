@@ -7,7 +7,9 @@
 #      start with its new definition, keeps running, and the workers and the other views go on.
 #   3. Replacing a view that another view reads is refused.
 #   4. alter-view changes a running view's epoch interval: its worker restarts it with the new setting.
-#   5. stop then drop right away, three times, while the worker has the view's epoch in flight: the worker
+#   5. create-view --if-exists update, as dbt reruns it: the same view (reformatted) changes nothing, a new
+#      epoch interval is altered in place without recomputing, and a changed query is refused.
+#   6. stop then drop right away, three times, while the worker has the view's epoch in flight: the worker
 #      fences that epoch instead of failing.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-150}
@@ -94,7 +96,28 @@ check "and commits on from epoch $e0" 20 '(( $(epoch game_totals) > e0 ))'
   || { echo "FAIL: game_totals' epoch interval was not changed"; failed=1; }
 alive
 
-log "5. stop then drop at once, three times, with the view's epoch in flight"
+log "5. create-view --if-exists update on the running game_totals"
+GT_SQL="SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
+  FROM clicks
+  GROUP BY ALL HAVING avg(amount) > 49.5;"
+s0=$(starts game_totals); e0=$(epoch game_totals)
+out=$("$BIN" create-view analytics.game_totals --if-exists update --epoch-interval 3s --sql "$GT_SQL" 2>&1)
+[[ $out == "unchanged view game_totals" ]] && echo "the same view, reformatted: $out" \
+  || { echo "FAIL: rerunning the same view said: $out"; failed=1; }
+sleep 3
+(( $(starts game_totals) == s0 )) || { echo "FAIL: an unchanged rerun restarted game_totals"; failed=1; }
+expect_error "an existing view without --if-exists" "$BIN" create-view analytics.game_totals --epoch-interval 3s --sql "$GT_SQL"
+out=$("$BIN" create-view analytics.game_totals --if-exists update --epoch-interval 2s --sql "$GT_SQL" 2>&1)
+[[ $out == "altered view game_totals: epoch_interval 2s,"* ]] && echo "$out" || { echo "FAIL: a new interval said: $out"; failed=1; }
+check "game_totals restarted with 2 s epochs" 20 '(( $(starts game_totals) > s0 ))'
+[[ $(q "SELECT definition->>'epoch_interval' FROM lake.__duckwake.jobs WHERE job_id = 'game_totals'") == 2s ]] \
+  || { echo "FAIL: game_totals' epoch interval is not 2s"; failed=1; }
+expect_error "a changed query with --if-exists update" "$BIN" create-view analytics.game_totals --if-exists update \
+  --epoch-interval 2s --sql "${GT_SQL/49.5/50}"
+check "game_totals commits on from epoch $e0, not recomputed" 20 '(( $(epoch game_totals) > e0 ))'
+alive
+
+log "6. stop then drop at once, three times, with the view's epoch in flight"
 for i in 1 2 3; do
   "$BIN" create-view analytics.scratch --epoch-interval 1s --sql "SELECT ts, amount FROM clicks WHERE amount >= 10" >/dev/null
   "$BIN" start scratch >/dev/null
