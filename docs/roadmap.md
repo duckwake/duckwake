@@ -1,8 +1,7 @@
 # Roadmap
 
 Where DuckWake stands and what it needs before production. The stages run in order, and each ends at a gate
-that must pass before the next starts. The same plan is in the design doc's
-[Delivery plan](https://github.com/duckwake/duckwake/tree/main/docs/design).
+that must pass before the next starts.
 
 ## Done (v0.1.0)
 
@@ -88,9 +87,6 @@ default.
      the rows before it.
   3. The package, an example project and a CI suite against the compose stack; later, replacing a view
      without downtime (build beside it, catch up, swap in one DuckLake transaction).
-
-  Design, and how dbt-risingwave does it, in the design doc's
-  [dbt-duckwake tab](https://github.com/duckwake/duckwake/tree/main/docs/design).
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
 - `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
   stream–stream joins
@@ -125,5 +121,4 @@ default.
   `CREATE [OR REPLACE] CONTINUOUS VIEW`, `EXPLAIN` and `DROP CONTINUOUS VIEW`), only if users still ask for it
   once dbt-duckwake exists. DuckDB's C API has no parser hooks, so it needs a C++ parser shim over DuckDB's
   internal API, which carries no stability promise, and it works only in `duckwaked` and `duckwake sql`, not
-  the loadable extension. Syntax in the design doc's
-  [SQL surface](https://github.com/duckwake/duckwake/tree/main/docs/design).
+  the loadable extension.

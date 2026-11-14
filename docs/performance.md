@@ -1,7 +1,6 @@
 # Performance: worker flags and benchmarks
 
-`run`, `serve` (`duckwaked`) and `playground` take four flags from the design's
-[parallel processing plan](https://github.com/duckwake/duckwake/tree/main/docs/design). They are off by
+`run`, `serve` (`duckwaked`) and `playground` take four flags for parallel processing. They are off by
 default until a 24 h soak with them on has passed:
 - `--stage-threads N` stages views in parallel, each thread on its own DuckDB connection to the same
   instance (`0` = half the cores).
@@ -14,9 +13,6 @@ default until a 24 h soak with them on has passed:
 - `--lean-commit` skips the epoch transaction's writes that have nothing to write (no window closing, no
   late rows, no dead letters, no changed groups), and writes all views' checkpoints and dead letters with
   one statement each.
-
-The plan, its estimates and the measurements are in the design doc's
-[parallel processing tab](https://github.com/duckwake/duckwake/tree/main/docs/design).
 
 ## Measured (MacBook, Apple Silicon, 10 cores)
 

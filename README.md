@@ -8,9 +8,7 @@ transaction, so a crash never loses or duplicates output. Views can filter, join
 tumbling and hopping windows, or keep running totals per group. Late events and undecodable messages go to
 their own tables.
 
-DuckWake is a proof of concept of the
-[DuckDB Streaming Extension design](https://github.com/duckwake/duckwake/tree/main/docs/design), built on DuckDB 2.0 and
-DuckLake 1.1.
+DuckWake is a proof of concept of streaming SQL for DuckDB, built on DuckDB 2.0 and DuckLake 1.1.
 
 ## Quick start
 
