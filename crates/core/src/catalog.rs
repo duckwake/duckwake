@@ -940,22 +940,25 @@ pub enum Assign<'a> {
     Any,
 }
 
-/// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
-/// Marks `job` failed for the worker that holds it at `lease`, and fences that lease. Returns false, changing
-/// nothing, when the view was dropped or the lease has moved on: reset, replaced, stopped or taken over meanwhile, and its
-/// new incarnation must not inherit an error its old one hit (a reset's deletes reaching an insert-only
-/// reader that is about to be recomputed, say). Check and update are one transaction, so a concurrent reset
-/// either lands first (and this returns false on retry) or after (and finds the view failed).
-pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: i64) -> Result<bool> {
+/// Marks `job` failed for `worker`, and fences its lease. With `held`, only while the worker holds the lease at
+/// that epoch; without (a view that failed to start, whose lease the start may have taken), only while the view
+/// is running and the worker owns it. Returns false, changing nothing, when the view was dropped or has moved
+/// on: reset, replaced, stopped or taken over meanwhile, and its new incarnation must not inherit an error its
+/// old one hit (a reset's deletes reaching an insert-only reader that is about to be recomputed, say). A view
+/// dropped meanwhile is not an error: the worker that failed it carries on with its other views. Check and
+/// update are one transaction, so a concurrent reset either lands first (and this returns false on retry) or
+/// after (and finds the view failed).
+pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: Option<i64>) -> Result<bool> {
     retry_conflicts(|| {
         conn.execute_batch("BEGIN")?;
         let res = (|| -> Result<bool> {
             // Dropped meanwhile (with its lease table): there is no view left to mark.
-            if job_status(conn, job)?.is_none() {
+            let Some(status) = job_status(conn, job)? else { return Ok(false) };
+            if held.is_none() && status != JobStatus::Running {
                 return Ok(false);
             }
             let (owner, lease_epoch) = lease(conn, job)?;
-            if owner.as_deref() != Some(worker) || lease_epoch != held {
+            if owner.as_deref() != Some(worker) || held.is_some_and(|h| h != lease_epoch) {
                 return Ok(false);
             }
             conn.execute(
@@ -982,6 +985,7 @@ pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: i64) -> Re
     })
 }
 
+/// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
 pub fn set_status(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
     job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
     if let Some(Assign::Pin(w) | Assign::Prefer(w)) = assign {
@@ -1365,6 +1369,53 @@ mod tests {
         assert_ne!(normalize_sql(r#"SELECT 1 AS "a  b""#), normalize_sql(r#"SELECT 1 AS "a b""#));
         assert_eq!(normalize_sql("SELECT 'it''s'   AS x"), "SELECT 'it''s' AS x");
         assert_eq!(normalize_sql("SELECT ';' AS x;;"), "SELECT ';' AS x");
+    }
+
+    /// A control schema with one view `v`, running, owned by `w1` at lease epoch 3.
+    fn catalog_with_view() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH ':memory:' AS {LAKE}; CREATE SCHEMA {CTL};
+             CREATE TABLE {CTL}.jobs (job_id VARCHAR, definition JSON, version INTEGER, status VARCHAR,
+               created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);
+             INSERT INTO {CTL}.jobs VALUES ('v', '{{}}', 1, 'running', now(), now());
+             CREATE TABLE {} (owner_worker VARCHAR, lease_epoch BIGINT, last_epoch BIGINT);
+             INSERT INTO {} VALUES ('w1', 3, 0);",
+            lease_table("v"),
+            lease_table("v")
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// A worker marks a view failed only while the view is still its own: a view dropped, stopped or taken over
+    /// while it failed is let go, and a dropped one is not an error (the worker would exit and stop its other
+    /// views: a dbt --full-refresh drops and creates views while workers start them).
+    #[test]
+    fn a_view_is_marked_failed_only_while_its_worker_holds_it() {
+        let held = |conn: &Connection| (job_status(conn, "v").unwrap(), lease(conn, "v").unwrap().1);
+
+        let conn = catalog_with_view();
+        assert!(!fail_if_held(&conn, "v", "w2", None).unwrap(), "another worker's view");
+        assert!(!fail_if_held(&conn, "v", "w1", Some(2)).unwrap(), "an older lease");
+        assert_eq!(held(&conn), (Some(JobStatus::Running), 3));
+        assert!(fail_if_held(&conn, "v", "w1", Some(3)).unwrap());
+        assert_eq!(held(&conn), (Some(JobStatus::Failed), 4), "failed and fenced");
+
+        // Failing to start: whatever lease the start took, while the view runs and is the worker's.
+        let conn = catalog_with_view();
+        assert!(fail_if_held(&conn, "v", "w1", None).unwrap());
+        assert_eq!(held(&conn), (Some(JobStatus::Failed), 4));
+
+        let conn = catalog_with_view();
+        conn.execute_batch(&format!("UPDATE {CTL}.jobs SET status = 'stopped'")).unwrap();
+        assert!(!fail_if_held(&conn, "v", "w1", None).unwrap(), "stopped while it started");
+        assert_eq!(held(&conn), (Some(JobStatus::Stopped), 3));
+
+        let conn = catalog_with_view();
+        conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
+        assert!(!fail_if_held(&conn, "v", "w1", None).unwrap(), "dropped while it started");
+        assert!(!fail_if_held(&conn, "v", "w1", Some(3)).unwrap(), "dropped while it ran");
     }
 
     #[test]
