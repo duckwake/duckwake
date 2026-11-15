@@ -1,0 +1,10 @@
+# gitleaks (and similar scanners): the test TLS material for the local Redpanda is in the repository on purpose
+# (docker/kafka/make_certs.sh), and the docs use placeholder tokens such as 'secret'.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test certificates and documentation placeholders"
+paths = [
+  '''^docker/kafka/.*\.(key|crt)$''',
+]

@@ -66,7 +66,7 @@ jobs:
       - run: |
           name=duckwake-${{ needs.check.outputs.version }}-${{ matrix.platform }}
           mkdir -p "dist/$name"
-          cp target/release/duckwake target/release/duckwaked README.md CHANGELOG.md "dist/$name/"
+          cp target/release/duckwake target/release/duckwaked README.md CHANGELOG.md LICENSE THIRD_PARTY_LICENSES.md "dist/$name/"
           "dist/$name/duckwake" --version
           tar -czf "dist/$name.tar.gz" -C dist "$name"
       - uses: actions/upload-artifact@v4

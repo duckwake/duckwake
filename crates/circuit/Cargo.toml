@@ -3,6 +3,10 @@ name = "duckwake_circuit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "DuckWake's DBSP operator graph: incremental view maintenance compiled to DuckDB SQL"
 
 [dependencies]
 # DuckDB parses and binds the view; which DuckDB (bundled or the host's) is chosen by duckwake_core's features.

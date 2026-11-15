@@ -1,4 +1,4 @@
-# Shared helpers for the POC test scripts. Source from a script in this directory.
+# Shared helpers for the test scripts. Source from a script in this directory.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BIN=${BIN:-target/release/duckwake}

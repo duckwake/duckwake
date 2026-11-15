@@ -9,6 +9,9 @@ default-members = ["crates/circuit", "crates/core", "crates/duckwake"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/duckwake/duckwake"
+homepage = "https://github.com/duckwake/duckwake"
+authors = ["Trần Công Tuấn Mạnh and the DuckWake authors"]
 
 [workspace.dependencies]
 # Bundled (the CLI and daemon) or linked to a host DuckDB (the extension): see duckwake_core's features.

@@ -1,0 +1,22 @@
+# `cargo deny check licenses`: every dependency must be under a license on this list, so a copyleft or
+# unknown license cannot slip into the binaries, the Docker image or the extension. CI runs it on each PR.
+[graph]
+all-features = false
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "CC0-1.0",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9

@@ -13,6 +13,7 @@ FROM mirror.gcr.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 duckwake && mkdir /data && chown duckwake /data
 COPY --from=build /src/target/release/duckwake /src/target/release/duckwaked /usr/local/bin/
+COPY LICENSE THIRD_PARTY_LICENSES.md /usr/share/doc/duckwake/
 USER duckwake
 # The DuckDB extensions the server loads, installed now so it starts without downloading them.
 RUN duckwake sql --bare "INSTALL ducklake; INSTALL postgres; INSTALL icu; INSTALL quack"

@@ -4,7 +4,7 @@
 - **Name**: DuckWake
 - **Category**: Open-source data infrastructure / developer tool (stream processing, lakehouse)
 - **Description**: Continuous SQL over Kafka into DuckLake, exactly once. You write a view in SQL; DuckWake keeps a DuckLake table up to date with it as events arrive.
-- **Stage**: Pre-launch (proof of concept, built on DuckDB 2.0 and DuckLake 1.1)
+- **Stage**: Pre-launch (v0.1, on the path to production; built on DuckDB 2.0 and DuckLake 1.1)
 - **Website**: N/A (GitHub repo planned; org name not decided)
 
 ## Audience

@@ -7,6 +7,10 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- **Open-source release files.** The MIT `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
+  issue and pull request templates, and the design documents under `docs/design/`. Release archives and the
+  image carry `LICENSE` and `THIRD_PARTY_LICENSES.md`; CI checks every dependency's license (`cargo deny`) and
+  that the notices match `Cargo.lock`.
 - **Schema changes.** `create-view --replace` (`CREATE OR REPLACE`, `replace := true`) swaps a running view's
   definition in one transaction; the view recomputes from the start and keeps its status, worker and pin.
   `add-source-column` adds a column to a running source; views that read it keep their columns.

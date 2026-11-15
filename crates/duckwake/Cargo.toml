@@ -3,6 +3,13 @@ name = "duckwake"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["duckdb", "ducklake", "kafka", "streaming", "sql"]
+categories = ["database", "command-line-utilities"]
+description = "Continuous SQL over Kafka into DuckLake, exactly once: the duckwake CLI and the duckwaked server"
 
 [[bin]]
 name = "duckwake"
