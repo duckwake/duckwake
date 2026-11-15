@@ -4,7 +4,8 @@
 #   1. One worker runs the five test views (big_spend pinned to it), started before their topics exist: the
 #      worker waits for the topics instead of failing the views.
 #   2. A second worker joins, then a third: views spread to them (view counts within one of each other), the
-#      pinned view stays, no view moves twice within its cooldown, and no view is claimed (nobody died).
+#      pinned view stays, no view moves twice within its cooldown, load moves that may follow settle, and no
+#      view is claimed (nobody died).
 #   3. Rolling restart: each worker stopped cleanly and started again within the stop grace keeps its views.
 #   4. Drain: a drained worker hands every view away and takes none.
 #   5. The pinned view's worker dies: the view fails over, then goes back when its worker returns.
@@ -73,10 +74,19 @@ check "spread over w1 and w2" $((COOLDOWN + 30)) 'spread w1 w2'
 run_worker w3
 check "spread over w1, w2 and w3" $((COOLDOWN + 30)) 'spread w1 w2 w3'
 [[ $(owner big_spend) == w1 ]] || { echo "FAIL: pinned big_spend moved to $(owner big_spend)"; failed=1; }
-sleep $((EVERY * 3))
-before=$(handoffs)
-sleep $((EVERY * 4))
-[[ $(handoffs) == "$before" ]] && echo "settled: no handoffs in $((EVERY * 4))s" || { echo "FAIL: still moving views when balanced"; failed=1; }
+# Count moves (a worker joined) come first. A load move may follow, once a moved view's cooldown has passed
+# and the imbalance has lasted LOAD_ROUNDS (3) rebalance rounds; it leaves the pair strictly more even, so
+# moves converge. Settled: no handoff for a cooldown plus four rounds, within three such windows, and no more
+# load moves than there are views to move.
+spread_handoffs=$(handoffs); quiet=$((COOLDOWN + 4 * EVERY)); settled=0
+for _ in 1 2 3; do
+  before=$(handoffs); sleep "$quiet"
+  [[ $(handoffs) == "$before" ]] && { settled=1; break; }
+done
+extra=$(( $(handoffs) - spread_handoffs ))
+if (( settled )); then echo "settled: no handoffs in ${quiet}s ($extra load moves after the counts evened out)"
+else echo "FAIL: still moving views after $((3 * quiet))s"; failed=1; fi
+(( extra < ${#VIEWS[@]} )) || { echo "FAIL: $extra handoffs after the counts evened out"; failed=1; }
 # No view handed off twice within its cooldown (handoff times per view, in seconds).
 cat "$OUT"/w*.log | grep 'handed off view' | sed -E 's/^([^ ]+).*job=([a-z_]+).*/\1 \2/' | sort | python3 -c '
 import sys, datetime
