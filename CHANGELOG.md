@@ -62,6 +62,10 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A worker no longer hangs starting a view whose topic was just created. Kafka clients retry a partition
+  without a leader for ever, and the worker waited on that in its own loop: it stopped heartbeating, other
+  workers took its views, and it did not stop on SIGTERM. A reader now gives up after 5 s and the view waits
+  for its topic, trying again at the next refresh.
 - A view that stopped during staging (a limit, or an insert-only input that changed) made its worker drop the
   whole epoch, losing those events for the worker's other views.
 - A view dropped while its worker had an epoch in flight failed that worker.
