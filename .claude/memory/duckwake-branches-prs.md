@@ -23,7 +23,8 @@ by their personal one, claude.ai links replaced) and published fresh; PR numbers
 
 **How to apply:** start new work on a new branch from `main` (or stacked on an open branch), with its own draft
 PR and green CI. The user imported rulesets: `main` takes changes only through PRs, `ci-passed` must be green
-(so no `[skip ci]` on a PR's head), merge commits only, no force-push; `v*` tags cannot move or be deleted. Merge
+(so no `[skip ci]` on a PR's head; GitHub skips the run when that marker appears anywhere in the head commit's
+message, even quoted, so never write it into a commit message), merge commits only, no force-push; `v*` tags cannot move or be deleted. Merge
 only when the user asks, retargeting each next PR to `main` first; merge `main` into a stacked branch, never
 rebase. Commit messages carry the Co-Authored-By line but no Claude-Session link (the user removed claude.ai
 links from the history). A red CI job gets its root cause, not a re-run: three of today's "flakes" were real
