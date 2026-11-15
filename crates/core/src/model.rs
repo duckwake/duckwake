@@ -186,10 +186,24 @@ pub struct JobDef {
     /// `create_view` resolved them.
     #[serde(default)]
     pub lake_inputs: Vec<LakeInput>,
-    /// With lake inputs: the snapshot current when the view was created. The view reads the changes after it
-    /// (`start: latest`); its first checkpoint starts from here.
+    /// With lake inputs: the snapshot current when the view was created (S0). The view reads the changes
+    /// after it; with `backfill` it first reads the rows its inputs held at it. None after a cascaded reset,
+    /// until the view's next start takes the snapshot current then.
     #[serde(default)]
     pub start_snapshot: Option<i64>,
+    /// With lake inputs: whether the view starts from the rows its inputs hold at `start_snapshot`
+    /// (`start := 'earliest'`, the default) before it follows their changes. False (`start := 'latest'`, and
+    /// every view made before backfill existed): only rows written after `start_snapshot`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfill: bool,
+    /// A backfill that takes only rows written after this snapshot: a `start := 'latest'` view recomputed by
+    /// a cascaded reset keeps to the rows written after the snapshot it was created at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lake_floor: Option<i64>,
+    /// `_commit_ts` at `start_snapshot`: what a row carries whose writing snapshot's time is no longer known
+    /// (expired before DuckWake's maintenance recorded it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_commit_us: Option<i64>,
     /// The columns of each Kafka source the view reads, as they were when it was created: a column added to
     /// the source later (`add_source_column`) does not change the view's shape. Empty in views made before
     /// columns could be added, which read the source's columns as they are.
@@ -200,6 +214,19 @@ pub struct JobDef {
     #[serde(default, skip_serializing_if = "Limits::is_none")]
     pub limits: Limits,
 }
+
+impl JobDef {
+    /// The snapshot at or before which a lake input's rows are not the view's: none with a full backfill.
+    pub fn floor(&self) -> Option<i64> {
+        self.lake_floor.or(if self.backfill { None } else { self.start_snapshot })
+    }
+}
+
+/// The key, in a lake input's offsets, of its position: the last snapshot read.
+pub const LAKE_POSITION: i32 = 0;
+/// The key, in a lake input's offsets, of its backfill cursor: the last row id read at the start snapshot.
+/// There only while the backfill runs.
+pub const LAKE_BACKFILL: i32 = 1;
 
 /// A view's limits; `alter_view` changes them without recomputing the view.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

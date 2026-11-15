@@ -20,6 +20,8 @@ pub struct ViewOptions {
     pub max_rows: Option<usize>,
     /// Sink rows kept inlined in the catalog before they go to Parquet.
     pub inline_row_limit: Option<usize>,
+    /// Views over lake tables or views: `earliest` (the default) or `latest` (`catalog::CreateView::start`).
+    pub start: Option<String>,
     /// Most rows the view's state may hold, and most late rows one epoch may write (`model::Limits`).
     pub max_state_rows: Option<u64>,
     pub max_late_rows: Option<u64>,
@@ -70,6 +72,7 @@ pub fn create_view(
                 max_state_rows: o.max_state_rows.filter(|m| *m > 0),
                 max_late_rows: o.max_late_rows.filter(|m| *m > 0),
             },
+            start: o.start.as_deref(),
             if_exists: o.if_exists,
         },
     )?;
@@ -180,8 +183,13 @@ pub fn stop(conn: &Connection, name: &str) -> Result<String> {
 /// Rewinds a paused or stopped view to a checkpoint; starting it again replays from that checkpoint's offsets.
 pub fn reset(conn: &Connection, name: &str, to_epoch: i64) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    catalog::reset(conn, &job, to_epoch)?;
-    Ok(format!("{job}: reset to epoch {to_epoch}; start it to replay"))
+    let recomputed = catalog::reset(conn, &job, to_epoch)?;
+    let also = if recomputed.is_empty() {
+        String::new()
+    } else {
+        format!("; {} read it insert-only and recompute from its table when they next start", recomputed.join(", "))
+    };
+    Ok(format!("{job}: reset to epoch {to_epoch}; start it to replay{also}"))
 }
 
 /// Drops a stopped view and, unless `keep_table`, its table (a late-data table is kept).

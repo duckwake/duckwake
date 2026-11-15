@@ -84,8 +84,7 @@ default.
   with dbt's `ref()` order, tests and docs. A plain `dbt run` never recomputes a view: unchanged does nothing,
   settings go through `alter_view`, a changed query fails until `--full-refresh`. In order:
   1. `create_view` reports what changed (`if_exists := 'fail' | 'update' | 'replace'`), also in the CLI.
-  2. Backfill of new views over lake inputs (F3, below): without it a view added over a running one misses
-     the rows before it.
+  2. Backfill of new views over lake inputs (F3, below). Built 2026-11-15 (`scripts/backfill_test.sh`).
   3. The package, an example project and a CI suite against the compose stack; later, replacing a view
      without downtime (build beside it, catch up, swap in one DuckLake transaction).
 
@@ -94,8 +93,8 @@ default.
 - `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
   stream–stream joins
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
-  `scripts/chain_test.sh`) and over tables whose rows change (F2, `scripts/retract_test.sh`) are done;
-  backfill, retention and reset cascade (F3), and shared and fused reads (F4) remain. Windows over tables
+  `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
+  retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain. Windows over tables
   whose rows change need an upsert window sink that keeps state for `lateness`, as Flink and Feldera do;
   what arrives later goes to the late-data table (C4), and bulk reruns are the partition-overwrite refresh
   below.

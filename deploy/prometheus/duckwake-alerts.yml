@@ -148,3 +148,13 @@ groups:
           summary: "{{ $value | humanizePercentage }} of the events of {{ $labels.view }} arrive after their window closed"
           description: "They go to the late-data table, not the view. watermark_delay is shorter than the real disorder of the events."
           runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakelaterows
+
+      - alert: DuckWakeSnapshotsHeld
+        expr: max by (view) (duckwake_snapshots_held_seconds) > 6 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.view }} keeps the lake's snapshots from {{ $value | humanizeDuration }} ago"
+          description: "Maintenance expires no snapshot after the view's position, so the catalog and the files of rewritten rows grow. The view is paused or stopped, or falling behind its lake inputs."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakesnapshotsheld

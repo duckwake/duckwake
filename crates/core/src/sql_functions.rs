@@ -13,7 +13,7 @@
 use crate::api::{self, ViewOptions};
 use crate::lake::LakeConfig;
 use crate::metrics::Metrics;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use duckdb::arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -322,7 +322,7 @@ impl Spec for CreateSource {
 }
 
 /// `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, checkpoint :=,
-/// inline_row_limit :=, max_state_rows :=, max_late_rows :=, if_exists :=, replace :=)`: the table `name` and the
+/// inline_row_limit :=, start :=, max_state_rows :=, max_late_rows :=, if_exists :=, replace :=)`: the table `name` and the
 /// job that maintains it. The result starts with what happened: created, unchanged, altered or replaced.
 struct CreateView;
 impl Spec for CreateView {
@@ -337,6 +337,7 @@ impl Spec for CreateView {
             ("max_rows", Bigint),
             ("checkpoint", Varchar),
             ("inline_row_limit", Bigint),
+            ("start", Varchar),
             ("max_state_rows", Bigint),
             ("max_late_rows", Bigint),
             ("if_exists", Varchar),
@@ -350,6 +351,7 @@ impl Spec for CreateView {
             epoch_interval: a.opt("epoch_interval").map(String::from),
             max_rows: a.opt_num("max_rows")?,
             inline_row_limit: a.opt_num("inline_row_limit")?,
+            start: a.opt("start").map(String::from),
             max_state_rows: a.opt_num("max_state_rows")?,
             max_late_rows: a.opt_num("max_late_rows")?,
             if_exists: api::if_exists(a.opt("if_exists"), a.flag("replace"))?,
@@ -545,7 +547,12 @@ impl Spec for Wait {
                     Some(l) => {
                         let p = ck.as_ref().and_then(|ck| ck.offsets.get(&0).copied()).or(def.start_snapshot).unwrap_or(0);
                         let s = end[&0];
-                        p >= s || api.with(|c| {
+                        // A backfill still running, or one that has not committed its first page, is not there.
+                        let backfilling = match &ck {
+                            Some(ck) => ck.offsets.contains_key(&crate::model::LAKE_BACKFILL),
+                            None => def.backfill,
+                        };
+                        !backfilling && (p >= s || api.with(|c| {
                             let Some((schema, table)) = crate::lake::table_by_id(c, l.table_id)? else { return Ok(false) };
                             let n: i64 = c.query_row(
                                 &format!("SELECT count(*) FROM ducklake_table_changes({}, ?, ?, ?, ?)", crate::lake::lit(crate::lake::LAKE)),
@@ -553,7 +560,7 @@ impl Spec for Wait {
                                 |r| r.get(0),
                             )?;
                             Ok(n == 0)
-                        })?
+                        })?)
                     }
                     None => ck.as_ref().is_some_and(|ck| end.iter().all(|(p, o)| ck.offsets.get(p).is_some_and(|c| c >= o))),
                 };
@@ -690,10 +697,14 @@ impl Spec for WorkerStart {
             ("shared_readers", Boolean),
             ("lean_commit", Boolean),
             ("metrics", Varchar),
+            ("position_refresh", Varchar),
         ]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
         let flag = |n: &str| a.opt(n).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        // As `--position-refresh`: how long an idle view with lake inputs may leave its position behind.
+        let position_refresh = crate::model::parse_duration(a.opt("position_refresh").unwrap_or("5m"))
+            .context("duckwake_worker_start: position_refresh")?;
         let mut inner = api.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = inner.worker.as_ref().filter(|w| !w.thread.is_finished()) {
             bail!("duckwake_worker_start: worker {} is already running", w.id);
@@ -730,6 +741,7 @@ impl Spec for WorkerStart {
                 shared_readers,
                 lean_commit,
                 metrics: None,
+                position_refresh,
             })
         };
         let shutdown = Arc::new(AtomicBool::new(false));

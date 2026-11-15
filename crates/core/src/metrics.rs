@@ -35,6 +35,8 @@ struct State {
     advertised: Option<String>,
     /// Every live worker's metrics address, read from the lake, for `GET /sd`.
     targets: Vec<(String, String)>,
+    /// Per view with lake inputs: snapshots held and when the oldest held was committed (`set_snapshots_held`).
+    held: BTreeMap<String, (i64, Option<i64>)>,
 }
 
 #[derive(Default, Clone)]
@@ -146,6 +148,13 @@ impl Metrics {
         j.max_state_rows = max_state_rows;
     }
 
+    /// What each view with lake inputs holds: snapshots from its position to the lake's newest, and when its
+    /// position's snapshot was committed. Maintenance keeps them all. For the views this worker runs and the
+    /// ones no worker runs (so every worker reports those), replacing the previous reading.
+    pub fn set_snapshots_held(&self, held: BTreeMap<String, (i64, Option<i64>)>) {
+        self.lock().held = held;
+    }
+
     /// Rows in the view's state as last committed.
     pub fn set_state_rows(&self, job: &str, rows: i64) {
         self.lock().jobs.entry(job.to_string()).or_default().state_rows = Some(rows);
@@ -229,6 +238,24 @@ impl Metrics {
                 if let Some(value) = f(j, &secs) {
                     out.push(Sample { name, kind, help, view: Some(id.clone()), value });
                 }
+            }
+        }
+        for (id, (n, since)) in &st.held {
+            out.push(Sample {
+                name: "duckwake_snapshots_held",
+                kind: "gauge",
+                help: "Views with lake inputs: snapshots from the view's position to the lake's newest, which maintenance keeps for it.",
+                view: Some(id.clone()),
+                value: *n as f64,
+            });
+            if let Some(us) = since {
+                out.push(Sample {
+                    name: "duckwake_snapshots_held_seconds",
+                    kind: "gauge",
+                    help: "Views with lake inputs: now minus the commit time of the snapshot at the view's position (a paused view's grows).",
+                    view: Some(id.clone()),
+                    value: secs(*us),
+                });
             }
         }
         let load: f64 = st.jobs.values().filter_map(|j| j.cost).fold(0.0, |a, c| a + c);
@@ -442,6 +469,20 @@ mod tests {
         assert!(text.contains("duckwake_dead_letters_total{worker=\"w1\",view=\"clicks\"} 2"), "{text}");
         assert!(text.contains("duckwake_commit_conflicts_total{worker=\"w1\"} 1"), "{text}");
         assert!(text.contains("# TYPE duckwake_freshness_seconds gauge"), "{text}");
+        let paused_since = now - 7_200_000_000;
+        m.set_snapshots_held([("clicks".to_string(), (40, Some(paused_since))), ("idle".to_string(), (0, None))].into());
+        let text = m.render();
+        assert!(text.contains("duckwake_snapshots_held{worker=\"w1\",view=\"clicks\"} 40"), "{text}");
+        assert!(text.contains("duckwake_snapshots_held{worker=\"w1\",view=\"idle\"} 0"), "{text}");
+        assert!(!text.contains("duckwake_snapshots_held_seconds{worker=\"w1\",view=\"idle\"}"), "{text}");
+        let held_s: f64 = text
+            .lines()
+            .find(|l| l.starts_with("duckwake_snapshots_held_seconds{worker=\"w1\",view=\"clicks\"}"))
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+            .unwrap();
+        assert!((7199.0..7300.0).contains(&held_s), "{held_s}");
+        m.set_snapshots_held(Default::default());
+        assert!(!m.render().contains("duckwake_snapshots_held"), "a new reading replaces the last");
         m.forget("clicks");
         assert!(!m.render().contains("view=\"clicks\""));
     }
@@ -484,6 +525,7 @@ mod tests {
         m.set_state_rows("v", 1);
         m.set_view_config("v", 2.0, 5.0, Some(10));
         m.set_duckdb_memory(1, 0, 2);
+        m.set_snapshots_held([("v".to_string(), (3, Some(0)))].into());
         let text = m.render();
         let known: std::collections::HashSet<&str> =
             text.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split('{').next()).collect();

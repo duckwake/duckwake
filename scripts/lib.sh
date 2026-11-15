@@ -52,10 +52,20 @@ reset_env() {
   reset_lake
 }
 
+# psql on the catalog's PostgreSQL: the compose service, or with PG_LOCAL=1 a server already listening on
+# localhost:55432 with a `lake` role (suites that read only lake tables then run without Docker).
+PG_LOCAL=${PG_LOCAL:-}
+psql_lake() {
+  if [[ $PG_LOCAL == 1 ]]; then
+    PGOPTIONS='-c client_min_messages=warning' psql -h localhost -p 55432 -U lake "$@"
+  else
+    docker compose exec -T -e PGOPTIONS='-c client_min_messages=warning' postgres psql -U lake "$@"
+  fi
+}
+
 # Recreates the test catalog database and its data files; the topic stays.
 reset_lake() {
-  docker compose exec -T -e PGOPTIONS='-c client_min_messages=warning' postgres psql -q -U lake -d lake \
-    -c "DROP DATABASE IF EXISTS $TEST_DB" -c "CREATE DATABASE $TEST_DB" >/dev/null
+  psql_lake -q -d lake -c "DROP DATABASE IF EXISTS $TEST_DB" -c "CREATE DATABASE $TEST_DB" >/dev/null
   rm -rf .lake/test
   [[ $LAKE_STORAGE != s3 ]] || docker compose exec -T minio mc rm -r --force local/duckwake/test >/dev/null 2>&1 || true
   "$BIN" init >/dev/null

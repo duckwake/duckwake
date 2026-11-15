@@ -135,3 +135,23 @@ tests:
               summary: "2% of the events of noisy cannot be decoded"
               description: "They go to __duckwake.dead_letter with the error. A producer changed its format, or a source column has the wrong type."
               runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakedeadletters
+
+  # A paused view holds snapshots from 7 hours ago; another, running, holds a minute's worth. Two workers report
+  # the paused one (no worker runs it), and the alert fires once for it.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_snapshots_held_seconds{job="duckwake",instance="w1:9464",worker="w1",view="paused"}'
+        values: '25200+60x30'
+      - series: 'duckwake_snapshots_held_seconds{job="duckwake",instance="w2:9464",worker="w2",view="paused"}'
+        values: '25200+60x30'
+      - series: 'duckwake_snapshots_held_seconds{job="duckwake",instance="w1:9464",worker="w1",view="busy"}'
+        values: '60x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DuckWakeSnapshotsHeld
+        exp_alerts:
+          - exp_labels: {severity: warning, view: paused}
+            exp_annotations:
+              summary: "paused keeps the lake's snapshots from 7h 20m 0s ago"
+              description: "Maintenance expires no snapshot after the view's position, so the catalog and the files of rewritten rows grow. The view is paused or stopped, or falling behind its lake inputs."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakesnapshotsheld

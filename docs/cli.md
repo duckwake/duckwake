@@ -93,6 +93,17 @@ $B create-view analytics.clicks_per_min --if-exists update --epoch-interval 30s 
 `stop` and `pause` fence the view's worker at once: an epoch it has in flight does not land, so `drop` or
 `reset` can follow straight away.
 
+A view over lake tables or other views first backfills the rows its inputs already hold, `--max-rows` per epoch
+(`--start latest` skips them); `reset` empties the windowed views that read it, which backfill again. A view
+created stopped holds its start snapshot until it starts. `reset --to-epoch N` refuses an epoch whose positions
+have expired; `--to-epoch 0` recomputes a view over lake inputs from the rows they hold at its next start. Maintenance
+(`--expire-every`, `--expire-older-than`) keeps every snapshot from the oldest position of a view that is not
+dropped, so a view paused for a week holds a week of snapshots; `duckwake_snapshots_held_seconds` shows it. Each
+running view moves its position to the newest snapshot every `--position-refresh` (default `5m`; `position_refresh :=` in
+`duckwake_worker_start`) even when its
+inputs did not change, so that idle views hold nothing back. A view whose position has expired anyway (the lake
+was maintained by another tool) fails with the snapshot it needs; `create-view --replace` it.
+
 ## Limits
 
 A view that grows without bound should fail alone, not slow down or take down its worker:

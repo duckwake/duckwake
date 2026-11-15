@@ -2,7 +2,7 @@
 # F2 gate: views over a lake table whose rows are inserted, updated and deleted, and over views whose tables
 # change in turn. A generator rewrites shop.accounts with mixed inserts, updates and deletes (some in one
 # transaction, some updating and then deleting the same rows, many touching rows written before the views
-# existed) while the worker is killed over and over: kill -9 from outside, and aborts injected at every step
+# existed, which the views backfill) while the worker is killed over and over: kill -9 from outside, and aborts injected at every step
 # of the epoch. After every crash each view verifies against its batch query over its input as of the
 # snapshot in its checkpoint (time travel), and again once the views have caught up. Then: a reset of a view
 # reaches the views that read it through the change feed, and a window over a view whose rows change is
@@ -18,9 +18,9 @@ VIEWS=("${LEVEL1[@]}" acc_amount_totals acc_busy_games acc_mixed)
 
 sql() { "$BIN" sql "$1" --csv 2>/dev/null | tail -1; }
 snapshot() { sql "SELECT id FROM ducklake_current_snapshot('lake')"; }
-# The snapshot a view has read its input up to, from its latest checkpoint.
+# The snapshot a view has read its input up to, from its latest checkpoint (key "0"; "1" is a backfill's cursor).
 position() {
-  sql "SELECT coalesce(max(o::BIGINT), 0) FROM (SELECT unnest(json_extract(source_offsets, '\$.*.*')) AS o FROM (
+  sql "SELECT coalesce(max(o::BIGINT), 0) FROM (SELECT unnest(json_extract(source_offsets, '\$.*.\"0\"')) AS o FROM (
          SELECT source_offsets FROM lake.__duckwake.checkpoints WHERE job_id = '$1' ORDER BY epoch DESC LIMIT 1))"
 }
 # Whether view $1 has read its input table $2.$3 up to snapshot $4: its position is there, or no change to the

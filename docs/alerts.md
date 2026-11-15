@@ -52,6 +52,7 @@ The series, per view (`worker` and `view` labels) unless marked per worker:
 | `duckwake_rows_in_total`, `_rows_out_total`, `_late_rows_total`, `_dead_letters_total` | counters |
 | `duckwake_state_rows` | rows in the state as last committed, read every 10 s |
 | `duckwake_view_cost` | share of a worker the view uses |
+| `duckwake_snapshots_held`, `_snapshots_held_seconds` | views with lake inputs: snapshots after the view's position, which maintenance keeps, and how old the oldest is; a view no worker runs is reported by every worker |
 | `duckwake_epoch_interval_seconds`, `duckwake_watermark_delay_setting_seconds`, `duckwake_max_state_rows` | the view's settings, for relative alerts |
 | per worker: `duckwake_worker_up`, `_worker_restarts_total`, `_views`, `_worker_load` | |
 | per worker: `duckwake_epochs_total`, `_commit_seconds_sum`, `_commit_seconds`, `_poll_stage_seconds`, `_commit_conflicts_total` | epochs and commits |
@@ -155,3 +156,10 @@ changed its format, or a source column has the wrong type (add one with `duckwak
 **warning.** More than 5% of a windowed view's events arrive after their window closed and go to its late-data
 table. The source's `watermark_delay` is shorter than the events' real disorder; a view with `max_late_rows` fails
 first.
+
+## DuckWakeSnapshotsHeld
+
+**warning.** A view's position in its lake inputs is more than 6 hours old, so maintenance keeps every snapshot
+since then: the catalog and the files of rows updated or deleted since grow. Find the view's status with
+`duckwake list`. A paused or stopped view holds them on purpose; start it, or drop it if it is no longer needed.
+A running view is falling behind its inputs: look at its epochs (`duckwake_stage_seconds`, `--max-rows`).

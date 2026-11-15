@@ -75,6 +75,10 @@ enum Cmd {
         max_rows: usize,
         #[arg(long, default_value_t = 10_000)]
         inline_row_limit: usize,
+        /// For a view over lake tables or other views: earliest (the default) starts from the rows they hold
+        /// now, then follows their changes; latest takes only rows written from now on.
+        #[arg(long, value_parser = ["earliest", "latest"])]
+        start: Option<String>,
         /// Fail the view once its state holds more rows than this (open windows, groups or distinct rows).
         #[arg(long)]
         max_state_rows: Option<u64>,
@@ -288,6 +292,10 @@ pub struct WorkerArgs {
     /// Skip epoch writes with nothing to write; one INSERT for all views' checkpoints and dead letters.
     #[arg(long, env = "DUCKWAKE_LEAN_COMMIT")]
     pub lean_commit: bool,
+    /// A view over lake tables with nothing to write commits its position alone once it is this far behind
+    /// in time, so that idle views do not keep maintenance from expiring snapshots.
+    #[arg(long, default_value = "5m", env = "DUCKWAKE_POSITION_REFRESH")]
+    pub position_refresh: String,
 }
 
 impl WorkerArgs {
@@ -326,6 +334,7 @@ impl WorkerArgs {
             shared_readers: self.shared_readers,
             lean_commit: self.lean_commit,
             metrics: None,
+            position_refresh: parse_duration(&self.position_refresh)?,
         })
     }
 }
@@ -389,6 +398,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             epoch_interval,
             max_rows,
             inline_row_limit,
+            start,
             max_state_rows,
             max_late_rows,
             if_exists,
@@ -403,6 +413,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 epoch_interval: Some(epoch_interval),
                 max_rows: Some(max_rows),
                 inline_row_limit: Some(inline_row_limit),
+                start,
                 max_state_rows,
                 max_late_rows,
                 if_exists: api::if_exists(if_exists.as_deref(), replace)?,
