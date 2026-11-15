@@ -483,7 +483,8 @@ fn update_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
     }
     // Only when the request names a start: a rerun that leaves it out keeps the view as it was made.
     if let Some(start) = v.start.filter(|_| !old.lake_inputs.is_empty()) {
-        let had = if old.backfill { "earliest" } else { "latest" };
+        // A recomputed `latest` view backfills too, from its floor: the floor is what says it was made latest.
+        let had = if old.floor().is_some() { "latest" } else { "earliest" };
         if start != had {
             changed.push(format!("its start ({had} -> {start})"));
         }
@@ -646,13 +647,10 @@ fn replace_view(conn: &Connection, def: &JobDef, circuit: &crate::circuit::Circu
     })
 }
 
-/// `_commit_ts` at snapshot `at`: the newest `snapshot_time` among the snapshots up to it, in UTC microseconds.
+/// `_commit_ts` at snapshot `at`, in UTC microseconds: the running maximum of `snapshot_time` up to it, the
+/// times of snapshots maintenance expired included (`lake::commit_times_sql`, as every row gets it).
 pub fn commit_us_at(conn: &Connection, at: i64) -> Result<Option<i64>> {
-    Ok(conn.query_row(
-        &format!("SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id <= ?", lit(LAKE)),
-        [at],
-        |r| r.get(0),
-    )?)
+    Ok(conn.query_row(&format!("SELECT epoch_us(max(ts)) FROM ({})", crate::lake::commit_times_sql(at, &at.to_string())), [], |r| r.get(0))?)
 }
 
 /// A view that reads lake tables through their change feeds, and the snapshot it has read them up to.
@@ -1087,10 +1085,58 @@ pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<Vec<String>>
     } else {
         None
     };
+    // The snapshots its lake inputs resume from must still be there; maintenance keeps only those from the
+    // views' newest checkpoints on. Checked again in the reset's transaction and after it commits, since
+    // maintenance on another worker may expire them meanwhile.
+    let positions = reset_positions(conn, job, &def, to_epoch)?;
+    check_positions(conn, job, to_epoch, &positions)?;
     let recompute = insert_only_readers(conn, job)?;
     // Its deletes from the shared control tables can lose to a running job's checkpoint insert.
-    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot, &recompute))?;
+    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot, &recompute, &positions))?;
+    check_positions(conn, job, to_epoch, &positions).context(
+        "the reset committed, but maintenance expired that snapshot while it ran: reset the view again, to a newer \
+         epoch or to epoch 0 (which recomputes it from its inputs' current rows)",
+    )?;
     Ok(recompute)
+}
+
+/// Where a reset of `job` to `to_epoch` leaves each lake input: its position in the newest checkpoint left,
+/// as `(table, snapshot)`. None for epoch 0, which starts the view over from the snapshot current at its
+/// next start.
+fn reset_positions(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64) -> Result<Vec<(String, i64)>> {
+    if to_epoch == 0 {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for l in &def.lake_inputs {
+        let ck = checkpoints(conn, job, &l.name, &format!("AND epoch <= {to_epoch} ORDER BY epoch DESC LIMIT 1"))?.pop();
+        if let Some(p) = ck.and_then(|c| c.offsets.get(&crate::model::LAKE_POSITION).copied()).or(def.start_snapshot) {
+            out.push((l.table.clone(), p));
+        }
+    }
+    Ok(out)
+}
+
+fn check_positions(conn: &Connection, job: &str, to_epoch: i64, positions: &[(String, i64)]) -> Result<()> {
+    for (table, p) in positions {
+        if !crate::lake::snapshot_exists(conn, *p)? {
+            bail!(
+                "view {job}: at epoch {to_epoch} it had read {table} up to snapshot {p}, which has expired, so the \
+                 changes after it are gone. Reset it to a newer epoch, or to epoch 0 to recompute it from its \
+                 inputs' current rows"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Makes a view with lake inputs start over: its next start takes the snapshot current then and backfills
+/// from it, keeping a `start := 'latest'` view to the rows written after the snapshot it was created at.
+fn start_over(def: &mut JobDef) {
+    def.lake_floor = def.floor();
+    def.backfill = true;
+    def.start_snapshot = None;
+    def.start_commit_us = None;
 }
 
 /// The views a reset of `job` changes the input of, that read that input insert-only: among `job`'s readers
@@ -1136,11 +1182,7 @@ fn recompute_view(conn: &Connection, job: &str) -> Result<()> {
         conn.execute(&format!("DELETE FROM {CTL}.{t} WHERE job_id = ?"), [job])?;
     }
     conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1, last_epoch = 0", lease_table(job)))?;
-    // A `start := 'latest'` view keeps to the rows written after it was created.
-    def.lake_floor = def.floor();
-    def.backfill = true;
-    def.start_snapshot = None;
-    def.start_commit_us = None;
+    start_over(&mut def);
     conn.execute(
         &format!("UPDATE {CTL}.jobs SET definition = ?, version = version + 1, updated_at = now() WHERE job_id = ?"),
         [&serde_json::to_string(&def)?, job],
@@ -1164,11 +1206,31 @@ pub fn take_start_snapshot(conn: &Connection, job: &str) -> Result<JobDef> {
     })
 }
 
-fn reset_once(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64, snapshot: Option<i64>, recompute: &[String]) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn reset_once(
+    conn: &Connection,
+    job: &str,
+    def: &JobDef,
+    to_epoch: i64,
+    snapshot: Option<i64>,
+    recompute: &[String],
+    positions: &[(String, i64)],
+) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
+        check_positions(conn, job, to_epoch, positions)?;
         for r in recompute {
             recompute_view(conn, r)?;
+        }
+        // Back to epoch 0, a view with lake inputs starts over from the snapshot current at its next start:
+        // its first start snapshot may be long expired.
+        if to_epoch == 0 && !def.lake_inputs.is_empty() {
+            let mut d = def.clone();
+            start_over(&mut d);
+            conn.execute(
+                &format!("UPDATE {CTL}.jobs SET definition = ?, version = version + 1, updated_at = now() WHERE job_id = ?"),
+                [&serde_json::to_string(&d)?, job],
+            )?;
         }
         let sink = quote_table(&def.sink)?;
         match (def.plan.sink_mode(), snapshot) {

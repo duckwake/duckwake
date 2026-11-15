@@ -13,7 +13,7 @@
 use crate::api::{self, ViewOptions};
 use crate::lake::LakeConfig;
 use crate::metrics::Metrics;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use duckdb::arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
@@ -697,10 +697,14 @@ impl Spec for WorkerStart {
             ("shared_readers", Boolean),
             ("lean_commit", Boolean),
             ("metrics", Varchar),
+            ("position_refresh", Varchar),
         ]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
         let flag = |n: &str| a.opt(n).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        // As `--position-refresh`: how long an idle view with lake inputs may leave its position behind.
+        let position_refresh = crate::model::parse_duration(a.opt("position_refresh").unwrap_or("5m"))
+            .context("duckwake_worker_start: position_refresh")?;
         let mut inner = api.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = inner.worker.as_ref().filter(|w| !w.thread.is_finished()) {
             bail!("duckwake_worker_start: worker {} is already running", w.id);
@@ -737,7 +741,7 @@ impl Spec for WorkerStart {
                 shared_readers,
                 lean_commit,
                 metrics: None,
-                position_refresh: std::time::Duration::from_secs(300),
+                position_refresh,
             })
         };
         let shutdown = Arc::new(AtomicBool::new(false));

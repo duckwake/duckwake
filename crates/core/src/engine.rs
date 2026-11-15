@@ -637,30 +637,45 @@ impl Worker {
 
     /// The snapshots each view with lake inputs holds, from its position to the lake's newest: for the views
     /// this worker runs, and for those no worker runs (paused, stopped or failed), which hold snapshots too.
-    /// Read every `STATE_CHECK_EVERY`.
-    fn report_held_snapshots(&mut self, m: &Arc<crate::metrics::Metrics>) -> Result<()> {
+    /// Read every `STATE_CHECK_EVERY`. A failed reading is logged and skipped: it is only a gauge.
+    fn report_held_snapshots(&mut self, m: &Arc<crate::metrics::Metrics>) {
         if self.held_checked.is_some_and(|t| t.elapsed() < STATE_CHECK_EVERY) {
-            return Ok(());
+            return;
         }
         self.held_checked = Some(Instant::now());
-        let positions = catalog::lake_positions(&self.conns[0])?;
-        let running: HashSet<String> = catalog::running_jobs(&self.conns[0])?.into_iter().filter(|j| j.owner.is_some()).map(|j| j.id).collect();
-        let current = crate::lake::current_snapshot(&self.conns[0])?;
-        let mut held = BTreeMap::new();
-        for p in positions {
-            let Some(at) = p.snapshot else { continue };
-            if !(self.jobs.contains_key(&p.job) || !running.contains(&p.job)) {
-                continue;
-            }
-            let since: Option<i64> = self.conns[0].query_row(
-                &format!("SELECT epoch_us(max(snapshot_time)) FROM ducklake_snapshots({}) WHERE snapshot_id = ?", lit(LAKE)),
-                [at],
-                |r| r.get(0),
-            )?;
-            held.insert(p.job, (current - at, since));
+        match self.held_snapshots() {
+            Ok(held) => m.set_snapshots_held(held),
+            Err(e) => warn!(error = %format!("{e:#}"), "reading the snapshots views hold failed"),
         }
-        m.set_snapshots_held(held);
-        Ok(())
+    }
+
+    fn held_snapshots(&self) -> Result<BTreeMap<String, (i64, Option<i64>)>> {
+        let conn = &self.conns[0];
+        let running: HashSet<String> = catalog::running_jobs(conn)?.into_iter().filter(|j| j.owner.is_some()).map(|j| j.id).collect();
+        let held: Vec<(String, i64)> = catalog::lake_positions(conn)?
+            .into_iter()
+            .filter(|p| self.jobs.contains_key(&p.job) || !running.contains(&p.job))
+            .filter_map(|p| Some((p.job, p.snapshot?)))
+            .collect();
+        if held.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        // One read of the snapshot list for every view: the newest snapshot, and the time of each position.
+        let ids = held.iter().map(|(_, s)| s.to_string()).collect::<Vec<_>>().join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT snapshot_id, epoch_us(snapshot_time), max(snapshot_id) OVER () FROM ducklake_snapshots({})
+             WHERE snapshot_id IN ({ids}) OR snapshot_id = (SELECT max(snapshot_id) FROM ducklake_snapshots({}))",
+            lit(LAKE),
+            lit(LAKE)
+        ))?;
+        let mut times = HashMap::new();
+        let mut current = 0;
+        for r in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+            let (id, us, newest) = r?;
+            times.insert(id, us);
+            current = newest;
+        }
+        Ok(held.into_iter().map(|(job, at)| (job, (current - at, times.get(&at).copied()))).collect())
     }
 
     /// Reads the size of each stateful view's state every `STATE_CHECK_EVERY` (the state as last committed),
@@ -672,7 +687,7 @@ impl Worker {
             self.last_targets = Some(Instant::now());
         }
         if let Some(m) = self.cfg.metrics.clone() {
-            self.report_held_snapshots(&m)?;
+            self.report_held_snapshots(&m);
             let (used, spilled, limit): (i64, i64, String) = self.conns[0].query_row(
                 "SELECT coalesce(sum(memory_usage_bytes), 0)::BIGINT, coalesce(sum(temporary_storage_bytes), 0)::BIGINT,
                         current_setting('memory_limit') FROM duckdb_memory()",
@@ -903,6 +918,9 @@ impl Worker {
     fn start_job(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
         let (mut def, sources) = catalog::load_compiled(conn, id)?;
+        // After an epoch ran out of memory the worker runs every view with fewer rows per epoch: Kafka reads
+        // and backfill pages alike take them from here.
+        def.max_rows = self.rows_cap.map_or(def.max_rows, |c| c.min(def.max_rows));
         // Recomputed by a cascaded reset: it starts from the snapshot current now.
         if !def.lake_inputs.is_empty() && def.start_snapshot.is_none() {
             let d = catalog::take_start_snapshot(conn, id)?;
@@ -942,11 +960,7 @@ impl Worker {
                         crate::lake::oldest_snapshot(conn)?
                     );
                 }
-                let commit_us: Option<i64> = conn.query_row(
-                    &format!("SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id <= ?", lit(LAKE)),
-                    [position],
-                    |r| r.get(0),
-                )?;
+                let commit_us = catalog::commit_us_at(conn, position)?;
                 match cursor {
                     Some(c) => info!(job = %id, input = %name, table = %lake.table, snapshot = position, after_row = c, "backfilling"),
                     None => info!(job = %id, input = %name, table = %lake.table, snapshot = position, "reading change feed"),
@@ -968,7 +982,7 @@ impl Worker {
             }
             let source = Arc::new(sources.get(name).with_context(|| format!("source {name} of the view is gone"))?.clone());
             let decoder = source.options.arrow_decoder()?.map(Arc::new);
-            let max_rows = self.rows_cap.map_or(def.max_rows, |c| c.min(def.max_rows));
+            let max_rows = def.max_rows;
             let (reader, offsets) = Reader::start(&self.rt, &source.options, &start, max_rows, decoder)?;
             let joined = self
                 .groups
@@ -1058,10 +1072,8 @@ impl Worker {
                 self.groups.remove(&gid);
                 self.drops.extend(group_tables(gid));
             } else {
+                // Each job's max_rows is already capped (`start_job`).
                 g.max_rows = g.members.iter().map(|m| self.jobs[m].def.max_rows).min().unwrap();
-                if let Some(c) = self.rows_cap {
-                    g.max_rows = g.max_rows.min(c);
-                }
             }
         }
     }

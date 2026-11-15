@@ -329,7 +329,8 @@ records the ones it took up.
   takes the input's updates and deletes as retractions (finding 11): a stateless view's table counts each
   row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view reads lake tables insert-only
   (an update or delete stops it, status `failed`) and refuses a view's table whose rows change.
-- **Backfill and retention (F3).** A new view takes S0, the snapshot current when it first starts, and pages
+- **Backfill and retention (F3).** A new view takes S0, the snapshot current when it is created (or, after a cascaded reset or a reset to
+  epoch 0, the one current at its next start), and pages
   each input `AT (VERSION => S0)` in `rowid` order, `max_rows` per epoch; the cursor is in the checkpoint
   (offsets key `1`, next to the position at key `0`), so a crash resumes the page after the last committed
   one. Rows read this way carry the `_commit_ts` of their version, so the view equals its batch query at S0

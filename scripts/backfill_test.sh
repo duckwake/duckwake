@@ -121,7 +121,10 @@ for i in $(seq 1 "$KILLS"); do
     kill -9 "$pid" 2>/dev/null && how="no crash in 10 s, killed" || how="aborted at $point"
     wait "$pid" 2>/dev/null || true
   fi
-  if verify_views quiet; then c=$(cursor bf_rich); c=${c:+at row $c}; echo "run $i: $how; bf_rich backfill ${c:-done}; all ${#VIEWS[@]} verify"
+  if verify_views quiet; then c=$(cursor bf_rich)
+    if [[ $(sql "SELECT count(*) FROM lake.__duckwake.checkpoints WHERE job_id = 'bf_rich'") == 0 ]]; then c="not started"
+    elif [[ -n $c ]]; then c="at row $c"; else c="done"; fi
+    echo "run $i: $how; bf_rich backfill $c; all ${#VIEWS[@]} verify"
   else echo "run $i: $how; VERIFY FAILED"; failed=1; fi
 done
 stop_generating
@@ -149,7 +152,7 @@ generate $((ROWS + 500000))
 sleep 20
 stop_generating
 oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
-echo "bf_rich paused at snapshot $held; the lake's oldest snapshot is $oldest of $(snapshot); $(sql "SELECT count(*) FROM lake.__duckwake.snapshot_times") commit times recorded"
+echo "bf_rich paused at snapshot $held; the lake's oldest snapshot is $oldest of $(snapshot); commit times recorded for $(sql "SELECT count(*) FROM lake.__duckwake.snapshot_times") of the $((oldest - 1)) expired (those that wrote rows)"
 (( oldest <= held )) || { echo "maintenance expired snapshots bf_rich still needs"; failed=1; }
 (( oldest > 1 )) || { echo "maintenance expired nothing"; failed=1; }
 "$BIN" start bf_rich --worker w1 >/dev/null
@@ -180,6 +183,30 @@ wait_for bf_windows_10s analytics bf_windows || failed=1
 after=$(sql "SELECT count(*) FROM lake.analytics.bf_windows_10s")
 echo "bf_windows_10s: $before windows before the reset, $after after its recomputation"
 verify_views bf_windows bf_windows_10s bf_by_game bf_busy || failed=1
+
+log "reset to epoch 0 after the start snapshot expired, and a rerun of a latest view's create"
+stop_view() {
+  "$BIN" stop "$1" >/dev/null
+  for _ in $(seq 1 30); do grep -q "job released.*job=$1" "$OUT/worker.log" && break; sleep 1; done
+}
+s0=$(sql "SELECT json_extract(definition, '\$.start_snapshot') FROM lake.__duckwake.jobs WHERE job_id = 'bf_rich'")
+oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
+(( s0 < oldest )) && echo "bf_rich's start snapshot $s0 has expired (oldest $oldest)" || { echo "bf_rich's start snapshot $s0 is still there: nothing to test"; failed=1; }
+for v in bf_rich bf_latest; do
+  stop_view "$v"
+  "$BIN" reset "$v" --to-epoch 0 | sed -n 1p || failed=1
+done
+# A deploy reruns the create of a `start latest` view after its reset: nothing changed.
+out=$(create bf_latest --if-exists update --start latest --sql "SELECT id, game_id, amount FROM shop.accounts" 2>&1) || true
+echo "$out" | sed -n 1p
+[[ $out == unchanged* ]] || { echo "rerunning bf_latest's create did not report unchanged"; failed=1; }
+for v in bf_rich bf_latest; do "$BIN" start "$v" --worker w1 >/dev/null; done
+for v in bf_rich bf_latest; do wait_for "$v" shop accounts || failed=1; done
+verify_views bf_rich bf_latest || failed=1
+rich=$(sql "SELECT count(*) FROM lake.analytics.bf_rich"); want=$(sql "SELECT count(*) FROM lake.shop.accounts WHERE amount >= 90")
+[[ $rich == "$want" ]] && echo "bf_rich recomputed: all $rich matching rows" || { echo "bf_rich holds $rich rows, the table $want"; failed=1; }
+latest=$(sql "SELECT count(*) FROM lake.analytics.bf_latest")
+(( latest < ROWS )) && echo "bf_latest recomputed: $latest rows, still only those written after it was created" || { echo "bf_latest holds $latest rows"; failed=1; }
 stop_worker
 
 if (( failed )); then echo "FAILED"; exit 1; fi

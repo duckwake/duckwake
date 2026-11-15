@@ -9,7 +9,7 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 - **Backfill of views over lake tables and other views (F3).** A new view starts from the rows its inputs
   already hold (`start := 'earliest'`, the default; `--start latest` keeps the old behaviour), read at the
-  view's first snapshot `max_rows` rows per epoch and then the changes after it; it continues where it stopped
+  snapshot current when the view was created, `max_rows` rows per epoch and then the changes after it; it continues where it stopped
   after a crash, and windows close only once it is done. Maintenance no longer expires a snapshot a view still
   needs, paused and stopped views included, and keeps the commit times of expired snapshots for `_commit_ts`.
   `duckwake_snapshots_held` and `duckwake_snapshots_held_seconds` show what each view holds, with the

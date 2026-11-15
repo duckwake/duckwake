@@ -303,6 +303,48 @@ pub fn commit_times_sql(upto: i64, needed: &str) -> String {
     )
 }
 
+/// A SQL condition on a `ducklake_snapshots` row: the snapshot inserted rows into a table outside DuckWake's
+/// control schema, so rows of user tables (and of views' tables) may carry its id. Heartbeats, and epochs
+/// that only moved checkpoints and leases, do not.
+pub fn wrote_user_rows_sql(conn: &Connection) -> Result<String> {
+    let m = metadata();
+    let ids: String = conn.query_row(
+        &format!(
+            "SELECT coalesce(string_agg('''' || t.table_id || '''', ', '), '') FROM {m}.ducklake_table t
+             JOIN {m}.ducklake_schema s USING (schema_id) WHERE s.schema_name = '{}'",
+            CTL.rsplit('.').next().unwrap_or(CTL)
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(format!(
+        "len(list_filter(coalesce(changes['tables_inserted_into'], []) || coalesce(changes['inlined_insert'], []),
+                         lambda x: NOT list_contains([{ids}]::VARCHAR[], x))) > 0"
+    ))
+}
+
+/// The oldest snapshot id any row a view may still read carries: the minimum `snapshot_id` over the user
+/// tables as of snapshot `at` (the oldest position a view holds), or None when they hold no rows then. Rows
+/// inserted later carry ids above `at`. A table renamed since `at` makes this fail, which callers treat as
+/// "unknown".
+pub fn oldest_row_snapshot(conn: &Connection, at: i64) -> Result<Option<i64>> {
+    let m = metadata();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.schema_name, t.table_name FROM {m}.ducklake_table t JOIN {m}.ducklake_schema s USING (schema_id)
+         WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL AND t.begin_snapshot <= ? AND s.schema_name <> '{}'",
+        CTL.rsplit('.').next().unwrap_or(CTL)
+    ))?;
+    let tables: Vec<(String, String)> = stmt.query_map([at], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<duckdb::Result<_>>()?;
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    let parts = tables
+        .iter()
+        .map(|(s, t)| Ok(format!("SELECT min(snapshot_id) AS m FROM {} AT (VERSION => {at})", quote_table(&format!("{LAKE}.{s}.{t}"))?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(conn.query_row(&format!("SELECT min(m) FROM ({})", parts.join(" UNION ALL ")), [], |r| r.get(0))?)
+}
+
 /// The DuckLake metadata schema of the lake, which holds `ducklake_table` and `ducklake_schema`.
 fn metadata() -> String {
     format!("__ducklake_metadata_{LAKE}")

@@ -17,7 +17,7 @@ change. To keep time buckets current instead, `GROUP BY time_bucket(INTERVAL 1 H
 view that another view reads is refused.
 
 A new view over lake inputs starts from the rows they already hold (`start := 'earliest'`, the default): it reads
-each input as it was at the view's first snapshot, `max_rows` rows per epoch in `rowid` order, then the changes
+each input as it was when the view was created (the snapshot S0, which it holds from then on, even while stopped), `max_rows` rows per epoch in `rowid` order, then the changes
 after that snapshot. Each row keeps the `_commit_ts` of its version. A backfill continues where it stopped after a
 crash, and a windowed view closes no window until its backfill is done. `start := 'latest'` holds only the rows
 written after the view was created. Maintenance never expires a snapshot a view still needs, from the oldest
@@ -45,7 +45,7 @@ Only in the extension:
 | Extension-only function | Does |
 | --- | --- |
 | `duckwake_connect(catalog, data_path :=)` | pick the lake |
-| `duckwake_worker_start(worker :=, stage_threads :=, pipeline :=, shared_readers :=, lean_commit :=, metrics :=)` | run a supervised worker in this process; `metrics` also serves `GET /metrics` |
+| `duckwake_worker_start(worker :=, stage_threads :=, pipeline :=, shared_readers :=, lean_commit :=, metrics :=, position_refresh :=)` | run a supervised worker in this process; `position_refresh` is `--position-refresh` (default `'5m'`); `metrics` also serves `GET /metrics` |
 | `duckwake_worker_stop()` | stop it after its current epoch |
 
 `TUMBLE(src, col, size)` and `HOP(src, col, size, slide)` are used inside the view SQL.

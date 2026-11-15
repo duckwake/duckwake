@@ -77,6 +77,11 @@ impl Maintenance {
             }
         }
         if self.due("cleanup", c.cleanup_every) {
+            match prune_times_sql(conn) {
+                Ok(Some(sql)) => run(conn, "prune snapshot times", &sql),
+                Ok(None) => {}
+                Err(e) => warn!(target: "maintenance", task = "prune snapshot times", error = %format!("{e:#}"), "skipped"),
+            }
             run(
                 conn,
                 "delete unreferenced files",
@@ -128,15 +133,46 @@ pub fn expire_sql(conn: &duckdb::Connection, older_than: Duration) -> anyhow::Re
     )?;
     let Some(cutoff) = cutoff.filter(|_| n > 0) else { return Ok(None) };
     let cutoff = format!("TIMESTAMPTZ {}", lit(&cutoff));
+    // Only the snapshots whose ids rows can carry are recorded, and the newest one expired, which carries the
+    // running maximum on: heartbeats and epochs that wrote only control tables are most snapshots.
+    let wrote = crate::lake::wrote_user_rows_sql(conn)?;
     Ok(Some(format!(
         "INSERT INTO {CTL}.snapshot_times
            SELECT snapshot_id, ts FROM (
-             SELECT snapshot_id, snapshot_time, greatest(max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id),
+             SELECT snapshot_id, snapshot_time, changes, greatest(max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id),
                     (SELECT max(commit_ts) FROM {CTL}.snapshot_times)) AS ts
              FROM ducklake_snapshots({lake}))
-           WHERE snapshot_time < {cutoff} AND snapshot_id NOT IN (SELECT snapshot_id FROM {CTL}.snapshot_times);
+           WHERE snapshot_time < {cutoff} AND snapshot_id NOT IN (SELECT snapshot_id FROM {CTL}.snapshot_times)
+             AND ({wrote} OR snapshot_id = (SELECT max(snapshot_id) FROM ducklake_snapshots({lake}) WHERE snapshot_time < {cutoff}));
          CALL ducklake_expire_snapshots({lake}, older_than => {cutoff})"
     )))
+}
+
+/// Deletes the recorded commit times no row can need any more: those of snapshots older than every row the
+/// user tables held at the oldest position a view holds (a view reads nothing older than that position, and
+/// a row live later was live then), keeping the newest record, which carries the running maximum. None when
+/// there is nothing to delete.
+pub fn prune_times_sql(conn: &duckdb::Connection) -> anyhow::Result<Option<String>> {
+    let at = match crate::catalog::lake_positions(conn)?.iter().filter_map(|p| p.snapshot).min() {
+        Some(p) => p,
+        None => crate::lake::current_snapshot(conn)?,
+    };
+    // Every live snapshot from `at` on has its time in DuckLake; so does every row inserted after `at`.
+    let floor = crate::lake::oldest_row_snapshot(conn, at)?.unwrap_or(at).min(at);
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM {CTL}.snapshot_times
+             WHERE snapshot_id < {floor} AND snapshot_id < (SELECT max(snapshot_id) FROM {CTL}.snapshot_times)"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok((n > 0).then(|| {
+        format!(
+            "DELETE FROM {CTL}.snapshot_times
+             WHERE snapshot_id < {floor} AND snapshot_id < (SELECT max(snapshot_id) FROM {CTL}.snapshot_times)"
+        )
+    }))
 }
 
 fn run(conn: &duckdb::Connection, task: &str, sql: &str) {
