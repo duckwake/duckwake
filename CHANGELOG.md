@@ -76,6 +76,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - With `--pipeline`, a view over lake tables stopped and started again soon after could lose its staged rows to
   the drop queued when its earlier run left the worker, and fail the worker ("Table with name typed_l... does
   not exist"). Each run of a view now stages into tables of its own.
+- A view dropped while its worker was staging an epoch that then failed (its input replaced, say) no longer
+  stops the worker: there is no view left to mark failed, so the worker lets it go.
+- `duckwake_verify` that failed (a view with no checkpoint yet, for one) left the SQL functions' connection
+  inside a transaction, and every later call in that session failed with "cannot start a transaction within a
+  transaction". It now rolls back.
 - A worker whose view was reset, replaced, stopped or taken over while an epoch was staging no longer marks the
   view `failed` when that epoch hits an error: the error belonged to the fenced incarnation. Before, a reset
   that emptied a windowed view could leave it failed instead of recomputing.

@@ -729,17 +729,18 @@ impl Worker {
         Ok(())
     }
 
-    /// Marks a view failed and drops it from this worker; the others go on. A view whose lease has moved on
-    /// (reset, replaced, stopped or taken over while this epoch staged) is only dropped: the error belongs to
-    /// the incarnation that was fenced.
+    /// Marks a view failed and drops it from this worker; the others go on. A view dropped meanwhile, or whose
+    /// lease has moved on (reset, replaced, stopped or taken over while this epoch staged), is only let go: the
+    /// error belongs to the run that was fenced, and a dropped view has nothing to mark.
     fn fail_job(&mut self, id: &str, why: &str) -> Result<()> {
         let held = self.jobs.get(id).map(|j| j.lease);
         let failed = match held {
             Some(lease) => catalog::fail_if_held(&self.conns[0], id, &self.cfg.worker_id, lease)?,
-            None => {
+            None if catalog::job_status(&self.conns[0], id)?.is_some() => {
                 catalog::set_status(&self.conns[0], id, crate::model::JobStatus::Failed, None)?;
                 true
             }
+            None => false,
         };
         if failed {
             warn!(job = %id, error = %why, "view stopped: marking it failed");
@@ -747,7 +748,7 @@ impl Worker {
                 m.record_view_failed();
             }
         } else {
-            info!(job = %id, error = %why, "view fenced while it failed: dropping it without marking it failed");
+            info!(job = %id, error = %why, "view dropped or fenced while it failed: letting it go without marking it failed");
         }
         self.remove_job(id);
         Ok(())

@@ -942,7 +942,7 @@ pub enum Assign<'a> {
 
 /// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
 /// Marks `job` failed for the worker that holds it at `lease`, and fences that lease. Returns false, changing
-/// nothing, when the lease has moved on: the view was reset, replaced, stopped or taken over meanwhile, and its
+/// nothing, when the view was dropped or the lease has moved on: reset, replaced, stopped or taken over meanwhile, and its
 /// new incarnation must not inherit an error its old one hit (a reset's deletes reaching an insert-only
 /// reader that is about to be recomputed, say). Check and update are one transaction, so a concurrent reset
 /// either lands first (and this returns false on retry) or after (and finds the view failed).
@@ -950,6 +950,10 @@ pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: i64) -> Re
     retry_conflicts(|| {
         conn.execute_batch("BEGIN")?;
         let res = (|| -> Result<bool> {
+            // Dropped meanwhile (with its lease table): there is no view left to mark.
+            if job_status(conn, job)?.is_none() {
+                return Ok(false);
+            }
             let (owner, lease_epoch) = lease(conn, job)?;
             if owner.as_deref() != Some(worker) || lease_epoch != held {
                 return Ok(false);
