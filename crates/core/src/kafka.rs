@@ -131,6 +131,10 @@ pub async fn client(opts: &SourceOptions) -> Result<Client> {
 /// How long a source's first connection to its brokers may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a reader may wait, once connected, for its topic's partitions to have leaders and offsets. Kept
+/// short: the worker's loop, which also heartbeats, waits on it.
+const PARTITIONS_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A plaintext client, for the test tools (`produce`, the playground's topics).
 pub async fn plain_client(brokers: &str) -> Result<Client> {
     ClientBuilder::new(broker_list(brokers)).build().await.context("connecting to Kafka")
@@ -250,28 +254,41 @@ impl Reader {
         let opts2 = opts.clone();
         let committed = committed.clone();
         let hw = high_watermarks.clone();
+        let topic = opts.topic.clone();
         let (clients, start) = rt.block_on(async move {
             let c = client(&opts2).await?;
-            let mut clients = Vec::new();
-            let mut start = BTreeMap::new();
-            for p in partitions(&c, &opts2.topic).await? {
-                let pc = partition_client(&c, &opts2.topic, p).await?;
-                let earliest = pc.get_offset(OffsetAt::Earliest).await?;
-                let latest = pc.get_offset(OffsetAt::Latest).await?;
-                hw.lock().unwrap().insert(p, latest);
-                let next = match committed.get(&p) {
-                    Some(&o) if o < earliest => bail!(
-                        "partition {p}: committed offset {o} has expired (earliest retained is {earliest}); \
-                         use reset to rewind or restart the job from earliest"
-                    ),
-                    Some(&o) => o,
-                    None if opts2.start == "latest" => latest,
-                    None => earliest,
-                };
-                start.insert(p, next);
-                clients.push((p, pc));
+            // rskafka retries a partition without a leader, and its offsets, for ever; a topic just created
+            // has none for a moment. This runs on the worker's own loop, which must not stall: past the bound
+            // the view waits for its topic and tries again at the next refresh.
+            let ready = tokio::time::timeout(PARTITIONS_READY_TIMEOUT, async move {
+                let mut clients = Vec::new();
+                let mut start = BTreeMap::new();
+                for p in partitions(&c, &opts2.topic).await? {
+                    let pc = partition_client(&c, &opts2.topic, p).await?;
+                    let earliest = pc.get_offset(OffsetAt::Earliest).await?;
+                    let latest = pc.get_offset(OffsetAt::Latest).await?;
+                    hw.lock().unwrap().insert(p, latest);
+                    let next = match committed.get(&p) {
+                        Some(&o) if o < earliest => bail!(
+                            "partition {p}: committed offset {o} has expired (earliest retained is {earliest}); \
+                             use reset to rewind or restart the job from earliest"
+                        ),
+                        Some(&o) => o,
+                        None if opts2.start == "latest" => latest,
+                        None => earliest,
+                    };
+                    start.insert(p, next);
+                    clients.push((p, pc));
+                }
+                anyhow::Ok((clients, start))
+            });
+            match ready.await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::Error::new(TopicMissing(topic.clone())).context(format!(
+                    "topic {topic:?}: its partitions had no leader within {} s",
+                    PARTITIONS_READY_TIMEOUT.as_secs()
+                ))),
             }
-            anyhow::Ok((clients, start))
         })?;
         let mut tasks = Vec::new();
         for (p, pc) in clients {
