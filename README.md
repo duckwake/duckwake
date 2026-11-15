@@ -48,6 +48,7 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 ## Docs
 
 - [SQL functions](docs/sql.md): every `duckwake_*` function and its CLI equivalent
+- [dbt-duckwake](dbt/README.md): sources and views as dbt models, on dbt-duckdb
 - [Performance](docs/performance.md): the worker flags and the benchmarks
 - [Testing](docs/testing.md): what has been verified, and how to run the tests
 - [Internals](docs/internals.md): how the code maps to the design, findings, gaps and layout
@@ -66,7 +67,8 @@ need it insert-only). Workers heartbeat into the lake: the views of a worker tha
 and views spread to workers that join, by measured load. Views can be replaced and sources gain columns while
 they run; per-view limits fail one view instead of its worker, and a worker short of memory shrinks its epochs.
 Sources connect with SASL (PLAIN, SCRAM) and TLS, data files can live on S3, and no
-credential is stored in the lake. Every test checks the views against the same SQL run as one batch query. Not yet:
+credential is stored in the lake. Every test checks the views against the same SQL run as one batch query. Views and sources can also be
+authored as dbt models with the [dbt-duckwake](dbt/README.md) package. Not yet:
 `CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.
 

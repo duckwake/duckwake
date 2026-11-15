@@ -1,0 +1,20 @@
+# The example: the test suite's views as a dbt project, run by scripts/dbt_test.sh.
+name: duckwake_example
+version: '0.1.0'
+config-version: 2
+profile: duckwake_example
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+on-run-start: "{{ duckwake.duckwake_setup() }}"
+on-run-end: "{{ duckwake.duckwake_wait_built(results) }}"
+
+models:
+  duckwake_example:
+    +database: lake
+    sources:
+      +materialized: streaming_source
+    analytics:
+      +materialized: streaming_view
+      +schema: analytics
+      +epoch_interval: "{{ var('epoch_interval', '2s') }}"

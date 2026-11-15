@@ -19,11 +19,14 @@ extension. dbt gives files, review, CI, `ref()` order, tests and docs with no C+
 2. Backfill of new views over lake inputs (F3) - built 2026-11-15 on branch `f3-backfill` (`start := 'earliest'`
    default, P_min retention, held-snapshot metrics, reset cascade; gate `scripts/backfill_test.sh`). The package
    can create and start each view as dbt builds it; the stopped-then-started workaround is no longer needed.
-3. The package: a Jinja-only dbt package on dbt-duckdb in a `dbt/` folder, with `streaming_source` and
-   `streaming_view` materializations, an example project and a CI suite. A plain `dbt run` never recomputes:
-   unchanged does nothing, settings go through `alter_view`, a changed query fails until `--full-refresh`
-   (stricter than dbt-risingwave, which ignores a changed query).
+3. The package - built 2026-11-15 on branch `dbt-duckwake` (stacked on `f3-backfill`) in `dbt/`: Jinja-only on
+   dbt-duckdb 1.11 / DuckDB 2.0.0, `streaming_source` and `streaming_view` materializations, `duckwake_verified`,
+   `duckwake_wait_built`, `duckwake_drop_orphans`, an example project in `dbt/example`, CI suite
+   `scripts/dbt_test.sh`. A plain `dbt run` never recomputes; a changed query fails until `--full-refresh`, which
+   needs the readers selected (`-s view+`) and drops and recreates them.
 4. Later: zero-downtime replace (build beside, catch up, swap in one DuckLake transaction).
 
-Open: whether dbt-duckdb can install our extension from a repository URL; how `ref()`'s quoted three-part
-names reach DuckWake's compiler. Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).
+Answered: dbt-duckdb installs the extension from a repository path or URL (`repo:` needs its own quotes;
+`config_options: {allow_unsigned_extensions: true}`); the compiler accepts quoted `"lake"."schema"."table"`, and
+the package rewrites `ref()` to a source model into the bare source name. Next: a repository of its own
+(`duckwake/dbt-duckwake`) for dbt Hub, once the user wants it listed. Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).

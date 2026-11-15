@@ -1,0 +1,25 @@
+# DuckDB in memory, with the DuckWake extension (unsigned until it is a signed community extension) and the
+# lake attached as `lake`, so dbt's tests read the views' tables. DUCKWAKE_CATALOG is the catalog as the CLI
+# takes it (postgres:dbname=... host=...), DUCKWAKE_DATA_PATH the data path, and DUCKWAKE_EXTENSION_REPO the
+# extension repository (scripts/package_extension.sh lays one out in dist/extensions).
+duckwake_example:
+  target: test
+  outputs:
+    test:
+      type: duckdb
+      path: ':memory:'
+      config_options:
+        allow_unsigned_extensions: true
+        # Its own extension directory: INSTALL never replaces an extension already installed, so a newer DuckWake
+        # build needs a fresh directory (the test suite clears DuckWake from this one) or FORCE INSTALL.
+        extension_directory: "{{ env_var('DUCKWAKE_DUCKDB_EXTENSIONS', '.lake/duckdb_extensions') }}"
+      extensions:
+        - ducklake
+        - postgres
+        - name: duckwake
+          # dbt-duckdb pastes this into INSTALL ... FROM as is: a path or URL needs its own quotes.
+          repo: "'{{ env_var('DUCKWAKE_EXTENSION_REPO') }}'"
+      attach:
+        - path: "ducklake:{{ env_var('DUCKWAKE_CATALOG') }}"
+          alias: lake
+          options: {data_path: "{{ env_var('DUCKWAKE_DATA_PATH') }}"}

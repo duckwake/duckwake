@@ -85,8 +85,9 @@ default.
   settings go through `alter_view`, a changed query fails until `--full-refresh`. In order:
   1. `create_view` reports what changed (`if_exists := 'fail' | 'update' | 'replace'`), also in the CLI.
   2. Backfill of new views over lake inputs (F3, below). Built 2026-11-15 (`scripts/backfill_test.sh`).
-  3. The package, an example project and a CI suite against the compose stack; later, replacing a view
-     without downtime (build beside it, catch up, swap in one DuckLake transaction).
+  3. The package, an example project and a CI suite against the compose stack. Built 2026-11-15 in `dbt/`
+     (`scripts/dbt_test.sh`). Later: replacing a view without downtime (build beside it, catch up, swap in
+     one DuckLake transaction), and the package in a repository of its own for dbt Hub.
 
   Design, and how dbt-risingwave does it, in [dbt-duckwake](design/dbt-duckwake.md).
 - More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)

@@ -165,16 +165,16 @@ Two engine changes, then the package; each is its own PR with its own CI suite.
 
 1. **Create what changed (engine). Built 2026-11-14, branch `create-view-if-exists`.** `duckwake_create_view(…, if_exists := 'fail' | 'update' | 'replace')`, and `--if-exists` in the CLI. `update` does nothing when the query and settings match, runs `alter_view` when only settings differ, and fails when what the view computes differs (query, table, late-data table, checkpoint, inlining); whitespace outside quotes and a trailing `;` are not a change. `replace` recomputes. The result's first word says which (`created`, `unchanged`, `altered`, `replaced`). Tested in `schema_test.sh` (CLI, two running workers, every view verified) and `serve_test.sh` (the SQL function over Quack).
 2. **Backfill (engine, F3). Built 2026-11-15, branch `f3-backfill`, tested in `scripts/backfill_test.sh`.** A new view over a lake table or a view starts from its input's current rows (a snapshot read) and then follows the change feed, exactly once.
-3. **The package (dbt-duckwake v0).** `streaming_source` and `streaming_view`, the rerun rules above, `duckwake_wait` before readers are built, the `duckwake_verified` test, and an example project. A CI suite runs the example against the Docker stack: deploy, rerun with no change, change a setting, change a query with `--full-refresh`, add a view over a running one, verify every view.
+3. **The package (dbt-duckwake v0). Built 2026-11-15, branch `dbt-duckwake`, in `dbt/`, tested in `scripts/dbt_test.sh`.** Departures: a view the run creates is started at once (with backfill there is no first-deploy rule to keep); `--full-refresh` of a view drops its selected readers and creates them again after it, since the engine refuses to replace a view others read; a source that changes other than gaining columns fails even with `--full-refresh`, as there is no SQL function to drop a source yet. `streaming_source` and `streaming_view`, the rerun rules above, `duckwake_wait` before readers are built, the `duckwake_verified` test, and an example project. A CI suite runs the example against the Docker stack: deploy, rerun with no change, change a setting, change a query with `--full-refresh`, add a view over a running one, verify every view.
 4. **Later.** Zero-downtime replace (build `<name>__next`, wait for it to catch up, swap in one DuckLake transaction), and `store_failures` as a streaming view, as dbt-risingwave does.
 
 ## Open questions
 
-- [ ] `ref()` rendering: does the package control how a model's name renders, or does DuckWake's compiler accept quoted three-part names?
-- [ ] Where the package lives: a `dbt/` folder in this repo first (one CI, one release), then `duckwake/dbt-duckwake` once it is stable?
-- [ ] Connection: the extension in the dbt session (needs unsigned extensions until signed), or `duckwaked` through `quack_query`?
-- [ ] Should `streaming_source` keep Kafka passwords as `env:` or `file:` references from dbt's own `env_var()`?
-- [ ] Does a `--full-refresh` of a source cascade to its readers, or only fail and name them?
+- [x] `ref()` rendering: DuckWake's compiler accepts quoted three-part names of lake tables and views (`"lake"."analytics"."x"`); the materialization rewrites a `ref()` to a source model into the source's bare name.
+- [x] Where the package lives: a `dbt/` folder in this repo (one CI, one release), installed with dbt's `subdirectory:`; `duckwake/dbt-duckwake` once it is listed on dbt Hub, which needs `dbt_project.yml` at a repository's root.
+- [x] Connection: the extension in the dbt session. dbt-duckdb installs it from a repository path or URL (`repo:` must carry its own quotes, as dbt-duckdb pastes it into `INSTALL ... FROM`), with `config_options: {allow_unsigned_extensions: true}`; `settings:` is applied too late.
+- [x] Kafka passwords stay `env:` or `file:` references, which the engine requires; a model never holds the password.
+- [ ] Does a `--full-refresh` of a source cascade to its readers, or only fail and name them? (For now any change but new columns fails; a source can't be dropped through SQL yet.)
 
 ## Sources
 
