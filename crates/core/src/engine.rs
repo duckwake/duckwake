@@ -22,7 +22,7 @@ use crate::circuit::{Circuit, Cost, Counter, EpochCtx, SourceInput};
 use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
-use crate::model::{parse_duration, JobDef, LakeInput, SourceDef, COMMIT_TS};
+use crate::model::{parse_duration, JobDef, LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
 use crate::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
@@ -63,6 +63,10 @@ pub struct WorkerConfig {
     pub lean_commit: bool,
     /// Live per-view numbers for a metrics endpoint.
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// How long a view with lake inputs may leave its position behind the lake's newest snapshot when it has
+    /// nothing to write: after that it commits the position alone, so an idle view does not keep maintenance
+    /// from expiring snapshots.
+    pub position_refresh: Duration,
 }
 
 struct JobRuntime {
@@ -110,8 +114,10 @@ enum Feed {
     /// A Kafka source, read by a reader group.
     Kafka { group: u64 },
     /// A lake table or view, read through its change feed by the job itself. Its position is the last
-    /// snapshot read, kept as partition 0 of the input's offsets; `commit_us` is `_commit_ts` at that
-    /// snapshot, carried so the running maximum continues across epochs.
+    /// snapshot read, kept as partition 0 of the input's offsets (`LAKE_POSITION`); `commit_us` is
+    /// `_commit_ts` at that snapshot, carried so the running maximum continues across epochs. While the view
+    /// backfills, the position stays at its start snapshot and partition 1 (`LAKE_BACKFILL`) holds the last
+    /// row id read there.
     Lake { lake: Arc<LakeInput>, commit_us: Option<i64> },
 }
 
@@ -224,6 +230,8 @@ struct StagedInput {
     /// Lake inputs: `_commit_ts` at the snapshot read up to, and how many snapshots the lake is ahead of it.
     commit_us: Option<i64>,
     snapshots_behind: i64,
+    /// Lake inputs: this epoch read the last page of the input's backfill.
+    backfill_done: bool,
 }
 
 /// A view's lease table is gone: the view was dropped while this worker still ran it. Its epoch is fenced,
@@ -468,6 +476,7 @@ fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Resul
     Ok(Worker {
         rows_cap,
         last_targets: None,
+        held_checked: None,
         liveness,
         last_heartbeat: Instant::now(),
         last_rebalance: Instant::now(),
@@ -541,6 +550,8 @@ struct Worker {
     rows_cap: Option<usize>,
     /// When the scrape targets were last read from the lake.
     last_targets: Option<Instant>,
+    /// When the snapshots each view holds were last read (`report_held_snapshots`).
+    held_checked: Option<Instant>,
 }
 
 /// How often a worker heartbeats: well inside the lease timeout, and at least every 5 s so workers with a
@@ -624,6 +635,34 @@ impl Worker {
         Ok(())
     }
 
+    /// The snapshots each view with lake inputs holds, from its position to the lake's newest: for the views
+    /// this worker runs, and for those no worker runs (paused, stopped or failed), which hold snapshots too.
+    /// Read every `STATE_CHECK_EVERY`.
+    fn report_held_snapshots(&mut self, m: &Arc<crate::metrics::Metrics>) -> Result<()> {
+        if self.held_checked.is_some_and(|t| t.elapsed() < STATE_CHECK_EVERY) {
+            return Ok(());
+        }
+        self.held_checked = Some(Instant::now());
+        let positions = catalog::lake_positions(&self.conns[0])?;
+        let running: HashSet<String> = catalog::running_jobs(&self.conns[0])?.into_iter().filter(|j| j.owner.is_some()).map(|j| j.id).collect();
+        let current = crate::lake::current_snapshot(&self.conns[0])?;
+        let mut held = BTreeMap::new();
+        for p in positions {
+            let Some(at) = p.snapshot else { continue };
+            if !(self.jobs.contains_key(&p.job) || !running.contains(&p.job)) {
+                continue;
+            }
+            let since: Option<i64> = self.conns[0].query_row(
+                &format!("SELECT epoch_us(max(snapshot_time)) FROM ducklake_snapshots({}) WHERE snapshot_id = ?", lit(LAKE)),
+                [at],
+                |r| r.get(0),
+            )?;
+            held.insert(p.job, (current - at, since));
+        }
+        m.set_snapshots_held(held);
+        Ok(())
+    }
+
     /// Reads the size of each stateful view's state every `STATE_CHECK_EVERY` (the state as last committed),
     /// and fails a view whose state has outgrown its `max_state_rows`: the worker and its other views go on.
     fn check_limits(&mut self) -> Result<()> {
@@ -632,7 +671,8 @@ impl Worker {
             m.set_targets(failover::scrape_targets(&self.conns[0])?);
             self.last_targets = Some(Instant::now());
         }
-        if let Some(m) = &self.cfg.metrics {
+        if let Some(m) = self.cfg.metrics.clone() {
+            self.report_held_snapshots(&m)?;
             let (used, spilled, limit): (i64, i64, String) = self.conns[0].query_row(
                 "SELECT coalesce(sum(memory_usage_bytes), 0)::BIGINT, coalesce(sum(temporary_storage_bytes), 0)::BIGINT,
                         current_setting('memory_limit') FROM duckdb_memory()",
@@ -671,12 +711,25 @@ impl Worker {
         Ok(())
     }
 
-    /// Marks a view failed and drops it from this worker; the others go on.
+    /// Marks a view failed and drops it from this worker; the others go on. A view whose lease has moved on
+    /// (reset, replaced, stopped or taken over while this epoch staged) is only dropped: the error belongs to
+    /// the incarnation that was fenced.
     fn fail_job(&mut self, id: &str, why: &str) -> Result<()> {
-        warn!(job = %id, error = %why, "view stopped: marking it failed");
-        catalog::set_status(&self.conns[0], id, crate::model::JobStatus::Failed, None)?;
-        if let Some(m) = &self.cfg.metrics {
-            m.record_view_failed();
+        let held = self.jobs.get(id).map(|j| j.lease);
+        let failed = match held {
+            Some(lease) => catalog::fail_if_held(&self.conns[0], id, &self.cfg.worker_id, lease)?,
+            None => {
+                catalog::set_status(&self.conns[0], id, crate::model::JobStatus::Failed, None)?;
+                true
+            }
+        };
+        if failed {
+            warn!(job = %id, error = %why, "view stopped: marking it failed");
+            if let Some(m) = &self.cfg.metrics {
+                m.record_view_failed();
+            }
+        } else {
+            info!(job = %id, error = %why, "view fenced while it failed: dropping it without marking it failed");
         }
         self.remove_job(id);
         Ok(())
@@ -849,7 +902,12 @@ impl Worker {
     /// at the position of a group of its source joins that group. Returns false when the job is not ours.
     fn start_job(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
-        let (def, sources) = catalog::load_compiled(conn, id)?;
+        let (mut def, sources) = catalog::load_compiled(conn, id)?;
+        // Recomputed by a cascaded reset: it starts from the snapshot current now.
+        if !def.lake_inputs.is_empty() && def.start_snapshot.is_none() {
+            let d = catalog::take_start_snapshot(conn, id)?;
+            (def.start_snapshot, def.start_commit_us) = (d.start_snapshot, d.start_commit_us);
+        }
         let names = def.plan.sources();
         // Every Kafka topic must exist before the lease is taken: a job waiting for its topic retries each
         // refresh, and taking the lease each time would commit a snapshot for nothing.
@@ -870,18 +928,36 @@ impl Worker {
             let start = catalog::latest_checkpoint(conn, id, name)?.map(|c| c.offsets).unwrap_or_default();
             if let Some(lake) = def.lake_inputs.iter().find(|l| &l.name == name) {
                 // The last snapshot read, or the one current when the view was created.
-                let position = start.get(&0).copied().or(def.start_snapshot).context("lake input without a start snapshot")?;
+                let s0 = def.start_snapshot.context("lake input without a start snapshot")?;
+                let position = start.get(&LAKE_POSITION).copied().unwrap_or(s0);
+                // Where a backfill stands: the cursor in the checkpoint, or before the first row when the
+                // view has not committed yet. No cursor in a checkpoint means the backfill is done.
+                let cursor = start.get(&LAKE_BACKFILL).copied().or((def.backfill && ckpt.epoch == 0).then_some(-1));
+                if !crate::lake::snapshot_exists(conn, position)? {
+                    anyhow::bail!(
+                        "view {id}: its position in {}, snapshot {position}, has expired (the oldest snapshot the lake has \
+                         is {}), so the changes after it are gone. Recompute the view from its inputs' current rows: \
+                         create-view --replace (replace := true)",
+                        lake.table,
+                        crate::lake::oldest_snapshot(conn)?
+                    );
+                }
                 let commit_us: Option<i64> = conn.query_row(
                     &format!("SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id <= ?", lit(LAKE)),
                     [position],
                     |r| r.get(0),
                 )?;
-                info!(job = %id, input = %name, table = %lake.table, snapshot = position, "reading change feed");
+                match cursor {
+                    Some(c) => info!(job = %id, input = %name, table = %lake.table, snapshot = position, after_row = c, "backfilling"),
+                    None => info!(job = %id, input = %name, table = %lake.table, snapshot = position, "reading change feed"),
+                }
+                let mut offsets = BTreeMap::from([(LAKE_POSITION, position)]);
+                offsets.extend(cursor.map(|c| (LAKE_BACKFILL, c)));
                 inputs.push(Input {
                     name: name.clone(),
                     columns: Arc::new(lake.columns.clone()),
                     feed: Feed::Lake { lake: Arc::new(lake.clone()), commit_us },
-                    offsets: BTreeMap::from([(0, position)]),
+                    offsets,
                     part_max_ts: HashMap::new(),
                     part_last_data: HashMap::new(),
                     watermark_us: ckpt.watermark_us,
@@ -1151,9 +1227,14 @@ impl Worker {
         // Nothing new and no window can close: skip the commit instead of writing an empty snapshot. A view
         // with lake inputs sees its watermark move with every snapshot, its own commits' included, so for it
         // only rows or a closing window count.
+        // The end of a backfill is committed even without rows, and so is a lake position left behind for
+        // `position_refresh`: maintenance keeps every snapshot from the oldest position on.
         let worth = |j: &JobRuntime, s: &Staged| {
             s.rows_in > 0
                 || (s.watermark_us != j.watermark_us && (j.def.lake_inputs.is_empty() || (j.def.plan.is_windowed() && s.closes)))
+                || s.inputs.iter().any(|i| i.backfill_done)
+                || (j.last_commit.unwrap_or(j.started).elapsed() >= cfg.position_refresh
+                    && j.inputs.iter().zip(&s.inputs).any(|(i, si)| i.group().is_none() && si.offsets != i.offsets))
         };
         // (Nothing worth it means no remaining job's group read events, so none are lost by skipping.)
         if !staged.iter().any(|(id, s)| worth(&jobs[id], s)) {
@@ -1363,17 +1444,18 @@ fn stage_source(
 /// maximum of `snapshot_time` from `carried` on, and the weight `__w` of each change. Reads the lake and writes
 /// only the memory catalog. Returns the staged input and `_commit_ts` at `to`.
 ///
-/// The view holds the rows written after `start`, the snapshot it was created at. An input that retracts
-/// stages a delete or an update's old version with the `_commit_ts` of the version it removes, so it cancels
-/// the row the view took in, and drops it when that version is from before `start`: the view never had it.
-/// An insert-only input must stay so: an update or delete stops the view.
+/// The view holds every row of the input (a backfilled view), or the rows written after its floor, the
+/// snapshot a `start := 'latest'` view was created at. An input that retracts stages a delete or an
+/// update's old version with the `_commit_ts` of the version it removes, so it cancels the row the view took
+/// in, and drops it when that version is from the floor or before: the view never had it. An insert-only
+/// input must stay so: an update or delete stops the view.
 #[allow(clippy::too_many_arguments)]
 fn stage_lake(
     conn: &Connection,
     job: &str,
     k: usize,
     lake: &LakeInput,
-    start: i64,
+    def: &JobDef,
     from: i64,
     to: i64,
     carried: Option<i64>,
@@ -1385,7 +1467,7 @@ fn stage_lake(
     let staged = |rows_in: usize| SourceStaged {
         typed: typed.clone(),
         dead: String::new(),
-        offsets: BTreeMap::from([(0, to.max(from))]),
+        offsets: BTreeMap::from([(LAKE_POSITION, to.max(from))]),
         active: vec![],
         part_max: vec![],
         rows_in,
@@ -1442,7 +1524,7 @@ fn stage_lake(
         .into());
     }
     if retracted > 0 {
-        retraction_versions(conn, job, &typed, lake, &schema, &table, start, from, to)?;
+        retraction_versions(conn, job, &typed, lake, &schema, &table, def, from, to)?;
     }
     let rows_in: i64 = conn.query_row(&format!("SELECT count(*) FROM {typed}"), [], |r| r.get(0))?;
     let newest: Option<i64> = conn.query_row(
@@ -1463,8 +1545,7 @@ fn stage_lake(
 /// Gives each retraction staged in `typed` (a delete, or an update's old version) the version it removes:
 /// the newest earlier write of its row in the range, or else its version at `from`, the snapshot read up to
 /// (row ids stay with a row through updates and are never reused). A retraction of a version written at or
-/// before `start` is dropped; any other gets that version's `_commit_ts`, the running maximum of
-/// `snapshot_time` up to the snapshot that wrote it.
+/// before the view's floor is dropped; any other gets that version's `_commit_ts` (`row_commit_ts`).
 #[allow(clippy::too_many_arguments)]
 fn retraction_versions(
     conn: &Connection,
@@ -1473,7 +1554,7 @@ fn retraction_versions(
     lake: &LakeInput,
     schema: &str,
     table: &str,
-    start: i64,
+    def: &JobDef,
     from: i64,
     to: i64,
 ) -> Result<()> {
@@ -1510,18 +1591,83 @@ fn retraction_versions(
         .into());
     }
     let key = "t._partition = v._partition AND t._offset = v._offset AND t._change = v._change";
+    if let Some(floor) = def.floor() {
+        conn.execute_batch(&format!("DELETE FROM {typed} t USING {versions} v WHERE {key} AND v.written <= {floor}"))?;
+        conn.execute_batch(&format!("DELETE FROM {versions} WHERE written <= {floor}"))?;
+    }
     conn.execute_batch(&format!(
-        "DELETE FROM {typed} t USING {versions} v WHERE {key} AND v.written <= {start};
-         UPDATE {typed} t SET {ct} = s.ts
-         FROM {versions} v JOIN (
-           SELECT snapshot_id, max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id) AS ts
-           FROM ducklake_snapshots({lake_lit}) WHERE snapshot_id <= {to}) s ON s.snapshot_id = v.written
-         WHERE {key} AND v.written > {start};
+        "UPDATE {typed} t SET {ct} = v.ts
+         FROM (SELECT v.*, {ts} AS ts FROM {versions} v LEFT JOIN ({times}) s ON s.snapshot_id = v.written) v
+         WHERE {key};
          DROP TABLE {versions};",
         ct = ident(COMMIT_TS),
-        lake_lit = lit(LAKE),
+        ts = row_commit_ts(def),
+        times = crate::lake::commit_times_sql(to, &format!("SELECT written FROM {versions}")),
     ))?;
     Ok(())
+}
+
+/// The `_commit_ts` of a row version, given its writing snapshot's time as `s.ts` (NULL when unknown): that
+/// time, or `_commit_ts` at the view's start snapshot for a version whose snapshot expired before DuckWake's
+/// maintenance recorded its time.
+pub(crate) fn row_commit_ts(def: &JobDef) -> String {
+    match def.start_commit_us {
+        Some(us) => format!("coalesce(s.ts, make_timestamp({us}))"),
+        None => "s.ts".into(),
+    }
+}
+
+/// Stages one page of the backfill of a job's `k`-th input, a lake input: up to `max_rows` of the rows the
+/// table held at the start snapshot `s0`, in row-id order after `cursor`, as inserts in the layout
+/// `stage_lake` gives changes. The staged offsets keep the cursor at the last row read, or drop it when this
+/// was the last page: the input then follows the changes after `s0`. A crash replays the page from the
+/// committed cursor, so no row is read twice or skipped.
+fn stage_backfill(conn: &Connection, job: &str, k: usize, lake: &LakeInput, def: &JobDef, s0: i64, cursor: i64) -> Result<SourceStaged> {
+    let t = Instant::now();
+    let typed = lake_typed(job, k);
+    let (schema, table) = crate::lake::table_by_id(conn, lake.table_id)?
+        .ok_or_else(|| StopJob(format!("{} (DuckLake table id {}) was dropped", lake.table, lake.table_id)))?;
+    let tbl = quote_table(&format!("{LAKE}.{schema}.{table}"))?;
+    let select: Vec<String> =
+        lake.columns.iter().filter(|(c, _)| c != COMMIT_TS).map(|(c, ty)| format!("CAST(p.{} AS {ty}) AS {}", ident(c), ident(c))).collect();
+    let rows = if lake.counted { format!("p.{}", ident(crate::circuit::ops::COUNT_COLUMN)) } else { "1".into() };
+    let floor = def.floor().map(|f| format!(" AND t.snapshot_id > {f}")).unwrap_or_default();
+    let page = mem("typed", &format!("p{job}_{k}"));
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE {page} AS
+           SELECT t.rowid AS __rid, t.snapshot_id AS __sid, t.* FROM {tbl} AS t AT (VERSION => {s0})
+           WHERE t.rowid > {cursor}{floor} ORDER BY t.rowid LIMIT {limit};
+         CREATE OR REPLACE TABLE {typed} AS
+           SELECT p.__sid::INTEGER AS _partition, p.__rid::BIGINT AS _offset, NULL::VARCHAR AS payload,
+                  'insert' AS _change, {select}, {ts} AS {commit_ts}, NULL::VARCHAR AS _err, ({rows})::INTEGER AS __w
+           FROM {page} p LEFT JOIN ({times}) s ON s.snapshot_id = p.__sid;
+         DROP TABLE {page};",
+        limit = def.max_rows,
+        select = select.join(", "),
+        ts = row_commit_ts(def),
+        commit_ts = ident(COMMIT_TS),
+        times = crate::lake::commit_times_sql(s0, &format!("SELECT __sid FROM {page}")),
+    ))
+    .with_context(|| format!("backfilling {} at snapshot {s0}", lake.table))?;
+    let (rows_in, last): (i64, Option<i64>) =
+        conn.query_row(&format!("SELECT count(*), max(_offset) FROM {typed}"), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut offsets = BTreeMap::from([(LAKE_POSITION, s0)]);
+    // A full page: there may be more. A short one is the last.
+    if rows_in as usize >= def.max_rows {
+        offsets.insert(LAKE_BACKFILL, last.unwrap_or(cursor));
+    }
+    Ok(SourceStaged {
+        typed,
+        dead: String::new(),
+        offsets,
+        active: vec![],
+        part_max: vec![],
+        rows_in: rows_in as usize,
+        rows_sql: 0,
+        bisections: 0,
+        rows_dead: 0,
+        stage_ms: t.elapsed().as_millis(),
+    })
 }
 
 /// The watermark of view `job` as of snapshot `at`: the one its newest checkpoint up to then recorded.
@@ -1543,15 +1689,25 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
 
     // Lake inputs, read to one snapshot S for all of them: a transaction that changed two of their tables
     // upstream is seen whole or not at all.
+    // While any of them backfills, each reads a page of its rows at the start snapshot (or nothing, once its
+    // own backfill is done) and no changes: they all stay at the start snapshot until every backfill is done.
     let mut lakes: Vec<Option<(SourceStaged, Option<i64>, i64)>> = (0..j.inputs.len()).map(|_| None).collect();
+    let mut backfilling = vec![false; j.inputs.len()];
     if j.inputs.iter().any(|i| i.group().is_none()) {
         let current = crate::lake::current_snapshot(conn)?;
-        let from = j.inputs.iter().filter(|i| i.group().is_none()).map(|i| i.offsets[&0]).min().unwrap();
-        let to = current.min(from + MAX_SNAPSHOTS).max(from);
+        let from = j.inputs.iter().filter(|i| i.group().is_none()).map(|i| i.offsets[&LAKE_POSITION]).min().unwrap();
+        let any_backfill = j.inputs.iter().any(|i| i.offsets.contains_key(&LAKE_BACKFILL));
+        let to = if any_backfill { from } else { current.min(from + MAX_SNAPSHOTS).max(from) };
         for (k, input) in j.inputs.iter().enumerate() {
             if let Feed::Lake { lake, commit_us } = &input.feed {
-                let start = def.start_snapshot.context("lake input without a start snapshot")?;
-                let (s, commit) = stage_lake(conn, id, k, lake, start, input.offsets[&0], to, *commit_us)?;
+                let (s, commit) = match input.offsets.get(&LAKE_BACKFILL) {
+                    Some(&cursor) => {
+                        let s = stage_backfill(conn, id, k, lake, &def, input.offsets[&LAKE_POSITION], cursor)?;
+                        backfilling[k] = s.offsets.contains_key(&LAKE_BACKFILL);
+                        (s, *commit_us)
+                    }
+                    None => stage_lake(conn, id, k, lake, &def, input.offsets[&LAKE_POSITION], to, *commit_us)?,
+                };
                 lakes[k] = Some((s, commit, current - to));
             }
         }
@@ -1564,16 +1720,22 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
     // has its `window_end` above.
     let window_col = plan.window.as_ref().map(|w| (plan.source.clone(), w.time_col.clone()));
     let mut watermarks: Vec<Option<i64>> = Vec::new();
-    for (input, (src, lake)) in j.inputs.iter_mut().zip(srcs.iter().zip(&lakes)) {
+    for (k, (input, (src, lake))) in j.inputs.iter_mut().zip(srcs.iter().zip(&lakes)).enumerate() {
         let Some((_, commit_us, _)) = lake else {
             watermarks.push(input.advance(src));
             continue;
         };
+        // A backfill reads rows in row-id order, not commit order: the watermark waits for its last page,
+        // then takes the start snapshot's.
+        if backfilling[k] {
+            watermarks.push(input.watermark_us);
+            continue;
+        }
         let Feed::Lake { lake: l, .. } = &input.feed else { unreachable!() };
         let candidate = match window_col.as_ref().filter(|(s, _)| *s == input.name).map(|(_, c)| c.as_str()) {
             Some(c @ ("window_start" | "window_end")) => {
                 let up = l.view.as_deref().context("window columns of a lake input without a view")?;
-                let w = watermark_at(conn, up, src.offsets[&0])?;
+                let w = watermark_at(conn, up, src.offsets[&LAKE_POSITION])?;
                 if c == "window_end" { w } else { w.map(|w| w - l.window_size_us.unwrap_or(0)) }
             }
             _ => *commit_us,
@@ -1642,12 +1804,14 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
         .iter()
         .zip(watermarks)
         .zip(&lakes)
-        .map(|((src, w), l)| StagedInput {
+        .zip(&j.inputs)
+        .map(|(((src, w), l), input)| StagedInput {
             offsets: src.offsets.clone(),
             watermark_us: w,
             rows_dead: src.rows_dead,
             commit_us: l.as_ref().and_then(|(_, c, _)| *c),
             snapshots_behind: l.as_ref().map_or(0, |(_, _, b)| *b),
+            backfill_done: input.offsets.contains_key(&LAKE_BACKFILL) && !src.offsets.contains_key(&LAKE_BACKFILL),
         })
         .collect();
     Ok(Staged {

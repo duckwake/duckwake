@@ -146,7 +146,9 @@ The defaults lean the way dbt-risingwave's do (nothing happens by surprise), exc
 
 ## The backfill gap
 
-A new DuckWake view over a lake table or another view sees only the changes made after it was created; filling it from existing rows is roadmap item F3. RisingWave backfills every new view, and dbt workflows assume that.
+Built (F3, branch `f3-backfill`): a new view over a lake table or another view now starts from the rows its inputs already hold, so the two rules below are no longer needed and the package can create and start each view as dbt builds it. The rest of this section is the problem as it stood.
+
+Before F3, a new DuckWake view over a lake table or another view saw only the changes made after it was created. RisingWave backfills every new view, and dbt workflows assume that.
 
 The failure is silent. `clicks_per_min` has run for a week; someone adds `top_games`, which reads it, and runs `dbt run -s top_games`. The view is created and runs without error, but holds only the rows from that moment on.
 
@@ -162,7 +164,7 @@ Rule 2 makes adding a view expensive, so F3 comes before the package ships.
 Two engine changes, then the package; each is its own PR with its own CI suite.
 
 1. **Create what changed (engine). Built 2026-11-14, branch `create-view-if-exists`.** `duckwake_create_view(…, if_exists := 'fail' | 'update' | 'replace')`, and `--if-exists` in the CLI. `update` does nothing when the query and settings match, runs `alter_view` when only settings differ, and fails when what the view computes differs (query, table, late-data table, checkpoint, inlining); whitespace outside quotes and a trailing `;` are not a change. `replace` recomputes. The result's first word says which (`created`, `unchanged`, `altered`, `replaced`). Tested in `schema_test.sh` (CLI, two running workers, every view verified) and `serve_test.sh` (the SQL function over Quack).
-2. **Backfill (engine, F3).** A new view over a lake table or a view starts from its input's current rows (a snapshot read) and then follows the change feed, exactly once.
+2. **Backfill (engine, F3). Built 2026-11-15, branch `f3-backfill`, tested in `scripts/backfill_test.sh`.** A new view over a lake table or a view starts from its input's current rows (a snapshot read) and then follows the change feed, exactly once.
 3. **The package (dbt-duckwake v0).** `streaming_source` and `streaming_view`, the rerun rules above, `duckwake_wait` before readers are built, the `duckwake_verified` test, and an example project. A CI suite runs the example against the Docker stack: deploy, rerun with no change, change a setting, change a query with `--full-refresh`, add a view over a running one, verify every view.
 4. **Later.** Zero-downtime replace (build `<name>__next`, wait for it to catch up, swap in one DuckLake transaction), and `store_failures` as a streaming view, as dbt-risingwave does.
 

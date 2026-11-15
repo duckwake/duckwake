@@ -7,6 +7,15 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- **Backfill of views over lake tables and other views (F3).** A new view starts from the rows its inputs
+  already hold (`start := 'earliest'`, the default; `--start latest` keeps the old behaviour), read at the
+  view's first snapshot `max_rows` rows per epoch and then the changes after it; it continues where it stopped
+  after a crash, and windows close only once it is done. Maintenance no longer expires a snapshot a view still
+  needs, paused and stopped views included, and keeps the commit times of expired snapshots for `_commit_ts`.
+  `duckwake_snapshots_held` and `duckwake_snapshots_held_seconds` show what each view holds, with the
+  `DuckWakeSnapshotsHeld` alert. A reset empties the windowed views that read the view insert-only, which
+  backfill again, and a reset to an expired epoch is refused. Running views move their position every
+  `--position-refresh` (default `5m`) even when their inputs are idle.
 - **Open-source release files.** The MIT `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
   issue and pull request templates, and the design documents under `docs/design/`. Release archives and the
   image carry `LICENSE` and `THIRD_PARTY_LICENSES.md`; CI checks every dependency's license (`cargo deny`) and
@@ -59,6 +68,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - A catalog stall that every worker shared (PostgreSQL slow or failing over) made workers declare each other
   dead and take over each other's views.
 - A worker frozen inside its catalog commit blocked every other worker's commits until it was thawed.
+- A worker whose view was reset, replaced, stopped or taken over while an epoch was staging no longer marks the
+  view `failed` when that epoch hits an error: the error belonged to the fenced incarnation. Before, a reset
+  that emptied a windowed view could leave it failed instead of recomputing.
 
 ## [0.1.0] - 2026-11-04
 

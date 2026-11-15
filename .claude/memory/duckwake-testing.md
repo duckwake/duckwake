@@ -17,6 +17,10 @@ metadata:
 - `scripts/limits_test.sh` pins `--threads 12`: under a 64 MB limit an epoch only runs out of memory with many
   DuckDB threads (4-core CI runners otherwise spill and pass).
 - Under `set -o pipefail`, put `|| true` at the end of a grep pipeline, not inside it.
+- Without Docker (cloud sessions), suites that need only PostgreSQL run with `PG_LOCAL=1` against a local
+  server on localhost:55432 with a `lake` role (`scripts/backfill_test.sh`). Read a view's position with the key
+  `"0"` of its checkpoint offsets (`'$.*."0"'`); key `"1"` is a backfill cursor. Table names contain dots, so a
+  JSON path must quote them. `set -e` applies inside an EXIT trap: end it with `|| true`.
 
 **Why:** each of these cost a debugging round once.
 

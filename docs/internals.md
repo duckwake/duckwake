@@ -208,7 +208,8 @@ records the ones it took up.
      change. A view that groups by `time_bucket(...)` of a column instead keeps every bucket up to date.
    - `reset` of a view restores an upsert or counted table with time travel (delete all, insert the old
      version), which its retracting readers see as ordinary deletes and inserts: they follow the reset
-     through the change feed. A windowed reader of an append-only view stops instead (F3 cascades reset).
+     through the change feed. A windowed reader of an append-only view cannot take deletes, so the reset
+     empties it in the same transaction and it backfills again from the table (F3).
 12. **Failover needs heartbeats in tables of their own, and dead workers judged on the observer's clock.**
    A shared `workers` table would conflict the way `jobs` would (finding 1), so each worker owns
    `__duckwake.worker_<id>`, one row it updates every `lease_timeout / 5` (at most every 5 s), inlined in the
@@ -327,11 +328,20 @@ records the ones it took up.
   no Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. A view without windows
   takes the input's updates and deletes as retractions (finding 11): a stateless view's table counts each
   row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view reads lake tables insert-only
-  (an update or delete stops it, status `failed`) and refuses a view's table whose rows change. A view reads
-  the changes after the snapshot current when it was created (`start: latest`) and holds the rows written
-  after it; backfill of existing rows (`earliest`) is F3. Retention does not yet keep the oldest position
-  (P_min, F3): maintenance can expire snapshots a paused view still needs. `reset` reaches retracting
-  readers through the change feed, but not windowed ones (F3). Windows over a lake input use `_commit_ts`,
+  (an update or delete stops it, status `failed`) and refuses a view's table whose rows change.
+- **Backfill and retention (F3).** A new view takes S0, the snapshot current when it first starts, and pages
+  each input `AT (VERSION => S0)` in `rowid` order, `max_rows` per epoch; the cursor is in the checkpoint
+  (offsets key `1`, next to the position at key `0`), so a crash resumes the page after the last committed
+  one. Rows read this way carry the `_commit_ts` of their version, so the view equals its batch query at S0
+  (`verify` restricts each input to `rowid <= cursor` while the backfill runs). Then it reads the changes after
+  S0. The watermark stays at its start while any input backfills, so no window closes early. `start: latest`
+  skips the backfill and drops retractions of versions at or before S0 (`lake_floor`); a reset or replace
+  keeps that floor. Maintenance expires snapshots only before the oldest position of any view not dropped
+  (P_min), and first records the expired snapshots' commit times in `__duckwake.snapshot_times`, since a row's
+  `_commit_ts` is the running maximum of snapshot times. An idle running view moves its position every
+  `--position-refresh`, so it does not hold P_min back. A view whose position has expired anyway fails with
+  that snapshot, and a reset to an epoch whose snapshot expired is refused. `reset` reaches retracting readers
+  through the change feed; windowed readers of the reset view are emptied and backfill again. Windows over a lake input use `_commit_ts`,
   or a windowed view's `window_start`/`window_end`; windows on another column of a lake input are not
   supported yet. Joins of two lake inputs, and fused chains on one worker (one hop per epoch now), come
   later. Columns are fixed at create time. `_commit_ts` is a `TIMESTAMP` in UTC, not `TIMESTAMPTZ`, so it

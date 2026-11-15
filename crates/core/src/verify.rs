@@ -15,7 +15,7 @@
 //! written after the view was created, with `_commit_ts` computed as the job computes it. Rows updated or
 //! deleted since are simply not there, which is what the view's retractions must have done to its table.
 use crate::catalog::{self, state_table};
-use crate::model::{LakeInput, SourceDef, COMMIT_TS};
+use crate::model::{LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
 use crate::kafka;
 use crate::lake::{ident, lit, quote_table, CTL};
 use crate::decode::{decode_sql, IS_JSON_OBJECT};
@@ -161,11 +161,15 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let mut dead_expected = vec!["SELECT NULL::VARCHAR AS source, NULL::INTEGER AS _partition, NULL::BIGINT AS _offset WHERE false".to_string()];
     for (k, src) in srcs.iter().enumerate() {
         let Some(src) = src else {
-            // A lake input: the table as of the checkpoint's snapshot, rows written after the view's start.
+            // A lake input: the table as of the checkpoint's snapshot. Every row of it for a backfilled view,
+            // up to the backfill's cursor while it runs; else the rows written after the view's floor.
             let l = lakes[k].unwrap();
-            let p = ends[k].get(&0).copied().or(def.start_snapshot).context("lake input without a position")?;
-            let s0 = def.start_snapshot.context("lake input without a start snapshot")?;
+            let p = ends[k].get(&LAKE_POSITION).copied().or(def.start_snapshot).context("lake input without a position")?;
+            let mut keep: Vec<String> = def.floor().map(|f| format!("t.snapshot_id > {f}")).into_iter().collect();
+            keep.extend(ends[k].get(&LAKE_BACKFILL).map(|c| format!("t.rowid <= {c}")));
+            let keep = if keep.is_empty() { "true".to_string() } else { keep.join(" AND ") };
             let (schema, table) = crate::lake::table_by_id(conn, l.table_id)?.with_context(|| format!("{} was dropped", l.table))?;
+            let tbl = quote_table(&format!("{}.{schema}.{table}", crate::lake::LAKE))?;
             let select: Vec<String> = l
                 .columns
                 .iter()
@@ -174,17 +178,14 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
                 .collect();
             conn.execute_batch(&format!(
                 "CREATE OR REPLACE TABLE memory.main.v_typed_{k} AS
-                   WITH snaps AS (
-                     SELECT snapshot_id, max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id) AS ts
-                     FROM ducklake_snapshots({lake}) WHERE snapshot_id <= {p})
-                   SELECT t.snapshot_id::INTEGER AS _partition, t.rowid::BIGINT AS _offset, {select}, s.ts AS {ct},
+                   SELECT t.snapshot_id::INTEGER AS _partition, t.rowid::BIGINT AS _offset, {select}, {ts} AS {ct},
                           NULL::VARCHAR AS _err
-                   FROM {tbl} AS t AT (VERSION => {p}) JOIN snaps s USING (snapshot_id){rows}
-                   WHERE t.snapshot_id > {s0}",
-                lake = lit(crate::lake::LAKE),
+                   FROM {tbl} AS t AT (VERSION => {p}) LEFT JOIN ({times}) s ON s.snapshot_id = t.snapshot_id{rows}
+                   WHERE {keep}",
                 select = select.join(", "),
+                ts = crate::engine::row_commit_ts(&def),
                 ct = ident(COMMIT_TS),
-                tbl = quote_table(&format!("{}.{schema}.{table}", crate::lake::LAKE))?,
+                times = crate::lake::commit_times_sql(p, &format!("SELECT snapshot_id FROM {tbl} AT (VERSION => {p})")),
                 rows = if l.counted { format!(", range(t.{})", ident(crate::circuit::ops::COUNT_COLUMN)) } else { String::new() },
             ))?;
             lake_rows += count(conn, &format!("SELECT * FROM memory.main.v_typed_{k}"))?;

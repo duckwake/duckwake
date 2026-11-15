@@ -228,6 +228,7 @@ fn spawn_worker(app: Shared) -> std::thread::JoinHandle<()> {
                 shared_readers: app.opts.shared_readers,
                 lean_commit: app.opts.lean_commit,
                 metrics: app.metrics.clone(),
+                position_refresh: Duration::from_secs(300),
             };
             let res = engine::run_worker(cfg, app.rt.clone(), app.shutdown.clone());
             let mut w = app.worker.lock().unwrap();
@@ -709,6 +710,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
                 max_rows: 100_000,
                 inline_row_limit: 10_000,
                 limits: Default::default(),
+                start: None,
                 if_exists: catalog::IfExists::Fail,
             },
         )?;
@@ -794,7 +796,9 @@ async fn view_action(
             "start" => catalog::set_status(conn, &name, JobStatus::Running, Some(catalog::Assign::Prefer(&app.worker_id)))?,
             "pause" => catalog::set_status(conn, &name, JobStatus::Paused, None)?,
             "stop" => catalog::set_status(conn, &name, JobStatus::Stopped, None)?,
-            "reset" => catalog::reset(conn, &name, req.to_epoch.ok_or_else(|| anyhow!("to_epoch is required"))?)?,
+            "reset" => {
+                catalog::reset(conn, &name, req.to_epoch.ok_or_else(|| anyhow!("to_epoch is required"))?)?;
+            }
             "drop" => catalog::drop_view(conn, &name, false)?,
             other => bail!("unknown action {other:?}"),
         }

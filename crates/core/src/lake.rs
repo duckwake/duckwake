@@ -147,7 +147,8 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
            job_id VARCHAR, epoch BIGINT, source VARCHAR, source_partition INTEGER, source_offset BIGINT,
            payload VARCHAR, error VARCHAR, failed_at TIMESTAMPTZ);
          CREATE TABLE IF NOT EXISTS {CTL}.dependencies (
-           job_id VARCHAR, input VARCHAR, table_id BIGINT, upstream_job VARCHAR);"
+           job_id VARCHAR, input VARCHAR, table_id BIGINT, upstream_job VARCHAR);
+         CREATE TABLE IF NOT EXISTS {CTL}.snapshot_times (snapshot_id BIGINT, commit_ts TIMESTAMP);"
     ))
     .context("bootstrapping __duckwake schema")?;
     // Lakes bootstrapped before the Arrow decode lack `rows_sql` (messages decoded in SQL per epoch).
@@ -270,6 +271,36 @@ pub fn query_opt_string(conn: &Connection, sql: &str) -> Result<Option<String>> 
 /// it always shows what other processes have just committed (F0, internals item 9).
 pub fn current_snapshot(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT id FROM ducklake_current_snapshot({})", lit(LAKE)), [], |r| r.get(0))?)
+}
+
+/// Whether snapshot `id` is still in the lake (not expired).
+pub fn snapshot_exists(conn: &Connection, id: i64) -> Result<bool> {
+    let n: i64 = conn.query_row(&format!("SELECT count(*) FROM ducklake_snapshots({}) WHERE snapshot_id = ?", lit(LAKE)), [id], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
+/// The oldest snapshot the lake still has.
+pub fn oldest_snapshot(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(&format!("SELECT min(snapshot_id) FROM ducklake_snapshots({})", lit(LAKE)), [], |r| r.get(0))?)
+}
+
+/// A query giving `(snapshot_id, ts)` for every snapshot up to `upto` whose commit time is known: `ts` is
+/// `_commit_ts`, the running maximum of `snapshot_time` by snapshot id in UTC. Snapshots still in the lake
+/// come from DuckLake; expired ones from `snapshot_times`, where maintenance records each snapshot before it
+/// expires it. `needed` is a query of the snapshot ids the caller will look up, so only those are read from
+/// the record. A snapshot expired by anything other than DuckWake's maintenance has no time here.
+pub fn commit_times_sql(upto: i64, needed: &str) -> String {
+    format!(
+        "SELECT snapshot_id, greatest(max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id),
+                (SELECT max(commit_ts) FROM {CTL}.snapshot_times)) AS ts
+         FROM ducklake_snapshots({lake}) WHERE snapshot_id <= {upto}
+         UNION ALL
+         SELECT snapshot_id, max(commit_ts) AS ts FROM {CTL}.snapshot_times
+         WHERE snapshot_id <= {upto} AND snapshot_id IN ({needed})
+           AND snapshot_id NOT IN (SELECT snapshot_id FROM ducklake_snapshots({lake}))
+         GROUP BY snapshot_id",
+        lake = lit(LAKE)
+    )
 }
 
 /// The DuckLake metadata schema of the lake, which holds `ducklake_table` and `ducklake_schema`.

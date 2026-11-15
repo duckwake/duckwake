@@ -305,6 +305,10 @@ pub struct CreateView<'a> {
     pub max_rows: usize,
     pub inline_row_limit: usize,
     pub limits: Limits,
+    /// For a view that reads lake tables or views through their change feeds: `earliest` (the default when
+    /// None) backfills it from the rows they hold when it is created, then follows their changes; `latest`
+    /// takes only the rows written after that. Kafka sources have their own `start`.
+    pub start: Option<&'a str>,
     /// What to do when the view exists.
     pub if_exists: IfExists,
 }
@@ -368,6 +372,9 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome
     if v.max_rows == 0 {
         bail!("max_rows must be at least 1");
     }
+    if let Some(s) = v.start.filter(|s| !matches!(*s, "earliest" | "latest")) {
+        bail!("start {s:?}: expected 'earliest' or 'latest'");
+    }
     let existing = job_status(conn, v.job_id)?;
     match (existing, v.if_exists) {
         (Some(_), IfExists::Fail) => bail!(
@@ -388,6 +395,7 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome
     let streams = plan.sources();
     lake_inputs.retain(|l| streams.contains(&l.name));
     let start_snapshot = (!lake_inputs.is_empty()).then(|| crate::lake::current_snapshot(conn)).transpose()?;
+    let start_commit_us = start_snapshot.map(|s| commit_us_at(conn, s)).transpose()?.flatten();
     let src_columns = input_columns(&plan.source, &sources, &lake_inputs)?.to_vec();
     let def = JobDef {
         job_id: v.job_id.into(),
@@ -399,6 +407,9 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome
         max_rows: v.max_rows,
         inline_row_limit: v.inline_row_limit,
         plan,
+        backfill: !lake_inputs.is_empty() && v.start != Some("latest"),
+        lake_floor: None,
+        start_commit_us,
         lake_inputs,
         start_snapshot,
         source_columns: BTreeMap::new(),
@@ -469,6 +480,13 @@ fn update_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
     }
     if old.inline_row_limit != v.inline_row_limit {
         changed.push(format!("inline_row_limit ({} -> {})", old.inline_row_limit, v.inline_row_limit));
+    }
+    // Only when the request names a start: a rerun that leaves it out keeps the view as it was made.
+    if let Some(start) = v.start.filter(|_| !old.lake_inputs.is_empty()) {
+        let had = if old.backfill { "earliest" } else { "latest" };
+        if start != had {
+            changed.push(format!("its start ({had} -> {start})"));
+        }
     }
     if !changed.is_empty() {
         bail!(
@@ -626,6 +644,52 @@ fn replace_view(conn: &Connection, def: &JobDef, circuit: &crate::circuit::Circu
         })();
         finish(conn, res)
     })
+}
+
+/// `_commit_ts` at snapshot `at`: the newest `snapshot_time` among the snapshots up to it, in UTC microseconds.
+pub fn commit_us_at(conn: &Connection, at: i64) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        &format!("SELECT epoch_us(max(timezone('UTC', snapshot_time))) FROM ducklake_snapshots({}) WHERE snapshot_id <= ?", lit(LAKE)),
+        [at],
+        |r| r.get(0),
+    )?)
+}
+
+/// A view that reads lake tables through their change feeds, and the snapshot it has read them up to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LakePosition {
+    pub job: String,
+    /// The last snapshot read (its start snapshot until its first commit), which its next epoch, `verify` and
+    /// a retraction's lookup all read; None for a view waiting for its start snapshot after a cascaded reset.
+    pub snapshot: Option<i64>,
+    pub backfilling: bool,
+}
+
+/// The position of every view with lake inputs, whatever its status: maintenance keeps every snapshot from
+/// the oldest of them on, the way a replication slot holds WAL.
+pub fn lake_positions(conn: &Connection) -> Result<Vec<LakePosition>> {
+    let mut latest: HashMap<String, serde_json::Value> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT job_id, source_offsets::VARCHAR FROM {CTL}.checkpoints c
+             WHERE epoch = (SELECT max(epoch) FROM {CTL}.checkpoints WHERE job_id = c.job_id)"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            latest.insert(r.get(0)?, serde_json::from_str(&r.get::<_, String>(1)?)?);
+        }
+    }
+    let mut out = Vec::new();
+    for (job, def) in all_jobs(conn)?.into_iter().filter(|(_, d)| !d.lake_inputs.is_empty()) {
+        let offsets = |l: &LakeInput, key: i32| latest.get(&job).and_then(|o| o.get(&l.name)).and_then(|o| o.get(key.to_string())).and_then(|v| v.as_i64());
+        let read = def.lake_inputs.iter().filter_map(|l| offsets(l, crate::model::LAKE_POSITION)).min();
+        let backfilling = match latest.get(&job) {
+            Some(_) => def.lake_inputs.iter().any(|l| offsets(l, crate::model::LAKE_BACKFILL).is_some()),
+            None => def.backfill,
+        };
+        out.push(LakePosition { job, snapshot: read.or(def.start_snapshot), backfilling });
+    }
+    Ok(out)
 }
 
 /// Every view with its definition.
@@ -879,6 +943,43 @@ pub enum Assign<'a> {
 }
 
 /// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
+/// Marks `job` failed for the worker that holds it at `lease`, and fences that lease. Returns false, changing
+/// nothing, when the lease has moved on: the view was reset, replaced, stopped or taken over meanwhile, and its
+/// new incarnation must not inherit an error its old one hit (a reset's deletes reaching an insert-only
+/// reader that is about to be recomputed, say). Check and update are one transaction, so a concurrent reset
+/// either lands first (and this returns false on retry) or after (and finds the view failed).
+pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: i64) -> Result<bool> {
+    retry_conflicts(|| {
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<bool> {
+            let (owner, lease_epoch) = lease(conn, job)?;
+            if owner.as_deref() != Some(worker) || lease_epoch != held {
+                return Ok(false);
+            }
+            conn.execute(
+                &format!("UPDATE {CTL}.jobs SET status = ?, updated_at = now() WHERE job_id = ?"),
+                [JobStatus::Failed.as_str(), job],
+            )?;
+            conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1", lease_table(job)))?;
+            Ok(true)
+        })();
+        match res {
+            Ok(true) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(true)
+            }
+            Ok(false) => {
+                conn.execute_batch("ROLLBACK")?;
+                Ok(false)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    })
+}
+
 pub fn set_status(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
     job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
     if let Some(Assign::Pin(w) | Assign::Prefer(w)) = assign {
@@ -961,7 +1062,11 @@ fn checkpoints(conn: &Connection, job: &str, source: &str, order: &str) -> Resul
 /// Rewinds a stopped/paused job to `to_epoch`: deletes sink, late and dead-letter rows written after it,
 /// restores the state table from the epoch's DuckLake snapshot (time travel) and drops later checkpoints.
 /// The next start replays from that checkpoint's offsets.
-pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<()> {
+///
+/// The views that read its table and take its changes (retractions) follow the reset through the change
+/// feed. Those that read a table changed by the reset insert-only, directly or through other views, cannot:
+/// they are recomputed in the same transaction (`recompute_view`) and returned.
+pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<Vec<String>> {
     let (def, status) = load_job(conn, job)?;
     if status == JobStatus::Running {
         bail!("pause or stop {job:?} before reset");
@@ -982,13 +1087,89 @@ pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<()> {
     } else {
         None
     };
+    let recompute = insert_only_readers(conn, job)?;
     // Its deletes from the shared control tables can lose to a running job's checkpoint insert.
-    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot))
+    retry_conflicts(|| reset_once(conn, job, &def, to_epoch, snapshot, &recompute))?;
+    Ok(recompute)
 }
 
-fn reset_once(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64, snapshot: Option<i64>) -> Result<()> {
+/// The views a reset of `job` changes the input of, that read that input insert-only: among `job`'s readers
+/// and their readers in turn (every one of whose tables can lose rows), each with an insert-only input from
+/// `job` or from one of those readers.
+fn insert_only_readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
+    let mut changed = vec![job.to_string()];
+    let mut i = 0;
+    while i < changed.len() {
+        for r in readers(conn, &changed[i].clone())? {
+            if !changed.contains(&r) {
+                changed.push(r);
+            }
+        }
+        i += 1;
+    }
+    let mut out = Vec::new();
+    for r in changed.iter().skip(1) {
+        let (def, _) = load_job(conn, r)?;
+        if def.lake_inputs.iter().any(|l| !l.retracts && l.view.as_ref().is_some_and(|v| changed.contains(v))) {
+            out.push(r.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Starts view `job` over, in the caller's transaction: its table is emptied (keeping its DuckLake table id,
+/// so the views that read it go on and see the deletes), its state, checkpoints and dead letters go, and so
+/// do the rows of a late-data table it alone writes. Its lease is bumped, so a worker still running it is
+/// fenced and starts it again. It then backfills from its inputs' rows at the snapshot current at that start.
+fn recompute_view(conn: &Connection, job: &str) -> Result<()> {
+    let (mut def, _) = load_job(conn, job)?;
+    conn.execute_batch(&format!("DELETE FROM {}", quote_table(&def.sink)?))?;
+    if def.plan.has_state() {
+        conn.execute_batch(&format!("DELETE FROM {}", state_table(job)))?;
+    }
+    if let Some(l) = &def.late_data {
+        if !all_jobs(conn)?.iter().any(|(id, d)| id != job && d.late_data.as_deref() == Some(l)) {
+            conn.execute_batch(&format!("DELETE FROM {}", quote_table(l)?))?;
+        }
+    }
+    for t in ["checkpoints", "dead_letter"] {
+        conn.execute(&format!("DELETE FROM {CTL}.{t} WHERE job_id = ?"), [job])?;
+    }
+    conn.execute_batch(&format!("UPDATE {} SET lease_epoch = lease_epoch + 1, last_epoch = 0", lease_table(job)))?;
+    // A `start := 'latest'` view keeps to the rows written after it was created.
+    def.lake_floor = def.floor();
+    def.backfill = true;
+    def.start_snapshot = None;
+    def.start_commit_us = None;
+    conn.execute(
+        &format!("UPDATE {CTL}.jobs SET definition = ?, version = version + 1, updated_at = now() WHERE job_id = ?"),
+        [&serde_json::to_string(&def)?, job],
+    )?;
+    Ok(())
+}
+
+/// A view recomputed by a cascaded reset has no start snapshot until a worker starts it: takes the current
+/// one now, and stores it with the view, so every later start and `verify` read the same.
+pub fn take_start_snapshot(conn: &Connection, job: &str) -> Result<JobDef> {
+    retry_conflicts(|| {
+        let (mut def, _) = load_job(conn, job)?;
+        if def.start_snapshot.is_some() || def.lake_inputs.is_empty() {
+            return Ok(def);
+        }
+        let s = crate::lake::current_snapshot(conn)?;
+        def.start_snapshot = Some(s);
+        def.start_commit_us = commit_us_at(conn, s)?;
+        conn.execute(&format!("UPDATE {CTL}.jobs SET definition = ?, updated_at = now() WHERE job_id = ?"), [&serde_json::to_string(&def)?, job])?;
+        Ok(def)
+    })
+}
+
+fn reset_once(conn: &Connection, job: &str, def: &JobDef, to_epoch: i64, snapshot: Option<i64>, recompute: &[String]) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
+        for r in recompute {
+            recompute_view(conn, r)?;
+        }
         let sink = quote_table(&def.sink)?;
         match (def.plan.sink_mode(), snapshot) {
             // Append sinks: drop what later epochs added.

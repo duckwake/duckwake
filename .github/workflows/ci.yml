@@ -59,6 +59,8 @@ jobs:
           - { name: retract s3, run: LAKE_STORAGE=s3 scripts/retract_test.sh }
           - { name: chain, run: scripts/chain_test.sh }
           - { name: retract, run: scripts/retract_test.sh }
+          # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
+          - { name: backfill, run: scripts/backfill_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
           - { name: decode, run: scripts/decode_test.sh }
           - { name: catchup, run: EVENTS=100000 scripts/catchup_test.sh }
@@ -76,6 +78,7 @@ jobs:
           - { name: rebalance pipelined, run: scripts/rebalance_test.sh, flags: true }
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
+          - { name: backfill pipelined, run: scripts/backfill_test.sh, flags: true }
           - { name: schema pipelined, run: scripts/schema_test.sh, flags: true }
           - { name: limits pipelined, run: scripts/limits_test.sh, flags: true }
     name: suite (${{ matrix.name }})

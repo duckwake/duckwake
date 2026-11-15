@@ -70,14 +70,11 @@ impl Maintenance {
             run(conn, "merge adjacent files", &format!("CALL ducklake_merge_adjacent_files({lake})"));
         }
         if self.due("expire", c.expire_every) {
-            run(
-                conn,
-                "expire snapshots",
-                &format!(
-                    "CALL ducklake_expire_snapshots({lake}, older_than => now() - INTERVAL '{} seconds')",
-                    c.expire_older_than.as_secs()
-                ),
-            );
+            match expire_sql(conn, c.expire_older_than) {
+                Ok(Some(sql)) => run(conn, "expire snapshots", &sql),
+                Ok(None) => {}
+                Err(e) => warn!(target: "maintenance", task = "expire snapshots", error = %format!("{e:#}"), "failed"),
+            }
         }
         if self.due("cleanup", c.cleanup_every) {
             run(
@@ -101,6 +98,45 @@ impl Maintenance {
             }
         }
     }
+}
+
+/// The statements that expire snapshots older than `older_than`, or None when there is none to expire.
+///
+/// Never past a view: every snapshot from the oldest position of a view with lake inputs on is kept (its
+/// next epoch reads the changes after its position, and `verify` and retractions read the table at it), so
+/// a paused or slow view holds snapshots the way a replication slot holds WAL. And never without a record:
+/// the commit time of each snapshot about to go is written to `snapshot_times` first, since rows written by
+/// it keep that time as their `_commit_ts`.
+pub fn expire_sql(conn: &duckdb::Connection, older_than: Duration) -> anyhow::Result<Option<String>> {
+    let lake = lit(LAKE);
+    let held = crate::catalog::lake_positions(conn)?.iter().filter_map(|p| p.snapshot).min();
+    // Snapshot times are not strictly ordered by id, so the bound is the oldest time among the snapshots kept.
+    let bound = match held {
+        Some(p) => format!(
+            "least(now() - INTERVAL '{} seconds', (SELECT min(snapshot_time) FROM ducklake_snapshots({lake}) WHERE snapshot_id >= {p}))",
+            older_than.as_secs()
+        ),
+        None => format!("now() - INTERVAL '{} seconds'", older_than.as_secs()),
+    };
+    let (cutoff, n): (Option<String>, i64) = conn.query_row(
+        &format!(
+            "SELECT strftime(b, '%Y-%m-%d %H:%M:%S.%f%z'), (SELECT count(*) FROM ducklake_snapshots({lake}) WHERE snapshot_time < b)
+             FROM (SELECT {bound} AS b)"
+        ),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let Some(cutoff) = cutoff.filter(|_| n > 0) else { return Ok(None) };
+    let cutoff = format!("TIMESTAMPTZ {}", lit(&cutoff));
+    Ok(Some(format!(
+        "INSERT INTO {CTL}.snapshot_times
+           SELECT snapshot_id, ts FROM (
+             SELECT snapshot_id, snapshot_time, greatest(max(timezone('UTC', snapshot_time)) OVER (ORDER BY snapshot_id),
+                    (SELECT max(commit_ts) FROM {CTL}.snapshot_times)) AS ts
+             FROM ducklake_snapshots({lake}))
+           WHERE snapshot_time < {cutoff} AND snapshot_id NOT IN (SELECT snapshot_id FROM {CTL}.snapshot_times);
+         CALL ducklake_expire_snapshots({lake}, older_than => {cutoff})"
+    )))
 }
 
 fn run(conn: &duckdb::Connection, task: &str, sql: &str) {
