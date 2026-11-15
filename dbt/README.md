@@ -107,7 +107,7 @@ A plain `dbt run` never recomputes a view; only `--full-refresh` does.
 
 `duckwake.duckwake_verified` checks that a view's table equals its query run as one batch over everything it
 has read (`duckwake_verify`); run it once the view has committed (`--vars '{duckwake_wait: true}'` on the run
-before). dbt's own tests read the views' tables in the attached lake.
+before). A windowed view needs `late_data` set for it: verify cannot reconstruct late events it dropped. dbt's own tests read the views' tables in the attached lake.
 
 ```yaml
 models:
