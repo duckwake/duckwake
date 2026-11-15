@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # dbt-duckwake gate: the example project (dbt/example) deployed and changed with dbt while events stream in and
 # a worker runs its views.
+#   0. A failed duckwake_verify leaves the session usable for the next call (dbt runs every test in one).
 #   1. dbt run creates the source and five views and starts them; a second run changes nothing.
 #   2. A changed setting alters the views in place; a changed query fails until --full-refresh, which needs the
 #      view's readers selected too (-s big_spend+), drops them and creates them again after it.
@@ -64,6 +65,28 @@ PRODUCER=$!
 pid=$!
 dbt deps >/dev/null || { echo "dbt deps failed"; cat "$OUT/dbt.log"; exit 1; }
 
+log "0. a failed call leaves the session usable"
+# dbt runs every test in one session: a verify that fails must not leave the extension's connection inside a
+# transaction, or every later call fails too.
+"$BIN" create-view analytics.not_started --sql "SELECT game_id FROM shop.accounts" >/dev/null
+"$PY" - "$DUCKWAKE_EXTENSION_REPO" "$DUCKWAKE_DUCKDB_EXTENSIONS" <<'PY' || failed=1
+import os, sys, duckdb
+c = duckdb.connect(config={"allow_unsigned_extensions": "true", "extension_directory": sys.argv[2]})
+c.execute(f"INSTALL duckwake FROM '{sys.argv[1]}'; LOAD duckwake")
+c.execute(f"CALL duckwake_connect('ducklake:{os.environ['DUCKWAKE_CATALOG']}', data_path := '{os.environ['DUCKWAKE_DATA_PATH']}')")
+errors = []
+for _ in range(2):
+    try:
+        c.execute("SELECT * FROM duckwake_verify('not_started')").fetchall()
+        errors.append("no error")
+    except Exception as e:
+        errors.append(str(e).splitlines()[0])
+ok = all("no checkpoint" in e for e in errors)
+print(("verify twice in one session: " if ok else "FAIL: ") + " / ".join(errors))
+sys.exit(0 if ok else 1)
+PY
+"$BIN" drop not_started >/dev/null
+
 log "1. deploy, then run again"
 dbt run || { tail -30 "$OUT/dbt.log"; failed=1; }
 expect "first run" "account_totals: created big_spend: created clicks: created clicks_per_window: created game_totals: created spend_by_game: created "
@@ -110,6 +133,10 @@ grep -q 'orphaned: top_games' "$OUT/dbt.log" && echo "listed: top_games" || { ec
 dbt run-operation duckwake_drop_orphans --args '{dry_run: false}' || failed=1
 [[ -z $(status top_games) ]] && echo "dropped: top_games" || { echo "FAIL: top_games is still there"; failed=1; }
 
-kill -TERM "$pid"; wait "$pid" || true
-if (( failed )); then echo "DBT TEST FAILED"; exit 1; fi
+kill -0 "$pid" 2>/dev/null || { echo "FAIL: the worker exited"; failed=1; }
+kill -TERM "$pid" 2>/dev/null || true; wait "$pid" || true
+if (( failed )); then
+  echo "worker errors:"; grep -E ' (WARN|ERROR) |^Error|Caused by' "$OUT/worker.log" | grep -v rskafka | tail -15 | cut -c1-300 || true
+  echo "DBT TEST FAILED"; exit 1
+fi
 echo "DBT TEST PASSED"
