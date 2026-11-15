@@ -16,10 +16,10 @@ extension. dbt gives files, review, CI, `ref()` order, tests and docs with no C+
 
 **How to apply:** the plan, in order, each its own PR:
 1. `create_view` `if_exists` with the outcome reported - merged in PR #5 (2026-11-14).
-2. Backfill of new views over lake inputs (F3) - built 2026-11-15 on branch `f3-backfill` (`start := 'earliest'`
+2. Backfill of new views over lake inputs (F3) - merged 2026-11-15 (PR #2) (`start := 'earliest'`
    default, P_min retention, held-snapshot metrics, reset cascade; gate `scripts/backfill_test.sh`). The package
    can create and start each view as dbt builds it; the stopped-then-started workaround is no longer needed.
-3. The package - built 2026-11-15 on branch `dbt-duckwake` (stacked on `f3-backfill`) in `dbt/`: Jinja-only on
+3. The package - merged 2026-11-15 (PR #4) in `dbt/`: Jinja-only on
    dbt-duckdb 1.11 / DuckDB 2.0.0, `streaming_source` and `streaming_view` materializations, `duckwake_verified`,
    `duckwake_wait_built`, `duckwake_drop_orphans`, an example project in `dbt/example`, CI suite
    `scripts/dbt_test.sh`. A plain `dbt run` never recomputes; a changed query fails until `--full-refresh`, which

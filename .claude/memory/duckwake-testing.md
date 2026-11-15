@@ -21,6 +21,12 @@ metadata:
   server on localhost:55432 with a `lake` role (`scripts/backfill_test.sh`). Read a view's position with the key
   `"0"` of its checkpoint offsets (`'$.*."0"'`); key `"1"` is a backfill cursor. Table names contain dots, so a
   JSON path must quote them. `set -e` applies inside an EXIT trap: end it with `|| true`.
+- The cloud session's local PostgreSQL stops when the container restarts; start it again with pg_ctl on
+  `/var/lib/postgresql/duckwake-test`, port 55432. DuckDB fetches core extensions over plain HTTP, which the
+  session's proxy refuses; they are in `~/.duckdb/extensions` (copy them into a fresh extension directory).
+- CI artifacts (worker logs) download from a host the session's proxy blocks: suites print what a failure
+  needs (`dbt_test.sh` prints the worker's errors). `scripts/dbt_test.sh` needs Kafka; its steps 0-3 run against
+  PostgreSQL alone with the Kafka lines stripped.
 
 **Why:** each of these cost a debugging round once.
 
