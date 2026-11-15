@@ -67,6 +67,34 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |r| r.get(0))?)
 }
 
+/// A transaction that rolls back unless `commit` ends it: an error between BEGIN and COMMIT must not leave the
+/// connection, which the SQL functions share, inside a failed transaction.
+struct Txn<'a> {
+    conn: &'a Connection,
+    open: bool,
+}
+
+impl<'a> Txn<'a> {
+    fn begin(conn: &'a Connection) -> Result<Self> {
+        conn.execute_batch("BEGIN")?;
+        Ok(Txn { conn, open: true })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.open = false;
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+}
+
+impl Drop for Txn<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::view_sources(&def, catalog::load_sources(conn)?);
@@ -95,7 +123,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     }
 
     // Snapshot the lake side in one transaction so checkpoint, sink, late rows and state agree.
-    conn.execute_batch("BEGIN")?;
+    let txn = Txn::begin(conn)?;
     let ckpt = catalog::latest_checkpoint(conn, job, &names[0])?.context("job has no checkpoint yet")?;
     // Every source's offsets in that checkpoint row (and in each older one: they are the same rows).
     let ends: Vec<_> = names.iter().map(|n| Ok(catalog::latest_checkpoint(conn, job, n)?.unwrap_or_default().offsets)).collect::<Result<_>>()?;
@@ -141,7 +169,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     if plan.is_windowed() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.v_state AS SELECT __ws, __we FROM {}", state_table(job)))?;
     }
-    conn.execute_batch("COMMIT")?;
+    txn.commit()?;
 
     // Each source's events from the base checkpoint (or the start) to the latest one, decoded as the job did.
     let from: Vec<_> = (0..srcs.len()).map(|k| base.as_ref().map(|(_, b)| b[k].clone()).unwrap_or_default()).collect();
