@@ -6,12 +6,14 @@
 #      the other views go on. Raised with alter-view and started again, both catch up, and every view
 #      matches its batch recomputation.
 #   2. Memory: a backlog of large events through a high-cardinality view, under a 64 MB DuckDB limit with 12
-#      DuckDB threads (what an epoch needs grows with the threads, so the count is fixed: with 4, as on a CI
-#      runner, these epochs spill and fit). Epochs that do not fit run out of memory; the worker halves its rows per epoch (duckwake_out_of_memory_total,
-#      duckwake_epoch_rows_cap), spills to its own directory, and the view matches its recomputation.
+#      DuckDB threads and at most 32 MB of spill (--max-spill). DuckDB spills before it runs out, so without the
+#      spill cap a runner with room to spill fits every epoch and the limit is never exercised. Epochs that do
+#      not fit run out of memory; the worker halves its rows per epoch (duckwake_out_of_memory_total,
+#      duckwake_epoch_rows_cap), spills to its own directory within the cap, and the view matches its
+#      recomputation.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-90}
-BACKLOG=${BACKLOG:-1500000}; MEMORY_LIMIT=${MEMORY_LIMIT:-64MB}; THREADS=${THREADS:-12}
+BACKLOG=${BACKLOG:-1500000}; MEMORY_LIMIT=${MEMORY_LIMIT:-64MB}; THREADS=${THREADS:-12}; MAX_SPILL=${MAX_SPILL:-32MB}
 METRICS=127.0.0.1:19187
 PARTS=${PARTS:-12}   # which parts to run
 failed=0
@@ -87,7 +89,7 @@ kill -TERM "$W"; wait "$W" 2>/dev/null || true
 fi
 
 if [[ $PARTS == *2* ]]; then
-log "2. a backlog of $BACKLOG large events under a $MEMORY_LIMIT memory limit"
+log "2. a backlog of $BACKLOG large events under a $MEMORY_LIMIT memory limit and $MAX_SPILL of spill"
 reset_env
 docker compose exec -T redpanda rpk topic create "$TOPIC" "$TOPIC2" -p "$PARTITIONS" >/dev/null
 setup_views 2s "10 SECOND" "5 seconds" >/dev/null
@@ -96,7 +98,7 @@ setup_views 2s "10 SECOND" "5 seconds" >/dev/null
 produce --rate 50000 --count "$BACKLOG" --pad-bytes 1000 --eos >/dev/null 2>&1
 "$BIN" start every_event --worker w1 >/dev/null
 t0=$SECONDS
-run_worker --memory-limit "$MEMORY_LIMIT" --threads "$THREADS"
+run_worker --memory-limit "$MEMORY_LIMIT" --threads "$THREADS" --max-spill "$MAX_SPILL"
 peak=0; spill=0
 end=$(topic_end)
 while ! caught_up every_event "$end" 0; do

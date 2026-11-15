@@ -7,6 +7,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- `--max-spill` (`DUCKWAKE_MAX_SPILL`) bounds the disk a worker's DuckDB spills to; past it an epoch runs out of
+  memory and the worker shrinks its epochs, as past `--memory-limit`.
 - **dbt-duckwake**, in `dbt/`: Kafka sources and streaming views as dbt models on dbt-duckdb
   (`materialized='streaming_source'` and `'streaming_view'`). A plain `dbt run` creates and starts new views,
   leaves unchanged ones alone, alters changed settings in place and fails on a changed query until
