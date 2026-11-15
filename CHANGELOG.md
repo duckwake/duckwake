@@ -69,6 +69,12 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A view paused or stopped while its worker was starting it no longer keeps running. The worker starts views
+  from a list of running views it read a moment before; it took a fresh lease without checking that the view
+  still ran, undoing the fence the pause had set, so the paused view's epochs kept committing until the next
+  refresh. After `stop` and then `reset` or `drop`, such an epoch could land on top of them. A worker now takes
+  a lease only while the view is running, checked in the same transaction. CI's backfill suite with pipelined
+  workers caught it: a paused view's position moved past snapshots maintenance had already expired.
 - A worker no longer exits when a view it is starting is dropped meanwhile. It tried to mark the view failed,
   found no such view, and stopped with every other view it ran; a `dbt run --full-refresh`, which drops and
   creates views while workers run, set this off in CI. A view that fails to start is now marked failed only
