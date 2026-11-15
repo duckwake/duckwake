@@ -73,6 +73,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - A catalog stall that every worker shared (PostgreSQL slow or failing over) made workers declare each other
   dead and take over each other's views.
 - A worker frozen inside its catalog commit blocked every other worker's commits until it was thawed.
+- With `--pipeline`, a view over lake tables stopped and started again soon after could lose its staged rows to
+  the drop queued when its earlier run left the worker, and fail the worker ("Table with name typed_l... does
+  not exist"). Each run of a view now stages into tables of its own.
 - A worker whose view was reset, replaced, stopped or taken over while an epoch was staging no longer marks the
   view `failed` when that epoch hits an error: the error belonged to the fenced incarnation. Before, a reset
   that emptied a windowed view could leave it failed instead of recomputing.

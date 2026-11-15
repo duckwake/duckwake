@@ -269,8 +269,11 @@ impl std::error::Error for StopJob {}
 const MAX_SNAPSHOTS: i64 = 1000;
 
 /// A job's staging table for the changes of its `k`-th input, a lake input.
-fn lake_typed(job: &str, k: usize) -> String {
-    mem("typed", &format!("l{job}_{k}"))
+/// The staged rows of a job's `k`-th input, a lake input, for the run of the job that holds `lease`. A run's
+/// tables are dropped after it leaves the worker, on the commit thread when epochs are pipelined, so a view
+/// started again soon after must not stage into a table of the same name.
+fn lake_typed(job: &str, lease: i64, k: usize) -> String {
+    mem("typed", &format!("l{job}_{lease}_{k}"))
 }
 
 /// One job's epoch as the commit needs it. It owns everything, so it can go to the commit thread.
@@ -1063,7 +1066,7 @@ impl Worker {
         }
         for (k, input) in j.inputs.iter().enumerate() {
             let Some(gid) = input.group() else {
-                self.drops.push(lake_typed(id, k));
+                self.drops.push(lake_typed(id, j.lease, k));
                 continue;
             };
             let Some(g) = self.groups.get_mut(&gid) else { continue };
@@ -1465,6 +1468,7 @@ fn stage_source(
 fn stage_lake(
     conn: &Connection,
     job: &str,
+    lease: i64,
     k: usize,
     lake: &LakeInput,
     def: &JobDef,
@@ -1473,7 +1477,7 @@ fn stage_lake(
     carried: Option<i64>,
 ) -> Result<(SourceStaged, Option<i64>)> {
     let t = Instant::now();
-    let typed = lake_typed(job, k);
+    let typed = lake_typed(job, lease, k);
     let cols: Vec<&(String, String)> = lake.columns.iter().filter(|(c, _)| c != COMMIT_TS).collect();
     let defs: Vec<String> = lake.columns.iter().map(|(c, ty)| format!("{} {ty}", ident(c))).collect();
     let staged = |rows_in: usize| SourceStaged {
@@ -1634,9 +1638,19 @@ pub(crate) fn row_commit_ts(def: &JobDef) -> String {
 /// `stage_lake` gives changes. The staged offsets keep the cursor at the last row read, or drop it when this
 /// was the last page: the input then follows the changes after `s0`. A crash replays the page from the
 /// committed cursor, so no row is read twice or skipped.
-fn stage_backfill(conn: &Connection, job: &str, k: usize, lake: &LakeInput, def: &JobDef, s0: i64, cursor: i64) -> Result<SourceStaged> {
+#[allow(clippy::too_many_arguments)]
+fn stage_backfill(
+    conn: &Connection,
+    job: &str,
+    lease: i64,
+    k: usize,
+    lake: &LakeInput,
+    def: &JobDef,
+    s0: i64,
+    cursor: i64,
+) -> Result<SourceStaged> {
     let t = Instant::now();
-    let typed = lake_typed(job, k);
+    let typed = lake_typed(job, lease, k);
     let (schema, table) = crate::lake::table_by_id(conn, lake.table_id)?
         .ok_or_else(|| StopJob(format!("{} (DuckLake table id {}) was dropped", lake.table, lake.table_id)))?;
     let tbl = quote_table(&format!("{LAKE}.{schema}.{table}"))?;
@@ -1714,11 +1728,11 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
             if let Feed::Lake { lake, commit_us } = &input.feed {
                 let (s, commit) = match input.offsets.get(&LAKE_BACKFILL) {
                     Some(&cursor) => {
-                        let s = stage_backfill(conn, id, k, lake, &def, input.offsets[&LAKE_POSITION], cursor)?;
+                        let s = stage_backfill(conn, id, j.lease, k, lake, &def, input.offsets[&LAKE_POSITION], cursor)?;
                         backfilling[k] = s.offsets.contains_key(&LAKE_BACKFILL);
                         (s, *commit_us)
                     }
-                    None => stage_lake(conn, id, k, lake, &def, input.offsets[&LAKE_POSITION], to, *commit_us)?,
+                    None => stage_lake(conn, id, j.lease, k, lake, &def, input.offsets[&LAKE_POSITION], to, *commit_us)?,
                 };
                 lakes[k] = Some((s, commit, current - to));
             }
@@ -2212,4 +2226,20 @@ pub fn fmt_us(us: Option<i64>) -> String {
     us.and_then(chrono::DateTime::from_timestamp_micros)
         .map(|d| d.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "-".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A run's staging tables are dropped after it leaves the worker, on the commit thread when epochs are
+    /// pipelined, so possibly after the next run of the same view has started: two runs never share a table.
+    #[test]
+    fn each_run_of_a_view_stages_into_its_own_table() {
+        assert_ne!(lake_typed("v", 3, 0), lake_typed("v", 4, 0));
+        assert_ne!(lake_typed("v", 3, 0), lake_typed("v", 3, 1));
+        // Lease and input are the last two parts of the name, so views whose names contain them stay apart.
+        assert_ne!(lake_typed("v_1", 2, 0), lake_typed("v", 12, 0));
+        assert_ne!(lake_typed("v_1", 2, 0), lake_typed("v", 1, 20));
+    }
 }
