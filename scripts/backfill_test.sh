@@ -8,6 +8,7 @@
 #     the rows written after it was created.
 #  2. Under aggressive maintenance (expiry every 2 s), a paused view keeps the snapshots after its position;
 #     started again, it catches up exactly. The commit times of expired snapshots stay known.
+#     A view stopped and started again ten times in a row keeps running and verifies.
 #  3. A reset to an epoch whose snapshot has expired fails with a clear error. A reset of a windowed view that
 #     another windowed view reads insert-only recomputes that reader, and both verify.
 # Needs only PostgreSQL: PG_LOCAL=1 runs it against one on localhost:55432 without Docker.
@@ -141,6 +142,22 @@ rich=$(sql "SELECT count(*) FROM lake.analytics.bf_rich"); want=$(sql "SELECT co
 [[ $rich == "$want" ]] && echo "bf_rich holds all $rich rows of the table with amount >= 90" || { echo "bf_rich holds $rich rows, the table $want"; failed=1; }
 latest=$(sql "SELECT count(*) FROM lake.analytics.bf_latest")
 (( latest < ROWS )) && echo "bf_latest holds $latest rows: only those written after it was created" || { echo "bf_latest holds $latest rows"; failed=1; }
+
+log "a view stopped and started again ten times in a row while its table changes"
+# Each start is a new run of the view on the same worker; the tables an old run staged into are dropped after
+# it left, on the commit thread when epochs are pipelined, and must not take the new run's with them.
+generate $((ROWS + 300000))
+for i in $(seq 1 10); do
+  released=$(grep -c 'job released.*job=bf_bands' "$OUT/worker.log" || true)
+  "$BIN" stop bf_bands >/dev/null
+  for _ in $(seq 1 60); do (( $(grep -c 'job released.*job=bf_bands' "$OUT/worker.log" || true) > released )) && break; sleep 0.5; done
+  "$BIN" start bf_bands --worker w1 >/dev/null
+  sleep "0.$((RANDOM % 10))"
+done
+stop_generating
+wait_for bf_bands shop accounts || failed=1
+kill -0 "$pid" 2>/dev/null && echo "the worker ran through ten restarts of bf_bands" || { echo "the worker exited"; failed=1; }
+verify_views bf_bands bf_rich bf_by_game || failed=1
 stop_worker
 
 log "aggressive maintenance with a paused view"
