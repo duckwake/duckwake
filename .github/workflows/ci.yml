@@ -39,6 +39,20 @@ jobs:
           name: binaries
           path: binaries.tar
           retention-days: 3
+      # The Docker Hub images the suites need, pulled once here: some 30 suite jobs pulling them each hit Docker
+      # Hub's limit for anonymous pulls. (PostgreSQL comes from mirror.gcr.io and MinIO from cgr.dev, which have
+      # no such limit; a digest-pinned image could not be matched after docker load anyway.)
+      - run: |
+          images="docker.redpanda.com/redpandadata/redpanda:v26.2.7 prom/prometheus:v3.1.0"
+          for i in $images; do docker pull -q "$i"; done
+          docker save $images | gzip -1 > images.tar.gz
+          ls -lh images.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images
+          path: images.tar.gz
+          compression-level: 0
+          retention-days: 3
 
   suite:
     needs: build
@@ -92,6 +106,10 @@ jobs:
         with:
           name: binaries
       - run: tar -xf binaries.tar
+      - uses: actions/download-artifact@v4
+        with:
+          name: images
+      - run: docker load -i images.tar.gz && rm images.tar.gz
       - if: matrix.duckdb_cli
         run: |
           mkdir -p "$RUNNER_TEMP/duckdb"
