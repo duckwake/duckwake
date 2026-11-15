@@ -1,0 +1,28 @@
+version: 2
+
+sources:
+  - name: shop
+    database: lake
+    schema: shop
+    tables:
+      - name: accounts
+
+models:
+  - name: clicks_per_window
+    data_tests: [duckwake.duckwake_verified]
+    columns:
+      - name: window_start
+        data_tests: [not_null]
+  - name: big_spend
+    data_tests: [duckwake.duckwake_verified]
+  - name: game_totals
+    data_tests: [duckwake.duckwake_verified]
+    columns:
+      - name: game_id
+        data_tests: [unique, not_null]
+  - name: spend_by_game
+    data_tests: [duckwake.duckwake_verified]
+  - name: account_totals
+    data_tests: [duckwake.duckwake_verified]
+  - name: top_games
+    data_tests: [duckwake.duckwake_verified]

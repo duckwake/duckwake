@@ -61,6 +61,8 @@ jobs:
           - { name: retract, run: scripts/retract_test.sh }
           # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
           - { name: backfill, run: scripts/backfill_test.sh }
+          # dbt-duckwake: the example project deployed and changed with dbt (installs dbt-duckdb into a venv).
+          - { name: dbt, run: scripts/dbt_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
           - { name: decode, run: scripts/decode_test.sh }
           - { name: catchup, run: EVENTS=100000 scripts/catchup_test.sh }

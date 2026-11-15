@@ -7,6 +7,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- **dbt-duckwake**, in `dbt/`: Kafka sources and streaming views as dbt models on dbt-duckdb
+  (`materialized='streaming_source'` and `'streaming_view'`). A plain `dbt run` creates and starts new views,
+  leaves unchanged ones alone, alters changed settings in place and fails on a changed query until
+  `--full-refresh`; sources gain columns. Also `duckwake_verified` (a generic test over `duckwake_verify`),
+  `duckwake_wait_built` and `duckwake_drop_orphans`. Install it with dbt's git `subdirectory: dbt`.
 - **Backfill of views over lake tables and other views (F3).** A new view starts from the rows its inputs
   already hold (`start := 'earliest'`, the default; `--start latest` keeps the old behaviour), read at the
   snapshot current when the view was created, `max_rows` rows per epoch and then the changes after it; it continues where it stopped

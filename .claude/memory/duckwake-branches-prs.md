@@ -14,8 +14,9 @@ commits in stack order:
 3. PR #5 (`create-view-if-exists`): `create_view(..., if_exists := 'fail'|'update'|'replace')` with the
    outcome as the result's first word (dbt-duckwake plan step 1), plus `CLAUDE.md` and `.claude/memory/`.
 
-In the new repository: PR #1 (`claude/focused-mendel-cbfmfj`) holds the open-source release files; F3 (backfill
-and retention) is on `f3-backfill`, stacked on it. Next in the dbt plan is the package; see [[duckwake-dbt-not-ddl]].
+In the new repository: PR #1 (open-source release files) and PR #3 (rebalance test settle fix) are merged;
+PR #2 (`f3-backfill`, F3 backfill and retention) targets `main`; the dbt package is on `dbt-duckwake`, stacked
+on `f3-backfill`. See [[duckwake-dbt-not-ddl]].
 
 On 2026-11-14, before open-sourcing (MIT), the history was rewritten with `git filter-repo` (the author's work
 email replaced by their personal one, claude.ai links replaced) and published to a fresh `duckwake/duckwake`
