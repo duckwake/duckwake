@@ -62,6 +62,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Changed
 
+- The test stack pins its Kafka and S3 images (Redpanda v26.2.7, MinIO by digest) instead of `latest`, so a
+  broker release no longer changes what CI tests.
 - `stop` and `pause` fence the view's worker at once, so `drop` and `reset` can follow straight away.
 - Worker instances run with `preserve_insertion_order = false`, so inserts stream instead of buffering.
 
