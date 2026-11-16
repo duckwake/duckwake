@@ -141,3 +141,25 @@ fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
     let err = compile("SELECT o.id FROM shop.orders o JOIN per_min m ON m.game_id = o.game_id").unwrap_err();
     assert!(err.to_string().contains("joins of two"), "{err}");
 }
+
+#[test]
+fn aggregates_not_supported_yet_are_refused_with_what_is() {
+    let (conn, sources) = super::setup();
+    let err = |sql: &str| crate::plan::compile(&conn, "v", sql, &sources).unwrap_err().to_string();
+    // count(DISTINCT) keeps value rows in GROUP BY views only, so far.
+    let e = err("SELECT window_start, count(DISTINCT user_id) AS u FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
+    assert!(e.contains("not supported in windowed views yet"), "{e}");
+    let e = err("SELECT game_id, sum(DISTINCT amount) AS s FROM clicks GROUP BY ALL");
+    assert!(e.contains("count(DISTINCT ...) is"), "{e}");
+    // An aggregate outside the list names the ones that are supported.
+    let e = err("SELECT game_id, string_agg(user_id, ',') AS us FROM clicks GROUP BY ALL");
+    assert!(e.contains("not supported yet") && e.contains("stddev_pop"), "{e}");
+    let e = err("SELECT window_start, median(amount) AS m FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
+    assert!(e.contains("not supported yet") && e.contains("bool_and"), "{e}");
+    // bool_and is MIN of a BOOLEAN: in a window over a source that can retract it needs a count per value.
+    let e = err("SELECT window_start, bool_and(amount > 3) AS b FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
+    assert!(e.contains("count per value"), "{e}");
+    // HAVING in a window may read keys and aggregates, not other columns.
+    let e = err("SELECT window_start, count(*) AS n FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING user_id = 'u1'");
+    assert!(!e.is_empty());
+}

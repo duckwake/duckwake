@@ -889,10 +889,18 @@ pub fn lease(conn: &Connection, job: &str) -> Result<(Option<String>, i64)> {
     })?)
 }
 
-/// Bumps the lease epoch for a job this worker owns, fencing any older incarnation of the worker.
+/// Bumps the lease epoch for a job this worker owns, fencing any older incarnation of the worker. None, changing
+/// nothing, unless the view is running: a worker starts views from a list of running ones it read a moment
+/// before, and a `pause` or `stop` committed since fences the view by bumping its lease. Taking a fresh lease
+/// then would undo that fence, so the paused view's epochs would keep landing until the worker next looked;
+/// after `stop` and a `reset` or `drop`, they would land on top of those. Check and bump are one transaction:
+/// a `pause` committed while it is open conflicts with the bump (both write the lease table) and wins.
 pub fn take_lease(conn: &Connection, job: &str, worker: &str) -> Result<Option<i64>> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<Option<i64>> {
+        if job_status(conn, job)? != Some(JobStatus::Running) {
+            return Ok(None);
+        }
         let n = conn.execute(
             &format!("UPDATE {} SET lease_epoch = lease_epoch + 1 WHERE owner_worker = ?", lease_table(job)),
             [worker],
@@ -903,6 +911,10 @@ pub fn take_lease(conn: &Connection, job: &str, worker: &str) -> Result<Option<i
         Ok(Some(lease(conn, job)?.1))
     })();
     match res {
+        Ok(None) => {
+            conn.execute_batch("ROLLBACK")?;
+            Ok(None)
+        }
         Ok(v) => {
             conn.execute_batch("COMMIT")?;
             Ok(v)
@@ -938,6 +950,17 @@ pub enum Assign<'a> {
     Prefer(&'a str),
     /// Unassigned: the next live worker to claim it takes it (see `failover`).
     Any,
+}
+
+/// Whether `worker` still holds `job` at lease epoch `held`: the view exists and neither a stop, pause, reset,
+/// replace nor takeover has moved its lease. A worker asks after a view's epoch fails to stage: a view dropped or
+/// replaced while it staged fails on its own missing tables, and that is not the worker's error.
+pub fn holds_lease(conn: &Connection, job: &str, worker: &str, held: i64) -> Result<bool> {
+    if job_status(conn, job)?.is_none() {
+        return Ok(false);
+    }
+    let (owner, lease_epoch) = lease(conn, job)?;
+    Ok(owner.as_deref() == Some(worker) && lease_epoch == held)
 }
 
 /// Marks `job` failed for `worker`, and fences its lease. With `held`, only while the worker holds the lease at
@@ -1416,6 +1439,35 @@ mod tests {
         conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
         assert!(!fail_if_held(&conn, "v", "w1", None).unwrap(), "dropped while it started");
         assert!(!fail_if_held(&conn, "v", "w1", Some(3)).unwrap(), "dropped while it ran");
+    }
+
+    /// A worker starts a view from a list of running views read before; a pause committed since must stay in
+    /// force, so the worker gets no lease and the paused view no epoch.
+    #[test]
+    fn a_lease_is_taken_only_while_the_view_runs() {
+        let conn = catalog_with_view();
+        assert_eq!(take_lease(&conn, "v", "w2").unwrap(), None, "another worker's view");
+        assert_eq!(take_lease(&conn, "v", "w1").unwrap(), Some(4));
+        for status in ["paused", "stopped", "failed"] {
+            let conn = catalog_with_view();
+            conn.execute_batch(&format!("UPDATE {CTL}.jobs SET status = '{status}'")).unwrap();
+            assert_eq!(take_lease(&conn, "v", "w1").unwrap(), None, "{status} while the worker started it");
+            assert_eq!(lease(&conn, "v").unwrap(), (Some("w1".into()), 3), "{status}: the lease is untouched");
+        }
+        let conn = catalog_with_view();
+        conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
+        assert_eq!(take_lease(&conn, "v", "w1").unwrap(), None, "dropped while the worker started it");
+    }
+
+    /// A view staged by a worker that no longer holds it (dropped, stopped, taken over) is not its error.
+    #[test]
+    fn a_worker_holds_a_view_only_at_its_own_lease() {
+        let conn = catalog_with_view();
+        assert!(holds_lease(&conn, "v", "w1", 3).unwrap());
+        assert!(!holds_lease(&conn, "v", "w1", 2).unwrap(), "an older lease: fenced");
+        assert!(!holds_lease(&conn, "v", "w2", 3).unwrap(), "another worker's view");
+        conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
+        assert!(!holds_lease(&conn, "v", "w1", 3).unwrap(), "dropped");
     }
 
     #[test]

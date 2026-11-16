@@ -10,6 +10,8 @@ their own tables.
 
 DuckWake brings streaming SQL to DuckDB, built on DuckDB 2.0 and DuckLake 1.1.
 
+Website and docs: **https://duckwake.github.io**
+
 ## Quick start
 
 You need Docker (for PostgreSQL, the lake's catalog, and Redpanda, the Kafka) and Rust.
@@ -60,7 +62,8 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 ## Status
 
 Version 0.1, on its [roadmap](docs/roadmap.md) to production. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
-across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`). A view can also read
+across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`, `bool_and`, `bool_or`, the
+variances and standard deviations, and `count(DISTINCT)` in `GROUP BY` views), with `HAVING`. A view can also read
 another view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with
 nothing to declare; when that table's rows are updated or deleted, the view retracts them (windowed views
 need it insert-only). Workers heartbeat into the lake: the views of a worker that dies move to the live ones,

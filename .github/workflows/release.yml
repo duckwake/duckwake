@@ -9,6 +9,7 @@
 #   pages       optional: copies the extension repository into the website repository, so that
 #               INSTALL duckwake FROM 'https://duckwake.github.io/extensions' works; runs only when the repository
 #               variable PUBLISH_EXTENSIONS is 'true' and the secret PAGES_TOKEN can push to it
+#   dbt-package dbt/ tagged with the same version in duckwake/dbt-duckwake, for dbt Hub (secret DBT_MIRROR_TOKEN)
 # A manual run (workflow_dispatch) builds everything and publishes nothing.
 # Linux builds link against the runner's glibc (Ubuntu 24.04: 2.39); older distributions should use the image.
 name: release
@@ -41,6 +42,8 @@ jobs:
             [[ $GITHUB_REF_NAME == "v$version" ]] || { echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"; exit 1; }
             grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
           fi
+          # dbt-duckwake is released with the engine under the same version.
+          grep -Eq "^version: *['\"]?$version['\"]?$" dbt/dbt_project.yml || { echo "::error::dbt/dbt_project.yml is not at version $version"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -192,11 +195,38 @@ jobs:
           path: site-repo
       # Each DuckDB version's folder is replaced; the folders of other DuckDB versions stay.
       - run: |
-          mkdir -p site-repo/site/extensions
-          for d in extensions/*/; do rm -rf "site-repo/site/extensions/$(basename "$d")"; cp -R "$d" site-repo/site/extensions/; done
+          mkdir -p site-repo/public/extensions
+          for d in extensions/*/; do rm -rf "site-repo/public/extensions/$(basename "$d")"; cp -R "$d" site-repo/public/extensions/; done
           cd site-repo
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/extensions
+          git add public/extensions
           git commit -m "Extension repository for DuckWake ${{ needs.check.outputs.version }}" || exit 0
           git push
+
+  # dbt-duckwake at this version: dbt/ as of the tag, tagged vX.Y.Z in duckwake/dbt-duckwake (which dbt Hub
+  # reads), with a release there pointing at this one. The tag lands on dbt-duckwake's main when main holds the
+  # same package, and on a commit of its own otherwise (scripts/mirror_dbt.sh).
+  dbt-package:
+    needs: [check, release]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          TOKEN: ${{ secrets.DBT_MIRROR_TOKEN }}
+          GH_TOKEN: ${{ secrets.DBT_MIRROR_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          [[ -n $TOKEN ]] || { echo "::error::the secret DBT_MIRROR_TOKEN is not set (docs/releasing.md)"; exit 1; }
+          tag=$GITHUB_REF_NAME
+          repo=${{ github.repository_owner }}/dbt-duckwake
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone -q --depth 1 "https://x-access-token:$TOKEN@github.com/$repo.git" "$RUNNER_TEMP/mirror"
+          scripts/mirror_dbt.sh layout "$RUNNER_TEMP/mirror" "$tag"
+          scripts/mirror_dbt.sh publish "$RUNNER_TEMP/mirror" "$tag"
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then echo "release $tag exists in $repo"; exit 0; fi
+          flags=(); [[ ${{ needs.check.outputs.prerelease }} == true ]] && flags+=(--prerelease)
+          gh release create "$tag" --repo "$repo" --verify-tag "${flags[@]}" --title "dbt-duckwake $tag" \
+            --notes "dbt-duckwake for DuckWake ${{ needs.check.outputs.version }}. What changed: https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"

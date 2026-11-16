@@ -86,13 +86,26 @@ default.
   1. `create_view` reports what changed (`if_exists := 'fail' | 'update' | 'replace'`), also in the CLI.
   2. Backfill of new views over lake inputs (F3, below). Built 2026-11-15 (`scripts/backfill_test.sh`).
   3. The package, an example project and a CI suite against the compose stack. Built 2026-11-15 in `dbt/`
-     (`scripts/dbt_test.sh`). Later: replacing a view without downtime (build beside it, catch up, swap in
-     one DuckLake transaction), and the package in a repository of its own for dbt Hub.
+     (`scripts/dbt_test.sh`). Later: the package in a repository of its own for dbt Hub.
+  4. **Zero-downtime replace.** Today `--full-refresh` drops a view's table and recomputes it, so queries see
+     it empty or partly filled until it catches up, minutes to hours for a large view. Instead, the old view
+     keeps running and serving while the new definition is built beside it as `<view>__next`, backfilling its
+     inputs; once it has caught up, one DuckLake transaction swaps them (table, state, checkpoints, lease) and
+     drops the old copy, so readers go from the complete old table straight to the complete new one. The
+     first version covers views no other view reads, the ones dashboards query: a reader's position in the
+     old table does not carry over to the new one, so a view with readers keeps today's rule (select them
+     with `-s view+`; they are dropped and created again). Engine: `create_view(..., if_exists := 'rebuild')`
+     and the swap; dbt: a model config that picks it on `--full-refresh`. **Gate:** a suite replaces a running
+     view under load while a reader polls its table; no poll ever sees it empty or partly built, the swap
+     survives a worker killed before, during and after it, and the new table equals its batch recomputation.
 
   Design, and how dbt-risingwave does it, in [dbt-duckwake](design/dbt-duckwake.md).
-- More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
-- `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
-  stream–stream joins
+- More aggregates. Built 2026-11-16: the variances and standard deviations, `bool_and`/`bool_or`,
+  `count(DISTINCT)` in `GROUP BY` views and `HAVING` in windowed views (`crates/circuit/src/tests/views.rs`,
+  `scripts/backfill_test.sh`). Next, in order: stream–stream joins; top-k and `ROW_NUMBER`; `approx_count_distinct`
+  and quantiles (DuckDB's exported aggregate states); `count(DISTINCT)` in windows, `covar`/`corr`/`regr_*`,
+  `arg_min`/`arg_max`, `list`/`string_agg`, `DISTINCT` over windows and aggregates, `MIN`/`MAX` in windows
+  over deletes
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
   retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain. Windows over tables

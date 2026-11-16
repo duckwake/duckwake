@@ -76,6 +76,24 @@ pub struct Plan {
     /// The inputs the view reads through a DuckLake change feed (lake tables and views), not from Kafka.
     #[serde(default)]
     pub change_feeds: Vec<String>,
+    /// Windowed views with HAVING: which closed windows are emitted.
+    #[serde(default)]
+    pub window_having: Option<WindowHaving>,
+}
+
+/// HAVING in a windowed view, applied as windows close: `condition` over a state row with `columns` added
+/// (`<finalized aggregate> AS __h<j>`, the aggregates HAVING reads) and keys as `__k<j>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowHaving {
+    pub columns: Vec<String>,
+    pub condition: String,
+}
+
+impl WindowHaving {
+    /// The rows of `state` (a state table or query) with the columns HAVING reads.
+    pub fn over(&self, state: &str) -> String {
+        format!("(SELECT *, {} FROM {state})", self.columns.join(", "))
+    }
 }
 
 /// One branch of a `UNION ALL` view.
@@ -143,6 +161,59 @@ pub enum AggKind {
     Avg,
     Min,
     Max,
+    /// Variance and standard deviation: from the weighted count, sum and sum of squares, so they are
+    /// invertible like `avg`.
+    VarSamp,
+    VarPop,
+    StddevSamp,
+    StddevPop,
+    /// `count(DISTINCT x)`: the state counts each group's values (`GlobalPlan::counted_values`).
+    CountDistinct,
+}
+
+impl AggKind {
+    /// Finalized from the counted values rather than from the group row's own partials.
+    fn counts_values(self) -> bool {
+        matches!(self, AggKind::Min | AggKind::Max | AggKind::CountDistinct)
+    }
+}
+
+/// The aggregate DuckWake runs for `fname`: synonyms map to one name, and `bool_and`/`bool_or` are MIN and MAX
+/// of a BOOLEAN (false < true), which gives them retractions and windows for free. None when unsupported.
+fn canonical_agg(fname: &str) -> Option<&'static str> {
+    Some(match fname {
+        "count_star" => "count_star",
+        "count" => "count",
+        "sum" => "sum",
+        "avg" | "mean" => "avg",
+        "min" | "bool_and" => "min",
+        "max" | "bool_or" => "max",
+        "var_samp" | "variance" => "var_samp",
+        "var_pop" => "var_pop",
+        "stddev_samp" | "stddev" => "stddev_samp",
+        "stddev_pop" => "stddev_pop",
+        _ => return None,
+    })
+}
+
+const SUPPORTED_LIST: &str =
+    "count, count(DISTINCT), sum, avg, min, max, bool_and, bool_or, var_samp, var_pop, variance, stddev_samp, stddev_pop, stddev";
+
+/// The variance or standard deviation of a group from its weighted count `n`, sum `s` and sum of squares `q`
+/// (DOUBLE). NULL below two values for the sample variants and below one for the population ones, as DuckDB.
+/// The difference `q - s²/n` can come out a hair below 0 from rounding; it is clamped there.
+fn moments_finalize(kind: AggKind, n: &str, s: &str, q: &str) -> String {
+    let m2 = format!("greatest({q} - CAST({s} AS DOUBLE) * CAST({s} AS DOUBLE) / {n}, 0)");
+    let var = match kind {
+        AggKind::VarSamp | AggKind::StddevSamp => format!("CASE WHEN {n} > 1 THEN {m2} / ({n} - 1) END"),
+        _ => format!("CASE WHEN {n} > 0 THEN {m2} / {n} END"),
+    };
+    if matches!(kind, AggKind::StddevSamp | AggKind::StddevPop) { format!("sqrt({var})") } else { var }
+}
+
+/// `x` squared as a DOUBLE.
+fn squared(x: &str) -> String {
+    format!("(CAST({x} AS DOUBLE) * CAST({x} AS DOUBLE))")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,17 +232,19 @@ pub struct AggSpec {
 ///    `__cnt` is the group's total weight and the group is dropped when it reaches 0;
 /// 3. post (stateless): HAVING and the select list over finalized values `__g<j>`, `__a<i>`.
 ///
-/// count, sum and avg are invertible (sums of weights). min and max are only mergeable, which is
-/// correct while sources are append-only; over a retracting input they keep value counts (`counted_values`).
+/// count, sum, avg and the variances are invertible (sums of weights). min and max are only mergeable, which
+/// is correct while sources are append-only; over a retracting input they keep value counts (`counted_values`),
+/// as count(DISTINCT) always does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalPlan {
     pub keys: usize,
     pub aggs: Vec<AggSpec>,
     /// Sink column holding group key j.
     pub sink_keys: Vec<String>,
-    /// MIN and MAX over a source that can retract: the state also counts each group's values, one row per
-    /// (group, aggregate `__i`, value `__v<i>`) with its count `__n`, so a retracted extreme gives way to the
-    /// next value still present (spike S4). Group rows have `__i` NULL.
+    /// MIN and MAX over a source that can retract, and count(DISTINCT) over any: the state also counts each
+    /// group's values, one row per (group, aggregate `__i`, value `__v<i>`) with its count `__n`, so a
+    /// retracted extreme gives way to the next value still present (spike S4) and a value is counted while its
+    /// count is above 0. Group rows have `__i` NULL.
     #[serde(default)]
     pub counted_values: bool,
 }
@@ -180,8 +253,6 @@ pub struct GlobalPlan {
 fn is_value_col(c: &str) -> bool {
     c == "__i" || c == "__n" || c.strip_prefix("__v").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
 }
-
-const SUPPORTED_AGGS: [&str; 6] = ["count", "count_star", "sum", "min", "max", "avg"];
 
 impl Plan {
     pub fn is_windowed(&self) -> bool {
@@ -318,6 +389,13 @@ impl GlobalPlan {
                 }
                 AggKind::Min => cols.push(format!("min(__x{k}) AS __a{i}")),
                 AggKind::Max => cols.push(format!("max(__x{k}) AS __a{i}")),
+                // Counted from the value rows (`aggregate_stmts`).
+                AggKind::CountDistinct => {}
+                AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop => {
+                    cols.push(format!("sum({}) AS __a{i}_s", signed(&x(k))));
+                    cols.push(format!("sum({}) AS __a{i}_q", signed(&squared(&x(k)))));
+                    cols.push(format!("{} AS __a{i}_n", weighted_count(&x(k))));
+                }
             }
         }
         let group = if self.keys == 0 { "HAVING count(*) > 0".to_string() } else { "GROUP BY ALL".to_string() };
@@ -347,6 +425,13 @@ impl GlobalPlan {
                 (AggKind::Min | AggKind::Max, Some(_)) => cols.push(format!("CAST(e.__a{i} AS {}) AS __a{i}", ty(&format!("__a{i}")))),
                 (AggKind::Min, None) => cols.push(format!("least(o.__a{i}, d.__a{i}) AS __a{i}")),
                 (AggKind::Max, None) => cols.push(format!("greatest(o.__a{i}, d.__a{i}) AS __a{i}")),
+                // A touched group with no value left has no extrema row: it counts 0.
+                (AggKind::CountDistinct, _) => cols.push(format!("CAST(coalesce(e.__a{i}, 0) AS BIGINT) AS __a{i}")),
+                (AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop, _) => {
+                    cols.push(add(&format!("__a{i}_s")));
+                    cols.push(add(&format!("__a{i}_q")));
+                    cols.push(add(&format!("__a{i}_n")));
+                }
             }
         }
         let extrema = extrema.map(|e| format!(" LEFT JOIN {e} e ON {}", self.keys_match("d", "e"))).unwrap_or_default();
@@ -383,7 +468,14 @@ impl GlobalPlan {
         ));
         let extremes: Vec<String> = self
             .value_aggs()
-            .map(|(i, kind)| format!("{}(__v{i}) FILTER (WHERE __i = {i}) AS __a{i}", if kind == AggKind::Min { "min" } else { "max" }))
+            .map(|(i, kind)| {
+                let f = match kind {
+                    AggKind::Min => "min",
+                    AggKind::Max => "max",
+                    _ => "count",
+                };
+                format!("{f}(__v{i}) FILTER (WHERE __i = {i}) AS __a{i}")
+            })
             .collect();
         let group = if self.keys == 0 { String::new() } else { format!(" GROUP BY {}", self.key_cols().join(", ")) };
         stmts.push(table(
@@ -415,13 +507,13 @@ impl GlobalPlan {
         state_columns.iter().filter(|(c, _)| keys.contains(c) || is_value_col(c)).cloned().collect()
     }
 
-    /// The MIN and MAX aggregates, by index, whose values the state counts.
+    /// The aggregates, by index, whose values the state counts: MIN, MAX and count(DISTINCT).
     fn value_aggs(&self) -> impl Iterator<Item = (usize, AggKind)> + '_ {
         let counted = self.counted_values;
-        self.aggs.iter().enumerate().filter(move |(_, a)| counted && matches!(a.kind, AggKind::Min | AggKind::Max)).map(|(i, a)| (i, a.kind))
+        self.aggs.iter().enumerate().filter(move |(_, a)| counted && a.kind.counts_values()).map(|(i, a)| (i, a.kind))
     }
 
-    /// One epoch's value counts: per group, MIN/MAX aggregate and non-NULL value, the sum of its weights.
+    /// One epoch's value counts: per group, counted aggregate and non-NULL value, the sum of its weights.
     fn value_delta_sql(&self, pre: &str, state_columns: &[(String, String)]) -> String {
         let ty = |c: &str| state_columns.iter().find(|(n, _)| n == c).map(|(_, t)| t.clone()).unwrap();
         let aggs: Vec<(usize, AggKind)> = self.value_aggs().collect();
@@ -522,9 +614,10 @@ impl GlobalPlan {
         let mut cols = self.key_cols();
         for (i, a) in self.aggs.iter().enumerate() {
             cols.push(match a.kind {
-                AggKind::CountStar | AggKind::Count | AggKind::Min | AggKind::Max => format!("__a{i}"),
+                AggKind::CountStar | AggKind::Count | AggKind::Min | AggKind::Max | AggKind::CountDistinct => format!("__a{i}"),
                 AggKind::Sum => format!("CASE WHEN __a{i}_n = 0 THEN NULL ELSE __a{i}_s END AS __a{i}"),
                 AggKind::Avg => format!("CASE WHEN __a{i}_n = 0 THEN NULL ELSE CAST(__a{i}_s AS DOUBLE) / __a{i}_n END AS __a{i}"),
+                k => format!("{} AS __a{i}", moments_finalize(k, &format!("__a{i}_n"), &format!("__a{i}_s"), &format!("__a{i}_q"))),
             });
         }
         cols
@@ -686,6 +779,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         global: None,
         retracting: if src.append_only() { vec![] } else { vec![stream.source.clone()] },
         change_feeds: if src.is_lake() { vec![stream.source.clone()] } else { vec![] },
+        window_having: None,
     };
 
     let node = &mut stmt["node"];
@@ -717,9 +811,6 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
             plan.state_columns = plan.sink_columns.iter().cloned().chain([("__cnt".to_string(), "BIGINT".to_string())]).collect();
         }
         return Ok(plan);
-    }
-    if !node["having"].is_null() {
-        bail!("HAVING is not supported in windowed views yet; it is supported in non-windowed GROUP BY views");
     }
     if !has_group {
         bail!("a windowed view must GROUP BY window_start (or GROUP BY ALL with window_start selected)");
@@ -787,6 +878,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         global: None,
         retracting,
         change_feeds,
+        window_having: None,
     })
 }
 
@@ -820,108 +912,72 @@ fn compile_windowed(
     let mut project = Vec::new();
     let mut args: Vec<Value> = Vec::new();
     let mut finals = Vec::new();
+    // Select items that are aggregates, with their finalized SQL over a state row.
+    let mut agg_items: Vec<(usize, String)> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        let (sink_name, sink_type) = &plan.sink_columns[i];
+        let (sink_name, sink_type) = plan.sink_columns[i].clone();
         let is_agg = item["class"] == "FUNCTION" && aggs.contains(item["function_name"].as_str().unwrap_or(""));
         if !is_agg {
             if contains_fn(item, aggs) {
-                bail!("aggregates must be top-level select items (column {sink_name:?}); nested expressions over aggregates are not supported");
+                bail!("aggregates must be top-level select items (column {sink_name:?}) in windowed views; nested expressions over aggregates are not supported");
             }
             let k = format!("__k{}", plan.key_columns.len());
             let mut e = item.clone();
             e["alias"] = json!(k);
             project.push(e);
             plan.key_columns.push(k.clone());
-            finals.push(format!("CAST({} AS {sink_type}) AS {}", ident(&k), ident(sink_name)));
+            finals.push(format!("CAST({} AS {sink_type}) AS {}", ident(&k), ident(&sink_name)));
             continue;
         }
-        let fname = item["function_name"].as_str().unwrap().to_ascii_lowercase();
-        if !SUPPORTED_AGGS.contains(&fname.as_str()) {
-            bail!("aggregate {fname}() is not supported in v1 (supported: count, sum, min, max, avg)");
-        }
-        if item["distinct"] == true
-            || !item["filter"].is_null()
-            || item["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty())
-        {
-            bail!("DISTINCT, FILTER and ORDER BY inside aggregates are not supported ({fname})");
-        }
-        let fn_args: Vec<Value> = item["arguments"].as_array().cloned().unwrap_or_default().iter()
-            .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
-        if fn_args.iter().any(|a| contains_fn(a, aggs)) {
-            bail!("nested aggregates are not supported ({fname})");
-        }
-        let x = match fname.as_str() {
-            "count_star" => String::new(),
-            _ => {
-                let [a] = fn_args.as_slice() else { bail!("{fname}() takes exactly one argument here") };
-                let key = norm(a);
-                let k = args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
-                    args.push(a.clone());
-                    args.len() - 1
-                });
-                format!("__x{k}")
-            }
-        };
-        let p = format!("__p{i}");
-        let mut partial = |name: &str, sql: String, op: MergeOp| {
-            plan.partials.push(format!("{sql} AS {name}"));
-            plan.merge_ops.push((name.to_string(), op));
-        };
-        // Over a source that can retract, the partials sum weights (as Feldera's ExpandAggregates does when the
-        // input is not append-only); over Kafka they count rows, which is the same there and cheaper. A sum
-        // keeps its weighted non-NULL count too, so that it is NULL again once every value is retracted.
-        let finalize = match (fname.as_str(), weighted) {
-            ("count_star", false) => {
-                partial(&p, "count(*)".into(), MergeOp::Add);
-                ident(&p)
-            }
-            ("count_star", true) => {
-                partial(&p, "CAST(sum(__w) AS BIGINT)".into(), MergeOp::Add);
-                ident(&p)
-            }
-            ("count", false) => {
-                partial(&p, format!("count({x})"), MergeOp::Add);
-                ident(&p)
-            }
-            ("count", true) => {
-                partial(&p, weighted_count(&x), MergeOp::Add);
-                ident(&p)
-            }
-            ("sum", false) => {
-                partial(&p, format!("sum({x})"), MergeOp::AddNullable);
-                ident(&p)
-            }
-            ("sum", true) => {
-                let (s, c) = (format!("{p}s"), format!("{p}c"));
-                partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
-                partial(&c, weighted_count(&x), MergeOp::Add);
-                format!("CASE WHEN {} = 0 THEN NULL ELSE {} END", ident(&c), ident(&s))
-            }
-            ("min" | "max", true) => {
-                bail!("{fname}() in a window over a source that can retract needs a count per value: not supported yet")
-            }
-            ("min", false) => {
-                partial(&p, format!("min({x})"), MergeOp::Min);
-                ident(&p)
-            }
-            ("max", false) => {
-                partial(&p, format!("max({x})"), MergeOp::Max);
-                ident(&p)
-            }
-            ("avg", _) => {
-                let (s, c) = (format!("{p}s"), format!("{p}c"));
-                if weighted {
-                    partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
-                    partial(&c, weighted_count(&x), MergeOp::Add);
-                } else {
-                    partial(&s, format!("sum({x})"), MergeOp::AddNullable);
-                    partial(&c, format!("count({x})"), MergeOp::Add);
+        let finalize = windowed_agg(plan, item, aggs, &mut args, &format!("__p{i}"), weighted)?;
+        agg_items.push((i, finalize.clone()));
+        finals.push(format!("CAST({finalize} AS {sink_type}) AS {}", ident(&sink_name)));
+    }
+    // HAVING: its aggregates get partials of their own and are read as `__h<j>`; references to a selected key,
+    // or to a select item by its alias, read that key's `__k<j>` or that aggregate's finalized value.
+    if !node["having"].is_null() {
+        let mut having = node["having"].clone();
+        let mut columns = Vec::new();
+        let keys: Vec<(String, String)> = items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !agg_items.iter().any(|(j, _)| j == i))
+            .zip(&plan.key_columns)
+            .map(|((_, e), k)| (norm(&stripped(e)), k.clone()))
+            .collect();
+        let aliases: Vec<(String, String)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let alias = e["alias"].as_str().filter(|a| !a.is_empty())?.to_string();
+                match agg_items.iter().find(|(j, _)| *j == i) {
+                    Some((_, fin)) => Some((alias, fin.clone())),
+                    None => keys.iter().find(|(n, _)| *n == norm(&stripped(e))).map(|(_, k)| (alias, ident(k))),
                 }
-                format!("CAST({} AS DOUBLE) / NULLIF({}, 0)", ident(&s), ident(&c))
+            })
+            .collect();
+        having_refs(&mut having, &mut |e: &Value| -> Result<Option<Value>> {
+            if e["class"] == "FUNCTION" && aggs.contains(e["function_name"].as_str().unwrap_or("")) {
+                let h = format!("__h{}", columns.len());
+                let fin = windowed_agg(plan, e, aggs, &mut args, &h, weighted)?;
+                columns.push(format!("{fin} AS {h}"));
+                return Ok(Some(column_ref(&h, "")));
             }
-            _ => unreachable!(),
-        };
-        finals.push(format!("CAST({finalize} AS {sink_type}) AS {}", ident(sink_name)));
+            if let Some((_, k)) = keys.iter().find(|(n, _)| *n == norm(e)) {
+                return Ok(Some(column_ref(k, "")));
+            }
+            if e["class"] == "COLUMN_REF" {
+                if let [name] = e["column_names"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                    if let Some((_, fin)) = aliases.iter().find(|(a, _)| Some(a.as_str()) == name.as_str()) {
+                        let h = format!("__h{}", columns.len());
+                        columns.push(format!("{fin} AS {h}"));
+                        return Ok(Some(column_ref(&h, "")));
+                    }
+                }
+            }
+            Ok(None)
+        })?;
+        plan.window_having = Some(WindowHaving { columns, condition: expr_sql(conn, &having)? });
     }
     // Each window and group's total weight: one whose rows are all retracted is not emitted.
     if weighted {
@@ -960,7 +1016,148 @@ fn compile_windowed(
     }
     plan.state_columns = state;
     plan.final_select = finals.join(", ");
+    if let Some(h) = &plan.window_having {
+        let typed: Vec<String> = plan.state_columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
+        let st = "memory.main.__having_state";
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE {st} ({})", typed.join(", ")))?;
+        describe(conn, &format!("SELECT {} FROM {} WHERE {}", plan.final_select, h.over(st), h.condition))
+            .context("binding HAVING over the windows (it may read the selected keys and aggregates)")?;
+        conn.execute_batch(&format!("DROP TABLE {st}"))?;
+    }
     Ok(())
+}
+
+/// Replaces, from the top down, each node of `e` that `f` maps to another; children of a replaced node are not
+/// visited.
+fn having_refs(e: &mut Value, f: &mut dyn FnMut(&Value) -> Result<Option<Value>>) -> Result<()> {
+    if let Some(v) = f(e)? {
+        *e = v;
+        return Ok(());
+    }
+    match e {
+        Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                if !k.starts_with("query_location") {
+                    having_refs(v, f)?;
+                }
+            }
+        }
+        Value::Array(a) => {
+            for v in a.iter_mut() {
+                having_refs(v, f)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// One aggregate call `item` of a windowed view: pushes its partials, named from `p`, and returns its finalized
+/// value over a state row. Over a source that can retract, the partials sum weights (as Feldera's
+/// ExpandAggregates does when the input is not append-only); over Kafka they count rows, which is the same there
+/// and cheaper. A sum keeps its weighted non-NULL count too, so that it is NULL again once every value is
+/// retracted.
+fn windowed_agg(plan: &mut Plan, item: &Value, aggs: &HashSet<String>, args: &mut Vec<Value>, p: &str, weighted: bool) -> Result<String> {
+    let raw = item["function_name"].as_str().unwrap().to_ascii_lowercase();
+    let Some(fname) = canonical_agg(&raw) else {
+        bail!("aggregate {raw}() is not supported yet (supported: {SUPPORTED_LIST})");
+    };
+    if item["distinct"] == true {
+        bail!("{raw}(DISTINCT ...) is not supported in windowed views yet; count(DISTINCT ...) is supported in non-windowed GROUP BY views");
+    }
+    if !item["filter"].is_null() || item["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty()) {
+        bail!("FILTER and ORDER BY inside aggregates are not supported ({raw})");
+    }
+    let fn_args: Vec<Value> = item["arguments"].as_array().cloned().unwrap_or_default().iter()
+        .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
+    if fn_args.iter().any(|a| contains_fn(a, aggs)) {
+        bail!("nested aggregates are not supported ({raw})");
+    }
+    let x = match fname {
+        "count_star" => String::new(),
+        _ => {
+            let [a] = fn_args.as_slice() else { bail!("{raw}() takes exactly one argument here") };
+            let key = norm(a);
+            let k = args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
+                args.push(a.clone());
+                args.len() - 1
+            });
+            format!("__x{k}")
+        }
+    };
+    let mut partial = |name: &str, sql: String, op: MergeOp| {
+        plan.partials.push(format!("{sql} AS {name}"));
+        plan.merge_ops.push((name.to_string(), op));
+    };
+    Ok(match (fname, weighted) {
+        ("count_star", false) => {
+            partial(p, "count(*)".into(), MergeOp::Add);
+            ident(p)
+        }
+        ("count_star", true) => {
+            partial(p, "CAST(sum(__w) AS BIGINT)".into(), MergeOp::Add);
+            ident(p)
+        }
+        ("count", false) => {
+            partial(p, format!("count({x})"), MergeOp::Add);
+            ident(p)
+        }
+        ("count", true) => {
+            partial(p, weighted_count(&x), MergeOp::Add);
+            ident(p)
+        }
+        ("sum", false) => {
+            partial(p, format!("sum({x})"), MergeOp::AddNullable);
+            ident(p)
+        }
+        ("sum", true) => {
+            let (s, c) = (format!("{p}s"), format!("{p}c"));
+            partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
+            partial(&c, weighted_count(&x), MergeOp::Add);
+            format!("CASE WHEN {} = 0 THEN NULL ELSE {} END", ident(&c), ident(&s))
+        }
+        ("min" | "max", true) => {
+            bail!("{raw}() in a window over a source that can retract needs a count per value: not supported yet")
+        }
+        ("min", false) => {
+            partial(p, format!("min({x})"), MergeOp::Min);
+            ident(p)
+        }
+        ("max", false) => {
+            partial(p, format!("max({x})"), MergeOp::Max);
+            ident(p)
+        }
+        ("avg", _) => {
+            let (s, c) = (format!("{p}s"), format!("{p}c"));
+            if weighted {
+                partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
+                partial(&c, weighted_count(&x), MergeOp::Add);
+            } else {
+                partial(&s, format!("sum({x})"), MergeOp::AddNullable);
+                partial(&c, format!("count({x})"), MergeOp::Add);
+            }
+            format!("CAST({} AS DOUBLE) / NULLIF({}, 0)", ident(&s), ident(&c))
+        }
+        (_, _) => {
+            let kind = match fname {
+                "var_samp" => AggKind::VarSamp,
+                "var_pop" => AggKind::VarPop,
+                "stddev_samp" => AggKind::StddevSamp,
+                _ => AggKind::StddevPop,
+            };
+            let (s, q, c) = (format!("{p}s"), format!("{p}q"), format!("{p}c"));
+            if weighted {
+                partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
+                partial(&q, format!("sum({})", signed(&squared(&x))), MergeOp::AddNullable);
+                partial(&c, weighted_count(&x), MergeOp::Add);
+            } else {
+                partial(&s, format!("sum({x})"), MergeOp::AddNullable);
+                partial(&q, format!("sum({})", squared(&x)), MergeOp::AddNullable);
+                partial(&c, format!("count({x})"), MergeOp::Add);
+            }
+            moments_finalize(kind, &ident(&c), &ident(&s), &ident(&q))
+        }
+    })
 }
 
 /// The state column holding a window and group's total weight, when the view's input can retract.
@@ -1087,6 +1284,16 @@ fn compile_global(
                 state.push((format!("__a{i}"), x.clone().unwrap()));
                 x.unwrap()
             }
+            AggKind::CountDistinct => {
+                state.push((format!("__a{i}"), "BIGINT".into()));
+                "BIGINT".to_string()
+            }
+            AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop => {
+                state.push((format!("__a{i}_s"), sum_type(a.arg.unwrap())?));
+                state.push((format!("__a{i}_q"), "DOUBLE".into()));
+                state.push((format!("__a{i}_n"), "BIGINT".into()));
+                "DOUBLE".to_string()
+            }
         };
         agg_cols.push(format!("__a{i} {out_type}"));
     }
@@ -1105,11 +1312,13 @@ fn compile_global(
     describe(conn, &format!("SELECT {} FROM {agg_table}{having_sql}", plan.query.finish.join(", ")))
         .context("binding the select list over the aggregates (every non-aggregate column must be a GROUP BY key)")?;
 
-    // MIN and MAX over a source that can retract: value rows in the same state table.
-    let counted_values = plan.retracts() && specs.iter().any(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max));
+    // MIN and MAX over a source that can retract, and count(DISTINCT) over any: value rows in the same state
+    // table.
+    let counted_values = (plan.retracts() && specs.iter().any(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max)))
+        || specs.iter().any(|(_, a)| a.kind == AggKind::CountDistinct);
     if counted_values {
         state.push(("__i".into(), "INTEGER".into()));
-        for (i, (_, a)) in specs.iter().enumerate().filter(|(_, (_, a))| matches!(a.kind, AggKind::Min | AggKind::Max)) {
+        for (i, (_, a)) in specs.iter().enumerate().filter(|(_, (_, a))| a.kind.counts_values()) {
             state.push((format!("__v{i}"), col_type(&format!("__x{}", a.arg.unwrap()))));
         }
         state.push(("__n".into(), "BIGINT".into()));
@@ -1146,17 +1355,24 @@ fn column_ref(name: &str, alias: &str) -> Value {
 fn replace_aggs(e: &mut Value, aggs: &HashSet<String>, specs: &mut Vec<(Value, AggSpec)>, args: &mut Vec<Value>) -> Result<()> {
     if e["class"] == "FUNCTION" && aggs.contains(e["function_name"].as_str().unwrap_or("")) {
         let fname = e["function_name"].as_str().unwrap().to_ascii_lowercase();
-        let kind = match fname.as_str() {
-            "count_star" => AggKind::CountStar,
-            "count" => AggKind::Count,
-            "sum" => AggKind::Sum,
-            "avg" | "mean" => AggKind::Avg,
-            "min" => AggKind::Min,
-            "max" => AggKind::Max,
-            _ => bail!("aggregate {fname}() is not supported in aggregate views yet (supported: count, sum, avg, min, max)"),
+        let distinct = e["distinct"] == true;
+        let kind = match (canonical_agg(&fname), distinct) {
+            (Some("count"), true) => AggKind::CountDistinct,
+            (_, true) => bail!("{fname}(DISTINCT ...) is not supported yet; count(DISTINCT ...) is"),
+            (Some("count_star"), _) => AggKind::CountStar,
+            (Some("count"), _) => AggKind::Count,
+            (Some("sum"), _) => AggKind::Sum,
+            (Some("avg"), _) => AggKind::Avg,
+            (Some("min"), _) => AggKind::Min,
+            (Some("max"), _) => AggKind::Max,
+            (Some("var_samp"), _) => AggKind::VarSamp,
+            (Some("var_pop"), _) => AggKind::VarPop,
+            (Some("stddev_samp"), _) => AggKind::StddevSamp,
+            (Some("stddev_pop"), _) => AggKind::StddevPop,
+            _ => bail!("aggregate {fname}() is not supported yet (supported: {SUPPORTED_LIST})"),
         };
-        if e["distinct"] == true || !e["filter"].is_null() || e["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty()) {
-            bail!("DISTINCT, FILTER and ORDER BY inside aggregates are not supported yet ({fname})");
+        if !e["filter"].is_null() || e["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty()) {
+            bail!("FILTER and ORDER BY inside aggregates are not supported yet ({fname})");
         }
         let fn_args: Vec<Value> = e["arguments"].as_array().cloned().unwrap_or_default().iter()
             .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
@@ -1573,8 +1789,14 @@ mod tests {
     #[test]
     fn global_rejections() {
         assert!(err("SELECT count(*) FROM clicks GROUP BY game_id").contains("select every GROUP BY key"));
-        assert!(err("SELECT game_id, count(DISTINCT user_id) FROM clicks GROUP BY ALL").contains("DISTINCT"));
-        assert!(err("SELECT game_id, string_agg(user_id) FROM clicks GROUP BY ALL").contains("not supported in aggregate views"));
+        assert!(err("SELECT game_id, sum(DISTINCT amount) FROM clicks GROUP BY ALL").contains("count(DISTINCT ...) is"));
+        assert!(err("SELECT game_id, string_agg(user_id) FROM clicks GROUP BY ALL").contains("not supported yet"));
+        // count(DISTINCT) compiles: the state counts the values (`__i`, `__v<i>`, `__n` next to the group rows).
+        let (c, s) = setup();
+        let p = compile(&c, "j", "SELECT game_id, count(DISTINCT user_id) AS u FROM clicks GROUP BY ALL", &s).unwrap();
+        assert!(p.global.as_ref().unwrap().counted_values);
+        let state: Vec<_> = p.state_columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(state, ["__g0", "__cnt", "__a0", "__i", "__v0", "__n"]);
         assert!(err("SELECT game_id, count(*) FROM clicks GROUP BY ROLLUP (game_id)").contains("ROLLUP"));
     }
 
@@ -1585,11 +1807,14 @@ mod tests {
         assert!(err("SELECT DISTINCT ON (game_id) * FROM clicks").contains("DISTINCT ON"));
         assert!(err("SELECT DISTINCT game_id, count(*) FROM clicks GROUP BY ALL").contains("DISTINCT"));
         assert!(err("SELECT ts, row_number() OVER () FROM clicks").contains("window functions"));
-        assert!(err("SELECT window_start, approx_count_distinct(user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("not supported in v1"));
+        assert!(err("SELECT window_start, approx_count_distinct(user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("not supported yet"));
         assert!(err("SELECT window_start, count(DISTINCT user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("DISTINCT"));
         assert!(err("SELECT game_id, count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("group by window"));
         assert!(err("SELECT window_start, sum(amount) / count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("top-level"));
-        assert!(err("SELECT window_start, count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING count(*) > 1").contains("HAVING"));
+        // HAVING in a window compiles, filtering windows as they close.
+        let (c, s) = setup();
+        let p = compile(&c, "j", "SELECT window_start, count(*) AS n FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING sum(amount) > 1", &s).unwrap();
+        assert!(p.window_having.as_ref().unwrap().condition.contains("__h0"));
         assert!(err("SELECT * FROM nope").contains("registered source"));
         assert!(err("SELECT window_start, count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MONTH) GROUP BY ALL").contains("month"));
     }

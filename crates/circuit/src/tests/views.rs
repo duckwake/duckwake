@@ -156,3 +156,82 @@ fn global_min_max_over_retractions() {
         true,
     );
 }
+
+#[test]
+fn windowed_variance_booleans_and_having() {
+    // Every variance and standard deviation, and bool_and/bool_or (MIN/MAX of a BOOLEAN), per window.
+    let stats = "SELECT window_start, game_id, var_samp(amount) AS vs, var_pop(amount) AS vp, variance(amount) AS v,
+                        stddev_samp(amount) AS ss, stddev_pop(amount) AS sp, stddev(amount) AS s,
+                        bool_and(amount > 3) AS all_big, bool_or(amount > 10) AS any_huge
+                 FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(stats, &EPOCHS, false);
+    check_view(stats, &EPOCHS, true);
+    // HAVING over an aggregate that is not selected, a selected key, and a select item by its alias.
+    let having = "SELECT window_start, game_id, count(*) AS n, stddev_pop(amount) AS sd
+                  FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL
+                  HAVING sum(amount) > 40 AND game_id <> 'g2' AND n % 3 <> 0";
+    check_view(having, &EPOCHS, false);
+    check_view(having, &EPOCHS, true);
+    check_view(
+        "SELECT c.window_end, g.studio, count(*) AS n FROM HOP(clicks, ts, INTERVAL 1 MINUTE, INTERVAL 20 SECOND) c
+         JOIN games g ON g.game_id = c.game_id GROUP BY c.window_end, g.studio HAVING avg(c.amount) > 6",
+        &EPOCHS,
+        false,
+    );
+}
+
+#[test]
+fn windowed_variance_and_having_over_retractions() {
+    let sql = "SELECT window_start, game_id, count(*) AS n, var_samp(amount) AS vs, stddev_pop(amount) AS sp
+               FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING count(*) > 4";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn global_variance_and_booleans() {
+    let sql = "SELECT game_id, var_samp(amount) AS vs, var_pop(amount) AS vp, stddev_samp(amount) AS ss,
+                      stddev_pop(amount) AS sp, bool_and(amount > 2) AS all_pos, bool_or(user_id = 'u4') AS has_u4
+               FROM clicks GROUP BY ALL HAVING stddev(amount) > 1";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view("SELECT variance(price) AS v, stddev(price) AS s FROM purchases", &EPOCHS, true);
+}
+
+#[test]
+fn global_variance_and_booleans_over_retractions() {
+    // Retracted values leave the sums; a group down to one value has no sample variance again; bool_and's
+    // false value retracted makes it true again.
+    let sql = "SELECT game_id, count(*) AS n, var_samp(amount) AS vs, stddev_pop(amount) AS sp, bool_and(amount > 4) AS all_big
+               FROM changes GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn global_count_distinct() {
+    // Several count(DISTINCT) over different arguments, next to MIN and MAX, which then share the value rows.
+    let sql = "SELECT game_id, count(DISTINCT user_id) AS users, count(DISTINCT amount) AS amounts, count(*) AS n,
+                      min(amount) AS lo, max(user_id) AS last_user
+               FROM clicks GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    // No GROUP BY, NULLs not counted, and HAVING on a distinct count.
+    check_view("SELECT count(DISTINCT game_id) AS games, count(DISTINCT amount) AS amounts FROM clicks", &EPOCHS, true);
+    check_view(
+        "SELECT g.studio, count(DISTINCT c.user_id) AS users FROM clicks c JOIN games g ON g.game_id = c.game_id
+         GROUP BY 1 HAVING count(DISTINCT c.user_id) > 3",
+        &EPOCHS,
+        false,
+    );
+}
+
+#[test]
+fn global_count_distinct_over_retractions() {
+    // A value stays counted while any of its rows is left; a group whose values are all retracted counts 0.
+    let sql = "SELECT game_id, count(DISTINCT user_id) AS users, count(DISTINCT amount) AS amounts, max(amount) AS hi
+               FROM changes GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view("SELECT count(DISTINCT user_id) AS users FROM changes WHERE amount > 3", &EPOCHS, true);
+}
