@@ -143,6 +143,15 @@ jobs:
           docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.1.0 check config /etc/prometheus/prometheus.yml
           python3 -m json.tool deploy/grafana/dashboards/duckwake.json >/dev/null
 
+  # dbt/ as published to duckwake/dbt-duckwake: the layout, and publishing to main and tags, against a local
+  # repository (scripts/mirror_dbt_test.sh). The dbt suite deploys the example from the same layout.
+  dbt-mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/mirror_dbt_test.sh
+
   # One check for branch protection: green only when the build, every suite and the monitoring checks are.
   # Every dependency's license is on deny.toml's list, and THIRD_PARTY_LICENSES.md matches Cargo.lock.
   licenses:
@@ -161,7 +170,7 @@ jobs:
 
   ci-passed:
     if: always()
-    needs: [build, suite, monitoring, licenses]
+    needs: [build, suite, monitoring, licenses, dbt-mirror]
     runs-on: ubuntu-24.04
     steps:
-      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success && "${{ needs.monitoring.result }}" == success && "${{ needs.licenses.result }}" == success ]]'
+      - run: '[[ "${{ needs.build.result }}" == success && "${{ needs.suite.result }}" == success && "${{ needs.monitoring.result }}" == success && "${{ needs.licenses.result }}" == success && "${{ needs.dbt-mirror.result }}" == success ]]'

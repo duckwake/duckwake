@@ -1,0 +1,40 @@
+# Publishes dbt/ as the root of duckwake/dbt-duckwake (scripts/mirror_dbt.sh, docs/releasing.md), so that dbt Hub
+# and `packages: - git:` find the package. Runs on every push to main that changes the package, and by hand.
+# Release tags are published by the release workflow's dbt-package job.
+# Needs the secret DBT_MIRROR_TOKEN: a fine-grained token with contents write access to duckwake/dbt-duckwake.
+name: dbt-mirror
+on:
+  push:
+    branches: [main]
+    paths:
+      - dbt/**
+      - LICENSE
+      - scripts/mirror_dbt.sh
+      - .github/workflows/dbt-mirror.yml
+  workflow_dispatch:
+
+# One at a time and in order: a later push must not be overtaken by an earlier one.
+concurrency:
+  group: dbt-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: publish to duckwake/dbt-duckwake main
+        env:
+          TOKEN: ${{ secrets.DBT_MIRROR_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          [[ -n $TOKEN ]] || { echo "::error::the secret DBT_MIRROR_TOKEN is not set (docs/releasing.md)"; exit 1; }
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone -q --depth 1 "https://x-access-token:$TOKEN@github.com/${{ github.repository_owner }}/dbt-duckwake.git" "$RUNNER_TEMP/mirror"
+          scripts/mirror_dbt.sh layout "$RUNNER_TEMP/mirror" main
+          scripts/mirror_dbt.sh publish "$RUNNER_TEMP/mirror"
