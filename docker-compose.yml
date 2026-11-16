@@ -17,7 +17,8 @@ services:
   # 19094 SASL over TLS, 19095 TLS with client certificates (test-only certs in docker/kafka). The SCRAM user
   # duckwake / duckwake-dev is created once the cluster is up.
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:latest
+    # Pinned: `latest` moves with every Redpanda release, so CI could test against a broker no change asked for.
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.7
     entrypoint:
       - bash
       - -c
@@ -38,9 +39,11 @@ services:
 
   # S3-compatible storage for the object-storage tests (LAKE_STORAGE=s3 in scripts/lib.sh): bucket duckwake,
   # key duckwake / duckwake-dev, S3 API on localhost:19900. MinIO no longer publishes community images to
-  # Docker Hub; Chainguard builds them from source.
+  # Docker Hub; Chainguard builds them from source and rebuilds `latest` daily, its only free tag, so this pins the
+  # build of 2026-11-15 (MinIO RELEASE.2026-11-12T01-15-23Z) by digest. Chainguard's registry has no Docker Hub
+  # pull limit.
   minio:
-    image: cgr.dev/chainguard/minio:latest
+    image: cgr.dev/chainguard/minio@sha256:18c8fa28697b25e0f34c6faae171079e88a03efb8e76a21d3b5d07b4e3cbef3e
     environment:
       MINIO_ROOT_USER: duckwake
       MINIO_ROOT_PASSWORD: duckwake-dev

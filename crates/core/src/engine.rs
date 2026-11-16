@@ -734,14 +734,7 @@ impl Worker {
     /// error belongs to the run that was fenced, and a dropped view has nothing to mark.
     fn fail_job(&mut self, id: &str, why: &str) -> Result<()> {
         let held = self.jobs.get(id).map(|j| j.lease);
-        let failed = match held {
-            Some(lease) => catalog::fail_if_held(&self.conns[0], id, &self.cfg.worker_id, lease)?,
-            None if catalog::job_status(&self.conns[0], id)?.is_some() => {
-                catalog::set_status(&self.conns[0], id, crate::model::JobStatus::Failed, None)?;
-                true
-            }
-            None => false,
-        };
+        let failed = catalog::fail_if_held(&self.conns[0], id, &self.cfg.worker_id, held)?;
         if failed {
             warn!(job = %id, error = %why, "view stopped: marking it failed");
             if let Some(m) = &self.cfg.metrics {
@@ -802,13 +795,10 @@ impl Worker {
                         warn!(job = %id, error = %format!("{e:#}"), "waiting for the topic; retrying every refresh");
                     }
                 }
-                Err(e) => {
-                    warn!(job = %id, error = %format!("{e:#}"), "cannot start job; marking failed");
-                    catalog::set_status(&self.conns[0], &id, crate::model::JobStatus::Failed, None)?;
-                    if let Some(m) = &self.cfg.metrics {
-                        m.record_view_failed();
-                    }
-                }
+                // Also when the view was stopped or dropped while it started (a dbt --full-refresh drops and
+                // creates views while workers run them): then there is nothing to mark, and this worker carries
+                // on with its other views.
+                Err(e) => self.fail_job(&id, &format!("cannot start job: {e:#}"))?,
             }
         }
         Ok(())
