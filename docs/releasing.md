@@ -70,7 +70,9 @@ settings → Change visibility).
 1. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new `## [X.Y.Z] - YYYY-MM-DD` heading, with notes
    on anything an upgrade needs (see Versioning), and update the links at the bottom.
 2. Set `version = "X.Y.Z"` in `Cargo.toml` and run `cargo build` (it updates `Cargo.lock`); set
-   `version: 'X.Y.Z'` in `dbt/dbt_project.yml`.
+   `version: 'X.Y.Z'` in `dbt/dbt_project.yml`; regenerate the notices, which list DuckWake's own crates with
+   their version (`cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md`; CI's `licenses` job fails until
+   they match).
 3. Open a pull request; merge it when `ci-passed` is green.
 4. Tag the merge commit and push the tag:
    `git tag -a vX.Y.Z -m "DuckWake X.Y.Z" && git push origin vX.Y.Z`.
