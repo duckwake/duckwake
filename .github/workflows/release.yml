@@ -118,6 +118,9 @@ jobs:
           (cd dist/assets && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
           # The release notes: this version's section of the changelog.
           awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on' CHANGELOG.md > dist/notes.md
+          # Relative links in the changelog point at files in the repository; on the release page they would
+          # resolve under /releases/tag/, so they point at the files as of this tag instead.
+          sed -i -E "s#\]\((\./)?([^):#/][^):]*)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/\2)#g" dist/notes.md
           cat dist/notes.md
       - uses: actions/upload-artifact@v4
         with:
