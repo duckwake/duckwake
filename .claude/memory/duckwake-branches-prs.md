@@ -14,6 +14,12 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
 4. PR #2: F3, backfill and retention of views over lake inputs, with three engine fixes found by its CI (each run
    of a view stages into its own tables; a dropped view no longer stops its worker; a failed verify rolls back).
 5. PR #4: dbt-duckwake in `dbt/` (dbt plan step 3).
+6. 2026-11-15/16: PR #7 (pull Docker Hub images once per CI run), #8 (pinned Redpanda and MinIO), #9 (a worker
+   survives a view dropped while it starts it), #10 (zero-downtime replace on the roadmap), #12 (a lease is taken
+   only while the view runs), #13 (more aggregates: variances, stddev, `count(DISTINCT)`, `bool_and`/`bool_or`,
+   windowed `HAVING`), #15 (a worker survives a view dropped while its epoch stages), #14 (SQL reference
+   restructured), #11 (release copies extensions into the website's `public/`), #16 (dbt/ mirrored to
+   duckwake/dbt-duckwake). PR #6 carries this memory.
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository
