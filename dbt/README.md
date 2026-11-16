@@ -123,5 +123,5 @@ in CI ([testing.md](../docs/testing.md)).
 
 ## Not yet
 
-Zero-downtime replace (build beside, catch up, swap); changing a source other than adding columns; `store_failures`
+Zero-downtime replace (build beside, catch up, swap; next on the [roadmap](../docs/roadmap.md)); changing a source other than adding columns; `store_failures`
 as a view; a dbt Hub listing, which needs the package in a repository of its own.
