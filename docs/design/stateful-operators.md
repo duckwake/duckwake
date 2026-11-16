@@ -117,9 +117,9 @@ Feldera lists no approximate aggregates. DuckDB's exported states give DuckWake 
 | --- | --- | --- | --- |
 | Filter, project, scalar functions | Yes; SQL and Rust UDFs | Yes; DuckDB's functions, no UDF registration | — |
 | `UNION ALL` of streams | Yes | One source per view | Stage 2 |
-| `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT` | Yes, a count per distinct row | Rejected | Stage 3 |
-| Linear aggregates: `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR`, `COVAR`, `REGR_*` | Yes | `COUNT`, `SUM`, `AVG` | Stage 2 |
-| Ordered aggregates: `MIN`, `MAX`, `ARG_MIN` / `ARG_MAX`, `BOOL_AND` / `BOOL_OR` | Yes, under retractions | `MIN` / `MAX` on append-only input | Stage 3 |
+| `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT` | Yes, a count per distinct row | `SELECT DISTINCT`; `count(DISTINCT)` in `GROUP BY` views (built 2026-11-16) | Stage 3 |
+| Linear aggregates: `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR`, `COVAR`, `REGR_*` | Yes | `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR` (built 2026-11-16, branch `aggregates-group1`) | Stage 2: `COVAR`, `REGR_*` |
+| Ordered aggregates: `MIN`, `MAX`, `ARG_MIN` / `ARG_MAX`, `BOOL_AND` / `BOOL_OR` | Yes, under retractions | `MIN` / `MAX`, `BOOL_AND` / `BOOL_OR`; under retractions in `GROUP BY` views | Stage 3: `ARG_MIN` / `ARG_MAX`, windows under retractions |
 | `ARRAY_AGG`, `MODE`, `list`, `string_agg` | Yes, O(N) | Rejected | Stage 3 |
 | `approx_count_distinct`, quantiles | None | Rejected | Stage 2, exported states |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | Yes | Rejected | Stage 3 |

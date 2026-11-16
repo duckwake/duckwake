@@ -68,7 +68,15 @@ log "drain to the end of the topic, then let the chain catch up"
 "$BIN" run $WORKER_FLAGS --worker w1 >>"$OUT/worker.log" 2>&1 &
 pid=$!; end=$(topic_end)
 for _ in $(seq 1 120); do [[ "$(committed chain_big)" == "$end" ]] && break; sleep 1; done
-sleep 15
+# The windows downstream are on commit times (_commit_ts, then window_end), so when the crashes left most rows
+# to this run, they all fall in the 30 s window the drain committed them in, which closes only once the
+# chain's watermark, carried by its own commits and the worker's heartbeats, passes its end: up to 30 s plus a
+# 10 s window later. Wait for that rather than a fixed time.
+for _ in $(seq 1 90); do
+  [[ $("$BIN" sql --csv "SELECT count(*) FROM lake.analytics.chain_per_30s" 2>/dev/null | tail -1) -gt 0 ]] && break
+  sleep 1
+done
+sleep 3
 echo "injected aborts: $(grep -c 'crash injected' "$OUT/worker.log" || true), epochs committed: $(grep -c 'epoch committed' "$OUT/worker.log" || true)"
 log "verify"; verify_chain || failed=1
 rows=$(awk -F': ' '/expected_rows/ {gsub(/,/,"",$2); print $2}' "$OUT/verify_chain_per_30s.txt")

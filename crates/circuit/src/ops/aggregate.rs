@@ -119,8 +119,13 @@ impl Stateful for Aggregate {
                     // Emit the windows the watermark closed, then drop them from the state. Over retractions a
                     // window and group whose rows were all retracted has a weight of 0 and no row.
                     let live = if plan.retracts() { format!(" AND {WINDOW_WEIGHT} <> 0") } else { String::new() };
+                    // With HAVING, only the closed windows that pass it are emitted; all of them leave the state.
+                    let (from, having) = match &plan.window_having {
+                        Some(h) => (h.over(&st), format!(" AND ({})", h.condition)),
+                        None => (st.clone(), String::new()),
+                    };
                     let sql = format!(
-                        "INSERT INTO {} ({}) SELECT {}, {} FROM {st} WHERE __we <= {wm}{live}",
+                        "INSERT INTO {} ({}) SELECT {}, {} FROM {from} WHERE __we <= {wm}{live}{having}",
                         x.sink,
                         cx.sink_cols(),
                         plan.final_select,

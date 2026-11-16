@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- **More aggregates.** `var_samp` (`variance`), `var_pop`, `stddev_samp` (`stddev`) and `stddev_pop`, in windowed
+  and `GROUP BY` views, from each group's count, sum and sum of squares, so they follow updates and deletes;
+  `bool_and` and `bool_or`, wherever `min` and `max` work; `count(DISTINCT x)` in `GROUP BY` views, with the
+  state counting each group's values, also over inputs that update or delete; and `HAVING` in windowed views,
+  which emit only the closed windows that pass it. An aggregate still unsupported is refused when the view is
+  created, with the list of those that are ([sql.md](docs/sql.md#aggregates)).
 - `--max-spill` (`DUCKWAKE_MAX_SPILL`) bounds the disk a worker's DuckDB spills to; past it an epoch runs out of
   memory and the worker shrinks its epochs, as past `--memory-limit`.
 - **dbt-duckwake**, in `dbt/`: Kafka sources and streaming views as dbt models on dbt-duckdb
