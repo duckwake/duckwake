@@ -1211,7 +1211,10 @@ impl Worker {
         let results = parallel(conns, items, |conn, (id, j, srcs, overlay)| {
             stage_view(conn, id, j, &srcs, parity, overlay).with_context(|| format!("job {id}: staging failed"))
         });
-        // A view whose input broke a promise it relies on stops alone; any other failure fails the worker.
+        // A view whose input broke a promise it relies on stops alone, and so does one this worker no longer holds:
+        // dropped, stopped or replaced while it staged (a dbt --full-refresh does that to running views), it fails
+        // on its own missing tables, and the caller lets it go without marking it failed. Any other failure fails
+        // the worker.
         let mut staged: Vec<(String, Staged)> = Vec::new();
         let mut stopped = Vec::new();
         for (id, r) in jobs.keys().zip(results) {
@@ -1227,6 +1230,9 @@ impl Worker {
                 )),
                 Ok(s) => staged.push((id.clone(), s)),
                 Err(e) if e.downcast_ref::<StopJob>().is_some() => stopped.push((id.clone(), format!("{e:#}"))),
+                Err(e) if !catalog::holds_lease(&conns[0], id, &cfg.worker_id, jobs[id].lease)? => {
+                    stopped.push((id.clone(), format!("{e:#}")))
+                }
                 Err(e) => return Err(e),
             }
         }
