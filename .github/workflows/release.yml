@@ -192,11 +192,11 @@ jobs:
           path: site-repo
       # Each DuckDB version's folder is replaced; the folders of other DuckDB versions stay.
       - run: |
-          mkdir -p site-repo/site/extensions
-          for d in extensions/*/; do rm -rf "site-repo/site/extensions/$(basename "$d")"; cp -R "$d" site-repo/site/extensions/; done
+          mkdir -p site-repo/public/extensions
+          for d in extensions/*/; do rm -rf "site-repo/public/extensions/$(basename "$d")"; cp -R "$d" site-repo/public/extensions/; done
           cd site-repo
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/extensions
+          git add public/extensions
           git commit -m "Extension repository for DuckWake ${{ needs.check.outputs.version }}" || exit 0
           git push

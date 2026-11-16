@@ -42,7 +42,8 @@ Verify a download: `sha256sum -c SHA256SUMS --ignore-missing`.
 
 **The extension repository on the website.** When the repository variable `PUBLISH_EXTENSIONS` is `true` and
 the secret `PAGES_TOKEN` (a fine-grained token with contents write access to `duckwake/duckwake.github.io`) is
-set, a release also copies the extension repository into that site, so users install with
+set, a release also copies the extension repository into that site's `public/extensions/` and pushes it, which
+redeploys the site, so users install with
 `INSTALL duckwake FROM 'https://duckwake.github.io/extensions'`. The site is public: turn this on only when the
 extension may be public.
 

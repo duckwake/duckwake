@@ -10,6 +10,8 @@ their own tables.
 
 DuckWake brings streaming SQL to DuckDB, built on DuckDB 2.0 and DuckLake 1.1.
 
+Website and docs: **https://duckwake.github.io**
+
 ## Quick start
 
 You need Docker (for PostgreSQL, the lake's catalog, and Redpanda, the Kafka) and Rust.
