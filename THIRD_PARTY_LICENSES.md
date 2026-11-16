@@ -4866,10 +4866,10 @@ SOFTWARE.
 ## MIT License
 
 Used by:
-- duckwake_circuit 0.1.0
-- duckwake_core 0.1.0
-- duckwake 0.1.0
-- duckwake_extension 0.1.0
+- duckwake_circuit 0.2.0
+- duckwake_core 0.2.0
+- duckwake 0.2.0
+- duckwake_extension 0.2.0
 - chrono-tz 0.10.4
 - chrono 0.4.45
 - crc32c 0.6.8

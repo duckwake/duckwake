@@ -20,8 +20,8 @@ packages:
 
 Each DuckWake release tags the package with its own version in
 [duckwake/dbt-duckwake](https://github.com/duckwake/dbt-duckwake); use the tag that matches your workers, since the
-package calls the functions of that version. `revision: main` follows the latest unreleased engine; until 0.2.0,
-the first release to tag the package, it is the only revision there. The package is
+package calls the functions of that version. `revision: main` follows the latest unreleased engine. 0.2.0 is the
+first version tagged there. The package is
 written in [`dbt/`](https://github.com/duckwake/duckwake/tree/main/dbt) of the DuckWake repository, so
 `git: "https://github.com/duckwake/duckwake.git"` with `subdirectory: dbt` installs the same files.
 

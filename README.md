@@ -61,7 +61,7 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 
 ## Status
 
-Version 0.1, on its [roadmap](docs/roadmap.md) to production. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
+Version 0.2, on its [roadmap](docs/roadmap.md) to production. Kafka with JSON only; filters, projections, lookup joins, `SELECT DISTINCT`, `UNION ALL`
 across sources, windowed and global aggregates (`count`, `sum`, `avg`, `min`, `max`, `bool_and`, `bool_or`, the
 variances and standard deviations, and `count(DISTINCT)` in `GROUP BY` views), with `HAVING`. A view can also read
 another view's table or a lake table through its DuckLake change feed (`FROM analytics.clicks_per_min`), with
