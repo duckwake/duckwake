@@ -71,6 +71,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A worker no longer exits when a view is dropped or replaced while one of its epochs stages. The epoch failed on
+  the view's missing tables, and any staging error stopped the worker and every other view it ran; a `dbt run
+  --full-refresh`, which drops and creates views while workers run them, set this off in CI. A view whose epoch
+  fails to stage is now let go when the worker no longer holds it; a staging error on a view it still holds
+  fails the worker as before.
 - A view paused or stopped while its worker was starting it no longer keeps running. The worker starts views
   from a list of running views it read a moment before; it took a fresh lease without checking that the view
   still ran, undoing the fence the pause had set, so the paused view's epochs kept committing until the next
