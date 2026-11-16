@@ -1,54 +1,134 @@
 # SQL functions
 
-The same functions exist in the server (`duckwaked`, also over Quack) and in the extension. A view is named by the
-DuckLake table it maintains (`analytics.clicks_per_min`); functions take that name or the bare table name, which
-is the view's job id. Actions return `(view, result)` rows.
+Every `duckwake_*` function works the same in the server (`duckwaked`, also over Quack) and in the extension
+(`LOAD duckwake`). The [CLI](cli.md) has a command for each one; see [the same in the CLI](#the-same-in-the-cli).
 
-A view's `FROM` names a Kafka source, or reads a lake table or another view's table through its DuckLake
-change feed: `SELECT game, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game` needs no source. A lake
-table joined to a Kafka source is a lookup instead, read as it is when each event is processed;
-`duckwake_explain` shows `ChangeFeed(...)` or `Lookup(...)` for each. Every lake input gets a `_commit_ts`
-column, the commit time of the row's version. A view takes the table's updates and deletes: it removes the
-rows it no longer holds, so a filter's table counts each row in `_duckwake_count`, and `DISTINCT` and
-`GROUP BY` views keep their rows up to date. Windows over a lake input use `_commit_ts`, or a windowed view's
-`window_start` or `window_end`, and get an exact watermark; a window is final once it closes, so a windowed
-view needs its lake tables insert-only (an update or delete stops it) and cannot read a view whose rows
-change. To keep time buckets current instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`. Dropping a
-view that another view reads is refused.
+A view is named by the DuckLake table it keeps up to date, such as `analytics.clicks_per_min`. Functions take
+that name or the bare table name (`clicks_per_min`), which is also the view's job id. Functions that change
+something return `(view, result)` rows.
 
-A new view over lake inputs starts from the rows they already hold (`start := 'earliest'`, the default): it reads
-each input as it was when the view was created (the snapshot S0, which it holds from then on, even while stopped), `max_rows` rows per epoch in `rowid` order, then the changes
-after that snapshot. Each row keeps the `_commit_ts` of its version. A backfill continues where it stopped after a
-crash, and a windowed view closes no window until its backfill is done. `start := 'latest'` holds only the rows
-written after the view was created. Maintenance never expires a snapshot a view still needs, from the oldest
-position of any view that is not dropped, paused and stopped ones included; `duckwake_snapshots_held_seconds`
-says how far back that is ([alerts](alerts.md#duckwakesnapshotsheld)).
+## At a glance
+
+| Task | Functions |
+| --- | --- |
+| [Sources](#sources) | `duckwake_create_source`, `duckwake_add_source_column`, `duckwake_sources` |
+| [Views](#views) | `duckwake_create_view`, `duckwake_alter_view` |
+| [Running views](#running-views) | `duckwake_start`, `duckwake_pause`, `duckwake_stop`, `duckwake_reset`, `duckwake_drop` |
+| [Workers](#workers) | `duckwake_workers`, `duckwake_drain` |
+| [Checking views](#checking-views) | `duckwake_jobs`, `duckwake_checkpoints`, `duckwake_verify`, `duckwake_explain`, `duckwake_wait`, `duckwake_metrics`, `duckwake_worker_status` |
+| [Extension only](#extension-only) | `duckwake_connect`, `duckwake_worker_start`, `duckwake_worker_stop` |
+| [In the view's SQL](#windows) | `TUMBLE`, `HOP`, [aggregates](#aggregates) |
+
+## Sources
+
+A source is a Kafka topic with a schema. It holds no data; it tells views how to read the topic.
+
+```sql
+CALL duckwake_create_source('clicks', 'kafka', '{
+  "brokers": "localhost:19092", "topic": "clicks",
+  "event_time": "ts", "watermark_delay": "5 seconds",
+  "columns": {"ts": "TIMESTAMP", "game_id": "VARCHAR", "amount": "DECIMAL(18,2)"}}');
+```
 
 | Function | Does |
 | --- | --- |
-| `duckwake_create_source(name, kind, options_json)` | register a Kafka source |
-| `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=, start :=, if_exists :=, replace :=)` | create the table `name` and its job; `start := 'latest'` skips the rows its lake inputs already hold. When the view exists, `if_exists := 'update'` changes only its settings (or nothing) and refuses a changed query, and `replace := true` (`if_exists := 'replace'`) replaces it, which recomputes from the start; the result starts with `created`, `unchanged`, `altered` or `replaced` ([details](cli.md#changing-views-and-sources)) |
-| `duckwake_add_source_column(source, column, type)` | add a column to a source; views that read it keep their columns |
-| `duckwake_alter_view(view, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=)` | change how a view runs without recomputing it; a limit of 0 removes it ([limits](cli.md#limits)) |
-| `duckwake_start(view, worker :=)` / `duckwake_pause(view)` / `duckwake_stop(view)` | lifecycle; `start` puts the view on the server's worker, `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it |
-| `duckwake_reset(view, to_epoch)` / `duckwake_drop(view, keep_table :=)` | rewind and replay / remove. The views that read the view's table with retractions follow the reset through its change feed; windowed views over it, which read it insert-only, are emptied and backfill again from its table. A reset to an epoch whose snapshot has expired is refused |
-| `duckwake_jobs()` / `duckwake_checkpoints(view, n :=)` / `duckwake_sources()` | status, history, sources |
-| `duckwake_workers()` / `duckwake_drain(worker)` | every worker that ran on the lake: state, views, load, last heartbeat / hand all of a worker's views to the others before taking it out |
-| `duckwake_verify(view)` | the differential exactly-once check |
-| `duckwake_explain(view)` | the view's operator circuit, how it was made incremental, and one epoch's SQL ([internals](internals.md#views-as-dbsp-circuits)) |
-| `duckwake_wait(view, timeout_s :=)` | block until the view has committed what its topic holds now |
-| `duckwake_metrics()` | the worker's numbers as rows: `(metric, worker, view, value)` |
-| `duckwake_worker_status()` | the worker: running, restarts, last error and when |
+| `duckwake_create_source(name, kind, options_json)` | Register a source. `kind` is `'kafka'`. |
+| `duckwake_add_source_column(source, column, type)` | Add a column to a source while views read it. Views that already read the source keep their columns. |
+| `duckwake_sources()` | Every source with its options. |
 
-Only in the extension:
+The options:
 
-| Extension-only function | Does |
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `brokers`, `topic` | required | Where to read. |
+| `columns` | required | The columns and their DuckDB types, decoded from each JSON message. |
+| `event_time` | required | The column holding each event's time; windows and the watermark use it. |
+| `watermark_delay` | `"30 seconds"` | How late an event may arrive before its window closes without it. |
+| `idle_timeout` | `"60 seconds"` | A partition with no events for this long no longer holds the watermark back. |
+| `start` | `"earliest"` | Where a new view starts in the topic: `earliest` or `latest`. |
+| `decode` | `"auto"` | `auto` decodes with Arrow when every column type allows it, `sql` always in SQL, `arrow` refuses types Arrow can't decode. |
+| `security_protocol`, `sasl_*`, `ssl_*` | `plaintext` | Kafka authentication and TLS; see [views and sources](cli.md#views-and-sources) in the CLI guide. A password is `env:NAME` or `file:/path`, never stored in the lake. |
+
+## Views
+
+A view is a `SELECT`. DuckWake creates its table and the job that keeps the table equal to the query.
+
+```sql
+CALL duckwake_create_view('analytics.clicks_per_min',
+  'SELECT window_start, game_id, count(*) AS n, sum(amount) AS revenue
+   FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL',
+  epoch_interval := '10s', late_data := 'analytics.clicks_late');
+```
+
+`duckwake_create_view(name, sql, ...)` takes these options:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `epoch_interval` | `'10s'` | How often an epoch runs. |
+| `max_rows` | `100000` | Most events (or lake rows) one epoch reads. |
+| `late_data` | none | A table for events that arrive after their window closed (windowed views). Without it they are counted in the checkpoint (`rows_late`) and dropped. |
+| `max_state_rows` | none | Most rows the view's state may hold; past it the view fails alone ([limits](cli.md#limits)). |
+| `max_late_rows` | none | Most late rows one epoch may write; past it the view fails alone. |
+| `start` | `'earliest'` | Over lake tables and other views: `earliest` starts from the rows they already hold, `latest` from rows written after the view is created ([backfill](#backfill)). |
+| `if_exists` | `'fail'` | When the view exists: `fail`; `update` changes only its settings and refuses a changed query; `replace` replaces it and recomputes from the start. `replace := true` is the same as `'replace'`. |
+| `inline_row_limit` | `10000` | Rows of the view's table kept inlined in the catalog before they go to Parquet. |
+| `checkpoint` | `'ducklake'` | Where the state lives; `ducklake` is the only backend. |
+
+The result starts with what happened: `created`, `unchanged`, `altered` or `replaced`
+([details](cli.md#changing-views-and-sources)).
+
+`duckwake_alter_view(view, epoch_interval :=, max_rows :=, max_state_rows :=, max_late_rows :=)` changes how a
+view runs without recomputing it. A limit of 0 removes it.
+
+## Running views
+
+| Function | Does |
 | --- | --- |
-| `duckwake_connect(catalog, data_path :=)` | pick the lake |
-| `duckwake_worker_start(worker :=, stage_threads :=, pipeline :=, shared_readers :=, lean_commit :=, metrics :=, position_refresh :=)` | run a supervised worker in this process; `position_refresh` is `--position-refresh` (default `'5m'`); `metrics` also serves `GET /metrics` |
-| `duckwake_worker_stop()` | stop it after its current epoch |
+| `duckwake_start(view, worker :=)` | Start the view. On the server it runs on the server's worker; `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it. |
+| `duckwake_pause(view)` / `duckwake_stop(view)` | Stop the view. Its worker is fenced at once, so an epoch in flight does not land and `drop` or `reset` can follow straight away. `start` continues from the last checkpoint. |
+| `duckwake_reset(view, to_epoch)` | Rewind to an epoch and replay from there. Views that read this view's table with retractions follow the reset through its change feed; windowed views that read it insert-only are emptied and backfill again. A reset to an epoch whose snapshot has expired is refused. |
+| `duckwake_drop(view, keep_table :=)` | Remove the view and its table (`keep_table := true` keeps the table). Dropping a view that another view reads is refused. |
 
-`TUMBLE(src, col, size)` and `HOP(src, col, size, slide)` are used inside the view SQL.
+## Workers
+
+| Function | Does |
+| --- | --- |
+| `duckwake_workers()` | Every worker that ran on the lake: state, views, load and last heartbeat. |
+| `duckwake_drain(worker)` | Hand all of a worker's views to the others before taking it out. |
+
+## Checking views
+
+| Function | Does |
+| --- | --- |
+| `duckwake_jobs()` | Every view: status, epoch, watermark, freshness, lag. |
+| `duckwake_checkpoints(view, n :=)` | The view's last `n` checkpoints (default 10). |
+| `duckwake_verify(view)` | The exactly-once check: the view's SQL run as one batch query over everything it has read, compared with its table. |
+| `duckwake_explain(view)` | The view's operator circuit, how it was made incremental, and one epoch's SQL ([internals](internals.md#views-as-dbsp-circuits)). |
+| `duckwake_wait(view, timeout_s :=)` | Block until the view has committed what its topic holds now (default timeout 60 s). |
+| `duckwake_metrics()` | The worker's numbers as rows: `(metric, worker, view, value)`. |
+| `duckwake_worker_status()` | The worker: running, restarts, last error and when. |
+
+`duckwake_verify` and `duckwake_jobs` are table functions: `FROM duckwake_verify('clicks_per_min')`.
+
+## Extension only
+
+| Function | Does |
+| --- | --- |
+| `duckwake_connect(catalog, data_path :=)` | Pick the lake. |
+| `duckwake_worker_start(worker :=, stage_threads :=, pipeline :=, shared_readers :=, lean_commit :=, metrics :=, position_refresh :=)` | Run a supervised worker in this process. `position_refresh` is `--position-refresh` (default `'5m'`); `metrics` also serves `GET /metrics`. The flags are described in [performance](performance.md). |
+| `duckwake_worker_stop()` | Stop the worker after its current epoch. |
+
+## Windows
+
+`TUMBLE(src, col, size)` and `HOP(src, col, size, slide)` go in the view's `FROM` and add `window_start` and
+`window_end`. A window is written to the view's table once the watermark passes its end, and is final from then
+on; an event for a closed window goes to the `late_data` table.
+
+```sql
+SELECT window_end, game_id, count(*) AS n
+FROM HOP(clicks, ts, INTERVAL 1 MINUTE, INTERVAL 20 SECOND)
+GROUP BY ALL
+```
 
 ## Aggregates
 
@@ -70,6 +150,41 @@ does. They are computed as (Σx² − (Σx)²/n) in DOUBLE, which matches DuckDB
 significant digits while a group's mean is within about 10⁴ times its standard deviation; beyond that the
 difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
 (`var_samp(x - 1000000)`) to keep full precision, since the variance does not change.
+
+## Views over lake tables and other views
+
+A view's `FROM` can read a lake table, or another view's table, instead of a Kafka source. It needs no source:
+
+```sql
+SELECT game_id, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game_id
+```
+
+- **Change feed or lookup.** Read on its own, a lake table is read through its DuckLake change feed: the rows
+  inserted, updated and deleted since the last snapshot the view read. Joined to a Kafka source, it is a lookup
+  instead, read as it is when each event is processed. `duckwake_explain` shows `ChangeFeed(...)` or
+  `Lookup(...)` for each.
+- **`_commit_ts`.** Every lake input gets a `_commit_ts` column: the commit time of the row's version.
+- **Updates and deletes.** A view removes the rows it no longer holds: a filter's table counts each row in
+  `_duckwake_count`, and `DISTINCT` and `GROUP BY` views keep their rows up to date.
+- **Windows.** Windows over a lake input use `_commit_ts`, or a windowed view's `window_start` or `window_end`,
+  and get an exact watermark. A window is final once it closes, so a windowed view needs its lake tables
+  insert-only (an update or delete stops it) and cannot read a view whose rows change. To keep time buckets
+  current instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`.
+
+### Backfill
+
+A new view over lake inputs starts from the rows they already hold (`start := 'earliest'`, the default):
+
+1. It reads each input as it was when the view was created (the snapshot S0, which it holds from then on, even
+   while stopped), `max_rows` rows per epoch in `rowid` order. Each row keeps the `_commit_ts` of its version.
+2. Then it reads the changes after S0.
+
+A backfill continues where it stopped after a crash, and a windowed view closes no window until its backfill is
+done. `start := 'latest'` holds only the rows written after the view was created.
+
+Maintenance never expires a snapshot a view still needs: it keeps every snapshot from the oldest position of
+any view that is not dropped, paused and stopped ones included. `duckwake_snapshots_held_seconds` says how far
+back that is ([alerts](alerts.md#duckwakesnapshotsheld)).
 
 ## The same in the CLI
 
