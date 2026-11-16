@@ -69,6 +69,10 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A worker no longer exits when a view it is starting is dropped meanwhile. It tried to mark the view failed,
+  found no such view, and stopped with every other view it ran; a `dbt run --full-refresh`, which drops and
+  creates views while workers run, set this off in CI. A view that fails to start is now marked failed only
+  while it is still running on that worker; one dropped, stopped or taken over meanwhile is let go.
 - A worker no longer hangs starting a view whose topic was just created. Kafka clients retry a partition
   without a leader for ever, and the worker waited on that in its own loop: it stopped heartbeating, other
   workers took its views, and it did not stop on SIGTERM. A reader now gives up after 5 s and the view waits
