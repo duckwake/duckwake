@@ -29,7 +29,9 @@ extension. dbt gives files, review, CI, `ref()` order, tests and docs with no C+
 Answered: dbt-duckdb installs the extension from a repository path or URL (`repo:` needs its own quotes;
 `config_options: {allow_unsigned_extensions: true}`); the compiler accepts quoted `"lake"."schema"."table"`, and
 the package rewrites `ref()` to a source model into the bare source name. On 2026-11-16 the user created
-`duckwake/dbt-duckwake` and chose to keep writing the package in `dbt/` and mirror it there (branch `dbt-mirror`):
-`.github/workflows/dbt-mirror.yml` on pushes to main, the release's `dbt-package` job tags `vX.Y.Z` there; both
-need the secret `DBT_MIRROR_TOKEN`, which the user adds. Never edit dbt-duckwake by hand. The dbt Hub listing is a
+`duckwake/dbt-duckwake` and chose to keep writing the package in `dbt/` and mirror it there (PR #16, merged
+2026-11-16): `.github/workflows/dbt-mirror.yml` on pushes to main, the release's `dbt-package` job tags `vX.Y.Z`
+there; both use the secret `DBT_MIRROR_TOKEN` (a fine-grained token, Contents write on dbt-duckwake only, set by
+the user; it expires, and the mirror then fails naming it). The first mirror run published `main` there the same
+day, identical to `scripts/mirror_dbt.sh layout`. Never edit dbt-duckwake by hand. The dbt Hub listing is a
 PR to dbt-labs/hubcap after the first tag (needs the user's go-ahead). Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).
