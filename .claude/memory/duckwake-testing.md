@@ -14,7 +14,8 @@ metadata:
 - The integration suites use their own lake (`scripts/lib.sh`: database `$TEST_DB`, data under `.lake/test/`),
   so they are safe to run while the playground runs. The playground may hold port 9464; run `serve_test.sh`
   with `QUACK_PORT=9495 METRICS_PORT=9465`.
-- `scripts/limits_test.sh` pins `--threads 12`: under a 64 MB limit an epoch only runs out of memory with many
+- `scripts/limits_test.sh` pins `--threads 12` and `--max-spill 32MB`: under a 64 MB limit DuckDB spills before it
+  runs out, so without the spill cap a roomy runner never exercises the limit. Before that, an epoch only ran out of memory with many
   DuckDB threads (4-core CI runners otherwise spill and pass).
 - Under `set -o pipefail`, put `|| true` at the end of a grep pipeline, not inside it.
 - Without Docker (cloud sessions), suites that need only PostgreSQL run with `PG_LOCAL=1` against a local
