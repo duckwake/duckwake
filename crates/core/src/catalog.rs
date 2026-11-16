@@ -952,6 +952,17 @@ pub enum Assign<'a> {
     Any,
 }
 
+/// Whether `worker` still holds `job` at lease epoch `held`: the view exists and neither a stop, pause, reset,
+/// replace nor takeover has moved its lease. A worker asks after a view's epoch fails to stage: a view dropped or
+/// replaced while it staged fails on its own missing tables, and that is not the worker's error.
+pub fn holds_lease(conn: &Connection, job: &str, worker: &str, held: i64) -> Result<bool> {
+    if job_status(conn, job)?.is_none() {
+        return Ok(false);
+    }
+    let (owner, lease_epoch) = lease(conn, job)?;
+    Ok(owner.as_deref() == Some(worker) && lease_epoch == held)
+}
+
 /// Marks `job` failed for `worker`, and fences its lease. With `held`, only while the worker holds the lease at
 /// that epoch; without (a view that failed to start, whose lease the start may have taken), only while the view
 /// is running and the worker owns it. Returns false, changing nothing, when the view was dropped or has moved
@@ -1446,6 +1457,17 @@ mod tests {
         let conn = catalog_with_view();
         conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
         assert_eq!(take_lease(&conn, "v", "w1").unwrap(), None, "dropped while the worker started it");
+    }
+
+    /// A view staged by a worker that no longer holds it (dropped, stopped, taken over) is not its error.
+    #[test]
+    fn a_worker_holds_a_view_only_at_its_own_lease() {
+        let conn = catalog_with_view();
+        assert!(holds_lease(&conn, "v", "w1", 3).unwrap());
+        assert!(!holds_lease(&conn, "v", "w1", 2).unwrap(), "an older lease: fenced");
+        assert!(!holds_lease(&conn, "v", "w2", 3).unwrap(), "another worker's view");
+        conn.execute_batch(&format!("DELETE FROM {CTL}.jobs; DROP TABLE {}", lease_table("v"))).unwrap();
+        assert!(!holds_lease(&conn, "v", "w1", 3).unwrap(), "dropped");
     }
 
     #[test]
