@@ -5,6 +5,28 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+The first release with published binaries, extension and image. Views over lake tables and other views, with
+backfill; failover and rebalancing across workers; Kafka SASL/TLS and S3; more aggregates; changing views while
+they run; limits; monitoring; and the dbt package, dbt-duckwake.
+
+### Upgrading from 0.1.0
+
+- Stop every 0.1.0 worker before the first 0.2.0 worker starts ([versioning](docs/releasing.md#versioning)). The
+  first 0.2.0 process to open the lake adds what this version stores: the `pinned_to` column of the jobs table
+  and the workers table, where workers heartbeat. A 0.1.0 lake with running and paused views was opened this way
+  and its worker took the running views over; resuming views from 0.1.0 checkpoints is part of P3's upgrade
+  tests ([roadmap](docs/roadmap.md#p3-proven-under-load-and-failure)).
+- dbt-duckwake is versioned with DuckWake: install the package at the tag of the version your workers run
+  (`revision: v0.2.0`).
+
+### Known issues
+
+- A view whose Kafka brokers cannot be reached for 10 s while its worker starts it is marked `failed` and must be
+  started again (`duckwake start`) once Kafka is back; a missing topic, by contrast, is waited for. Kafka outages
+  are among P3's failure drills.
+
 ### Added
 
 - **More aggregates.** `var_samp` (`variance`), `var_pop`, `stddev_samp` (`stddev`) and `stddev_pop`, in windowed
@@ -123,5 +145,6 @@ filters, `DISTINCT` and `UNION ALL` as incremental circuits; late-data tables an
 a view against its batch recomputation; reset and replay. The `duckwake` CLI, the `duckwaked` server over Quack
 with Prometheus metrics, the loadable extension, and the playground.
 
-[Unreleased]: https://github.com/duckwake/duckwake/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/duckwake/duckwake/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/duckwake/duckwake/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/duckwake/duckwake/releases/tag/v0.1.0
