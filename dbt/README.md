@@ -14,10 +14,16 @@ out in `dist/extensions`; releases attach one).
 ```yaml
 # packages.yml
 packages:
-  - git: "https://github.com/duckwake/duckwake.git"
-    revision: main            # or a release tag
-    subdirectory: dbt
+  - git: "https://github.com/duckwake/dbt-duckwake.git"
+    revision: v0.2.0          # the version of DuckWake your workers run
 ```
+
+Each DuckWake release tags the package with its own version in
+[duckwake/dbt-duckwake](https://github.com/duckwake/dbt-duckwake); use the tag that matches your workers, since the
+package calls the functions of that version. `revision: main` follows the latest unreleased engine; until 0.2.0,
+the first release to tag the package, it is the only revision there. The package is
+written in [`dbt/`](https://github.com/duckwake/duckwake/tree/main/dbt) of the DuckWake repository, so
+`git: "https://github.com/duckwake/duckwake.git"` with `subdirectory: dbt` installs the same files.
 
 ```yaml
 # profiles.yml: DuckDB in memory, with the extension and the lake attached as `lake`
@@ -118,10 +124,10 @@ models:
 ## The example
 
 [`example/`](example/) is the test suite's views as a project: a Kafka source, a windowed aggregate, a filter, a
-grouped aggregate, a view over a view and a view over a lake table. `scripts/dbt_test.sh` deploys and changes it
-in CI ([testing.md](../docs/testing.md)).
+grouped aggregate, a view over a view and a view over a lake table. DuckWake's `scripts/dbt_test.sh` deploys and
+changes it in CI, from the package as dbt-duckwake publishes it ([testing.md](../docs/testing.md)).
 
 ## Not yet
 
 Zero-downtime replace (build beside, catch up, swap; next on the [roadmap](../docs/roadmap.md)); changing a source other than adding columns; `store_failures`
-as a view; a dbt Hub listing, which needs the package in a repository of its own.
+as a view; a dbt Hub listing (the package's repository is ready for one).

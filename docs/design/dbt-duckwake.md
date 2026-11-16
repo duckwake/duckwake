@@ -172,7 +172,7 @@ Two engine changes, then the package; each is its own PR with its own CI suite.
 ## Open questions
 
 - [x] `ref()` rendering: DuckWake's compiler accepts quoted three-part names of lake tables and views (`"lake"."analytics"."x"`); the materialization rewrites a `ref()` to a source model into the source's bare name.
-- [x] Where the package lives: a `dbt/` folder in this repo (one CI, one release), installed with dbt's `subdirectory:`; `duckwake/dbt-duckwake` once it is listed on dbt Hub, which needs `dbt_project.yml` at a repository's root.
+- [x] Where the package lives: a `dbt/` folder in this repo (one CI, one release), installed with dbt's `subdirectory:`. Since 2026-11-16 (branch `dbt-mirror`) it is also published as the root of `duckwake/dbt-duckwake`, which dbt Hub needs (`dbt_project.yml` at a repository's root): `scripts/mirror_dbt.sh` copies it there on every push to `main` and tags it with each release's version, so the package is still written and tested beside the engine (`scripts/mirror_dbt_test.sh`; `scripts/dbt_test.sh` runs from the published layout).
 - [x] Connection: the extension in the dbt session. dbt-duckdb installs it from a repository path or URL (`repo:` must carry its own quotes, as dbt-duckdb pastes it into `INSTALL ... FROM`), with `config_options: {allow_unsigned_extensions: true}`; `settings:` is applied too late.
 - [x] Kafka passwords stay `env:` or `file:` references, which the engine requires; a model never holds the password.
 - [ ] Does a `--full-refresh` of a source cascade to its readers, or only fail and name them? (For now any change but new columns fails; a source can't be dropped through SQL yet.)

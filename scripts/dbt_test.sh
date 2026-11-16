@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dbt-duckwake gate: the example project (dbt/example) deployed and changed with dbt while events stream in and
-# a worker runs its views.
+# a worker runs its views. It runs from the package as published to duckwake/dbt-duckwake (scripts/mirror_dbt.sh).
 #   0. A failed duckwake_verify leaves the session usable for the next call (dbt runs every test in one).
 #   1. dbt run creates the source and five views and starts them; a second run changes nothing.
 #   2. A changed setting alters the views in place; a changed query fails until --full-refresh, which needs the
@@ -32,10 +32,14 @@ gzip -kf "$DUCKWAKE_EXTENSION_REPO/v$DUCKDB_PY/$platform/duckwake.duckdb_extensi
 export DUCKWAKE_DUCKDB_EXTENSIONS=$PWD/.lake/duckdb_extensions
 rm -f "$DUCKWAKE_DUCKDB_EXTENSIONS"/v*/*/duckwake.duckdb_extension*
 
+# The package as duckwake/dbt-duckwake publishes it (scripts/mirror_dbt.sh): the example installs it from there.
+PACKAGE=$PWD/.lake/dbt_package
+scripts/mirror_dbt.sh layout "$PACKAGE"
+
 VARS="topic: $TOPIC"
 dbt() {
   # From the repository root: the lake's data path is relative to it.
-  "$DBT" "$@" --project-dir dbt/example --profiles-dir dbt/example --vars "{$VARS}" >"$OUT/dbt.log" 2>&1
+  "$DBT" "$@" --project-dir "$PACKAGE/example" --profiles-dir "$PACKAGE/example" --vars "{$VARS}" >"$OUT/dbt.log" 2>&1
   local rc=$?
   cat "$OUT/dbt.log" >>"$OUT/dbt_all.log"
   return $rc
