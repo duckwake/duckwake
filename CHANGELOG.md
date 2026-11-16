@@ -5,6 +5,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ## [Unreleased]
 
+### Fixed
+
+- Release notes link to files in the repository at the release's tag; the relative links copied from the
+  changelog led nowhere on the release page.
+
 ## [0.2.0] - 2026-11-16
 
 The first release with published binaries, extension and image. Views over lake tables and other views, with
