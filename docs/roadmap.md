@@ -90,9 +90,12 @@ default.
      one DuckLake transaction), and the package in a repository of its own for dbt Hub.
 
   Design, and how dbt-risingwave does it, in [dbt-duckwake](design/dbt-duckwake.md).
-- More aggregates: `approx_count_distinct`, quantiles, `list` (DuckDB's exported aggregate states)
-- `DISTINCT` over windows and aggregates, `count(DISTINCT)`, `MIN`/`MAX` in windows over deletes,
-  stream–stream joins
+- More aggregates. Built 2026-11-16: the variances and standard deviations, `bool_and`/`bool_or`,
+  `count(DISTINCT)` in `GROUP BY` views and `HAVING` in windowed views (`crates/circuit/src/tests/views.rs`,
+  `scripts/backfill_test.sh`). Next, in order: stream–stream joins; top-k and `ROW_NUMBER`; `approx_count_distinct`
+  and quantiles (DuckDB's exported aggregate states); `count(DISTINCT)` in windows, `covar`/`corr`/`regr_*`,
+  `arg_min`/`arg_max`, `list`/`string_agg`, `DISTINCT` over windows and aggregates, `MIN`/`MAX` in windows
+  over deletes
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
   retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain. Windows over tables

@@ -5,7 +5,8 @@
 #     worker is killed over and over (kill -9 from outside, and aborts injected at every step of the epoch).
 #     After every crash each view verifies against its batch query at its checkpoint's snapshot, up to its
 #     backfill cursor while it backfills; at the end it holds every row. A `start := 'latest'` view holds only
-#     the rows written after it was created.
+#     the rows written after it was created. Among the views: count(DISTINCT), the variances and bool_or over
+#     the changing table, and a window with HAVING over the insert-only one.
 #  2. Under aggressive maintenance (expiry every 2 s), a paused view keeps the snapshots after its position;
 #     started again, it catches up exactly. The commit times of expired snapshots stay known.
 #     A view stopped and started again ten times in a row keeps running and verifies.
@@ -15,7 +16,7 @@
 source "$(dirname "$0")/lib.sh"
 ROWS=${ROWS:-200000}; PAGE=${PAGE:-5000}; KILLS=${KILLS:-6}; EPOCH=${EPOCH:-1s}
 read -r -a POINTS <<< "${POINTS:-external poll commit_begin commit_mid before_commit after_commit maintenance staged_ahead}"
-VIEWS=(bf_rich bf_by_game bf_bands bf_busy bf_windows bf_windows_10s bf_latest)
+VIEWS=(bf_rich bf_by_game bf_bands bf_busy bf_windows bf_windows_10s bf_latest bf_spread bf_quiet)
 
 sql() { "$BIN" sql "$1" --csv 2>/dev/null | tail -1; }
 snapshot() { sql "SELECT id FROM ducklake_current_snapshot('lake')"; }
@@ -106,6 +107,13 @@ create bf_windows --sql "SELECT window_start, window_end, kind, count(*) AS n, s
 create bf_windows_10s --sql "SELECT window_start, kind, sum(n) AS n, sum(total) AS total
                              FROM TUMBLE(analytics.bf_windows, window_end, INTERVAL 10 SECOND) GROUP BY ALL"
 create bf_latest --start latest --sql "SELECT id, game_id, amount FROM shop.accounts"
+# The statistics aggregates over a table whose rows change: count(DISTINCT) keeps value rows, the variances
+# running sums, bool_or is MAX of a BOOLEAN; and a window with HAVING, which emits only the windows that pass it.
+create bf_spread --sql "SELECT game_id, count(DISTINCT floor(amount)) AS levels, var_samp(amount) AS v,
+                               stddev_pop(amount) AS sd, bool_or(amount > 99) AS any_top
+                        FROM shop.accounts GROUP BY ALL"
+create bf_quiet --sql "SELECT window_start, kind, count(*) AS n, stddev_samp(amount) AS sd, bool_and(amount >= 1) AS all_paid
+                       FROM TUMBLE(shop.events, _commit_ts, INTERVAL 2 SECOND) GROUP BY ALL HAVING count(*) > 3"
 for v in "${VIEWS[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 
 log "backfill while the tables change and the worker is killed $KILLS times"
@@ -136,6 +144,8 @@ for v in bf_rich bf_by_game bf_bands bf_latest; do wait_for "$v" shop accounts |
 wait_for bf_busy analytics bf_by_game || failed=1
 wait_for bf_windows shop events || failed=1
 wait_for bf_windows_10s analytics bf_windows || failed=1
+wait_for bf_spread shop accounts || failed=1
+wait_for bf_quiet shop events || failed=1
 echo "injected aborts: $(grep -c 'crash injected' "$OUT/worker.log" || true), backfill starts: $(grep -c 'backfilling' "$OUT/worker.log" || true)"
 verify_views || failed=1
 rich=$(sql "SELECT count(*) FROM lake.analytics.bf_rich"); want=$(sql "SELECT count(*) FROM lake.shop.accounts WHERE amount >= 90")

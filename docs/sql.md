@@ -50,6 +50,27 @@ Only in the extension:
 
 `TUMBLE(src, col, size)` and `HOP(src, col, size, slide)` are used inside the view SQL.
 
+## Aggregates
+
+| Aggregate | Windowed views | `GROUP BY` views |
+| --- | --- | --- |
+| `count(*)`, `count(x)`, `sum`, `avg` (`mean`) | yes | yes |
+| `min`, `max`, `bool_and`, `bool_or` | yes, over inputs that only insert | yes; over inputs that update or delete, the state counts each value |
+| `var_samp` (`variance`), `var_pop`, `stddev_samp` (`stddev`), `stddev_pop` | yes | yes |
+| `count(DISTINCT x)` | not yet | yes; the state counts each group's values |
+
+`HAVING` works in both: a windowed view emits only the closed windows that pass it, and may read the selected
+keys, aggregates (selected or not) and select items by their alias. Aggregates must be top-level select items
+in a windowed view; a `GROUP BY` view also takes expressions over them. Any other aggregate, `DISTINCT` inside
+an aggregate other than `count`, and `FILTER` or `ORDER BY` inside one are refused when the view is created,
+with the list above.
+
+The variances keep each group's count, sum and sum of squares, so they follow updates and deletes as `avg`
+does. They are computed as (Σx² − (Σx)²/n) in DOUBLE, which matches DuckDB's batch result to about 10
+significant digits while a group's mean is within about 10⁴ times its standard deviation; beyond that the
+difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
+(`var_samp(x - 1000000)`) to keep full precision, since the variance does not change.
+
 ## The same in the CLI
 
 | SQL function (server, extension) | CLI |
