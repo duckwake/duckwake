@@ -91,6 +91,7 @@ they run; limits; monitoring; and the dbt package, dbt-duckwake.
 - **CI.** Clippy, unit tests and every integration suite run on each pull request and push to `main`.
 - Release binaries for Linux and macOS with SHA-256 checksums; the release checks the tag against the crate
   version.
+  macOS arm64 builds run on GitHub's `macos-15` runners (`macos-14` was retired on 2026-11-02).
 
 ### Changed
 
