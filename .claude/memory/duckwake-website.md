@@ -3,8 +3,10 @@ Astro + Starlight (versions pinned at least two weeks old), with the brand kit i
 (`brand/GUIDELINES.md`: Ink, Paper, Amber, Lake; Space Grotesk, Inter, JetBrains Mono).
 
 **How it fits together:** the home page, About, Install, Quick start and Concepts are written in that
-repository. The reference docs, `dbt/README.md`, `CHANGELOG.md` and `docs/design/` stay in this repository and
-are copied in at build time by its `scripts/sync-docs.mjs` (each first heading becomes the title, relative links
+repository. The user docs (`docs/*.md` but `internals.md` and `testing.md`), `dbt/README.md` and `CHANGELOG.md`
+stay in this repository and are copied in at build time by its `scripts/sync-docs.mjs`. On 2026-11-16 the user
+had the design documents, internals and testing taken off the site: they are for people working on DuckWake and
+stay on GitHub, and links to them point there (each first heading becomes the title, relative links
 are rewritten, an edit link points back here). `.github/workflows/pages.yml` there builds every PR (a broken
 internal link fails it) and deploys `main` on push, daily and on demand. The release workflow here copies the
 extension repository into its `public/extensions/` (PR #11).
