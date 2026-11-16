@@ -11,6 +11,7 @@ that covers it instead of adding a duplicate, and keep this index in step.
 - [Working rules](.claude/memory/duckwake-working-rules.md): what needs the user's go-ahead; files never to commit
 - [Design doc](.claude/memory/duckwake-design-doc.md): the Claude Doc and its tabs; keep it in step with docs/roadmap.md
 - [Testing](.claude/memory/duckwake-testing.md): cargo commands, which binary has the SQL functions, ports, test lake
+- [Website](.claude/memory/duckwake-website.md): duckwake.github.io on Starlight; which docs live where; how they sync
 
 @.claude/memory/duckwake-production-grade.md
 @.claude/memory/duckwake-p3-vps.md
@@ -19,3 +20,4 @@ that covers it instead of adding a duplicate, and keep this index in step.
 @.claude/memory/duckwake-working-rules.md
 @.claude/memory/duckwake-design-doc.md
 @.claude/memory/duckwake-testing.md
+@.claude/memory/duckwake-website.md

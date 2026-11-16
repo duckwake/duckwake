@@ -27,5 +27,8 @@ PR and green CI. The user imported rulesets: `main` takes changes only through P
 message, even quoted, so never write it into a commit message), merge commits only, no force-push; `v*` tags cannot move or be deleted. Merge
 only when the user asks, retargeting each next PR to `main` first; merge `main` into a stacked branch, never
 rebase. Commit messages carry the Co-Authored-By line but no Claude-Session link (the user removed claude.ai
-links from the history). A red CI job gets its root cause, not a re-run: three of today's "flakes" were real
-engine bugs. Related: [[duckwake-working-rules]], [[duckwake-testing]].
+links from the history). PR descriptions end with the plain "Generated with Claude Code" line; the PR tool can
+append its own footer with a claude.ai session link, so read the body back after creating or editing a PR and
+replace it (it did on #9-#12 and duckwake.github.io#1, 2026-11-15). A red CI job gets its root cause, not a
+re-run: five "flakes" on 2026-11-15 were real engine bugs (the last two: a worker exiting when a view it was
+starting was dropped, PR #9; a paused view taking a fresh lease, PR #12). Related: [[duckwake-working-rules]], [[duckwake-testing]].
