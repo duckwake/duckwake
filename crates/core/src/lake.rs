@@ -22,6 +22,9 @@ pub struct LakeConfig {
     pub temp_dir: Option<String>,
     /// DuckDB threads for this instance (default: one per core). What an epoch needs in memory grows with them.
     pub threads: Option<usize>,
+    /// Most disk DuckDB may spill to, e.g. `20GB` (default: 90% of the free space). Past it an epoch runs out of
+    /// memory, and the worker shrinks its epochs, as it does past `memory_limit`.
+    pub max_spill: Option<String>,
 }
 
 impl LakeConfig {
@@ -42,6 +45,10 @@ impl LakeConfig {
         }
         if let Some(n) = self.threads {
             conn.execute_batch(&format!("SET threads = {}", n.max(1)))?;
+        }
+        if let Some(size) = &self.max_spill {
+            conn.execute_batch(&format!("SET max_temp_directory_size = {}", lit(size)))
+                .with_context(|| format!("--max-spill {size:?}"))?;
         }
         if self.data_path.starts_with("s3://") {
             conn.execute_batch(&s3_secret_sql(&self.data_path, &|k| std::env::var(k).ok())?)

@@ -38,6 +38,10 @@ struct Cli {
     /// small --memory-limit, fewer threads let more of it fit before DuckDB runs out.
     #[arg(long, global = true, env = "DUCKWAKE_THREADS")]
     threads: Option<usize>,
+    /// Most disk DuckDB may spill to, e.g. 20GB (default: 90% of the free space under --temp-dir). An epoch that
+    /// needs more runs out of memory, and the worker shrinks its epochs as it does past --memory-limit.
+    #[arg(long, global = true, env = "DUCKWAKE_MAX_SPILL")]
+    max_spill: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -373,6 +377,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         memory_limit: cli.memory_limit.clone(),
         temp_dir: cli.temp_dir.clone(),
         threads: cli.threads,
+        max_spill: cli.max_spill.clone(),
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
     let open = || -> Result<duckdb::Connection> {
