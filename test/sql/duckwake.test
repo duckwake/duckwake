@@ -1,0 +1,30 @@
+# name: test/sql/duckwake.test
+# description: The duckwake extension loads and registers its functions. DuckDB's community extension CI runs
+#              this with no PostgreSQL or Kafka, so it checks what works without a lake; the end-to-end test
+#              of the extension against a lake and Kafka is scripts/extension_test.sh.
+# group: [duckwake]
+
+require duckwake
+
+# Every duckwake_* function: views, sources, workers, checks, and the extension's own connect/worker ones.
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE function_name LIKE 'duckwake\_%' ESCAPE '\';
+----
+22
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('duckwake_connect', 'duckwake_create_view', 'duckwake_worker_start', 'duckwake_verify');
+----
+4
+
+# No worker runs until duckwake_worker_start is called.
+query TI
+SELECT running, restarts FROM duckwake_worker_status();
+----
+false	0
+
+# Without a reachable lake, a function that needs one says so.
+statement error
+CALL duckwake_create_view('analytics.v', 'SELECT 1');
+----
+attaching DuckLake

@@ -5,3 +5,8 @@ dist/
 .tmp/
 .claude/settings.local.json
 .venv-dbt/
+
+# The community extension build: DuckDB's extension-ci-tools (checked out by its CI) and what it builds.
+extension-ci-tools/
+build/
+configure/
