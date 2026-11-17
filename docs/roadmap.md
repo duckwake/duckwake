@@ -101,11 +101,15 @@ default.
 
   Design, and how dbt-risingwave does it, in [dbt-duckwake](design/dbt-duckwake.md).
 - More aggregates. Built 2026-11-16: the variances and standard deviations, `bool_and`/`bool_or`,
-  `count(DISTINCT)` in `GROUP BY` views and `HAVING` in windowed views (`crates/circuit/src/tests/views.rs`,
-  `scripts/backfill_test.sh`). Next, in order: stream–stream joins; top-k and `ROW_NUMBER`; `approx_count_distinct`
-  and quantiles (DuckDB's exported aggregate states); `count(DISTINCT)` in windows, `covar`/`corr`/`regr_*`,
-  `arg_min`/`arg_max`, `list`/`string_agg`, `DISTINCT` over windows and aggregates, `MIN`/`MAX` in windows
-  over deletes
+  `count(DISTINCT)` in `GROUP BY` views and `HAVING` in windowed views. Built 2026-11-17
+  ([#29](https://github.com/duckwake/duckwake/issues/29)): `approx_count_distinct`, `median` and the exact
+  quantiles, `count(DISTINCT)` in windows, `covar_*`, `corr` and `regr_*` (`crates/circuit/src/tests/views.rs`,
+  `scripts/backfill_test.sh`). Next, in order: stream–stream joins
+  ([#31](https://github.com/duckwake/duckwake/issues/31)); top-k and `ROW_NUMBER`
+  ([#35](https://github.com/duckwake/duckwake/issues/35)); `list`/`string_agg`/`mode` and grouping sets
+  ([#30](https://github.com/duckwake/duckwake/issues/30)); `DISTINCT` over windows and aggregates; `MIN`/`MAX`
+  in windows over deletes ([#38](https://github.com/duckwake/duckwake/issues/38)). `arg_min`/`arg_max` wait
+  until a tie can be checked against the batch query
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
   retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain. Windows over tables

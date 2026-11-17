@@ -117,11 +117,11 @@ Feldera lists no approximate aggregates. DuckDB's exported states give DuckWake 
 | --- | --- | --- | --- |
 | Filter, project, scalar functions | Yes; SQL and Rust UDFs | Yes; DuckDB's functions, no UDF registration | — |
 | `UNION ALL` of streams | Yes | One source per view | Stage 2 |
-| `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT` | Yes, a count per distinct row | `SELECT DISTINCT`; `count(DISTINCT)` in `GROUP BY` views (built 2026-11-16) | Stage 3 |
-| Linear aggregates: `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR`, `COVAR`, `REGR_*` | Yes | `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR` (built 2026-11-16, branch `aggregates-group1`) | Stage 2: `COVAR`, `REGR_*` |
-| Ordered aggregates: `MIN`, `MAX`, `ARG_MIN` / `ARG_MAX`, `BOOL_AND` / `BOOL_OR` | Yes, under retractions | `MIN` / `MAX`, `BOOL_AND` / `BOOL_OR`; under retractions in `GROUP BY` views | Stage 3: `ARG_MIN` / `ARG_MAX`, windows under retractions |
+| `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT` | Yes, a count per distinct row | `SELECT DISTINCT`; `count(DISTINCT)` in `GROUP BY` views (built 2026-11-16) and in windows over inputs that only insert (built 2026-11-17) | Stage 3 |
+| Linear aggregates: `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR`, `COVAR`, `REGR_*` | Yes | All, in windowed and `GROUP BY` views, under retractions: `COUNT`, `SUM`, `AVG`, `STDDEV`, `VAR` (built 2026-11-16, branch `aggregates-group1`), `COVAR_*`, `CORR`, `REGR_*` (built 2026-11-17, `crates/circuit/src/tests/views.rs`, `scripts/backfill_test.sh`) | — |
+| Ordered aggregates: `MIN`, `MAX`, `ARG_MIN` / `ARG_MAX`, `BOOL_AND` / `BOOL_OR` | Yes, under retractions | `MIN` / `MAX`, `BOOL_AND` / `BOOL_OR`; under retractions in `GROUP BY` views. `ARG_MIN` / `ARG_MAX` refused: a tie makes DuckDB's batch result depend on row order, so `verify` could not check them | Stage 3: windows under retractions; `ARG_MIN` / `ARG_MAX` once ties can be checked |
 | `ARRAY_AGG`, `MODE`, `list`, `string_agg` | Yes, O(N) | Rejected | Stage 3 |
-| `approx_count_distinct`, quantiles | None | Rejected | Stage 2, exported states |
+| `approx_count_distinct`, quantiles | None | Exact quantiles (`median`, `quantile_cont`, `quantile_disc`) and `approx_count_distinct` from the values kept with their counts, equal to the batch query's (built 2026-11-17); `approx_quantile` rejected (a t-digest merged epoch by epoch differs from the batch one) | Exported states would make them small, but DuckLake cannot store an `AGGREGATE_STATE` column ("Unsupported user-defined type", DuckDB 2.0 / DuckLake 1.1) |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | Yes | Rejected | Stage 3 |
 | `TUMBLE`, `HOP` windows | Yes, stateless plus waterline cleanup | Yes, emitted on close | — |
 | `SESSION` windows | Not found | No | Later |

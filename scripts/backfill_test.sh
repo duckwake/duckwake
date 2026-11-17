@@ -5,8 +5,9 @@
 #     worker is killed over and over (kill -9 from outside, and aborts injected at every step of the epoch).
 #     After every crash each view verifies against its batch query at its checkpoint's snapshot, up to its
 #     backfill cursor while it backfills; at the end it holds every row. A `start := 'latest'` view holds only
-#     the rows written after it was created. Among the views: count(DISTINCT), the variances and bool_or over
-#     the changing table, and a window with HAVING over the insert-only one.
+#     the rows written after it was created. Among the views: count(DISTINCT), approx_count_distinct, median,
+#     the variances, corr, regr_slope and bool_or over the changing table, and a window with HAVING,
+#     count(DISTINCT), a quantile and a covariance over the insert-only one.
 #  2. Under aggressive maintenance (expiry every 2 s), a paused view keeps the snapshots after its position;
 #     started again, it catches up exactly. The commit times of expired snapshots stay known.
 #     A view stopped and started again ten times in a row keeps running and verifies.
@@ -107,12 +108,18 @@ create bf_windows --sql "SELECT window_start, window_end, kind, count(*) AS n, s
 create bf_windows_10s --sql "SELECT window_start, kind, sum(n) AS n, sum(total) AS total
                              FROM TUMBLE(analytics.bf_windows, window_end, INTERVAL 10 SECOND) GROUP BY ALL"
 create bf_latest --start latest --sql "SELECT id, game_id, amount FROM shop.accounts"
-# The statistics aggregates over a table whose rows change: count(DISTINCT) keeps value rows, the variances
-# running sums, bool_or is MAX of a BOOLEAN; and a window with HAVING, which emits only the windows that pass it.
+# The statistics aggregates over a table whose rows change: count(DISTINCT), approx_count_distinct and median
+# keep value rows with their counts, the variances and the paired statistics running sums, bool_or is MAX of a
+# BOOLEAN; and a window with HAVING, which emits only the windows that pass it, keeping each window's distinct
+# values and values as lists.
 create bf_spread --sql "SELECT game_id, count(DISTINCT floor(amount)) AS levels, var_samp(amount) AS v,
-                               stddev_pop(amount) AS sd, bool_or(amount > 99) AS any_top
+                               stddev_pop(amount) AS sd, bool_or(amount > 99) AS any_top,
+                               approx_count_distinct(floor(amount)) AS approx_levels, median(amount) AS med,
+                               corr(amount, id % 97) AS r, regr_slope(amount, id % 97) AS slope
                         FROM shop.accounts GROUP BY ALL"
-create bf_quiet --sql "SELECT window_start, kind, count(*) AS n, stddev_samp(amount) AS sd, bool_and(amount >= 1) AS all_paid
+create bf_quiet --sql "SELECT window_start, kind, count(*) AS n, stddev_samp(amount) AS sd, bool_and(amount >= 1) AS all_paid,
+                              count(DISTINCT floor(amount)) AS levels, quantile_disc(amount, 0.9) AS p90,
+                              covar_samp(amount, id % 7) AS cv
                        FROM TUMBLE(shop.events, _commit_ts, INTERVAL 2 SECOND) GROUP BY ALL HAVING count(*) > 3"
 for v in "${VIEWS[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 

@@ -137,19 +137,32 @@ GROUP BY ALL
 | `count(*)`, `count(x)`, `sum`, `avg` (`mean`) | yes | yes |
 | `min`, `max`, `bool_and`, `bool_or` | yes, over inputs that only insert | yes; over inputs that update or delete, the state counts each value |
 | `var_samp` (`variance`), `var_pop`, `stddev_samp` (`stddev`), `stddev_pop` | yes | yes |
-| `count(DISTINCT x)` | not yet | yes; the state counts each group's values |
+| `covar_pop`, `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2` | yes | yes |
+| `count(DISTINCT x)`, `approx_count_distinct(x)` | yes, over inputs that only insert; the state keeps each window's distinct values | yes; the state counts each group's values |
+| `median(x)`, `quantile_cont(x, q)`, `quantile_disc(x, q)` (`quantile`) | yes, over inputs that only insert; the state keeps each window's values | yes; the state counts each group's values |
 
 `HAVING` works in both: a windowed view emits only the closed windows that pass it, and may read the selected
 keys, aggregates (selected or not) and select items by their alias. Aggregates must be top-level select items
 in a windowed view; a `GROUP BY` view also takes expressions over them. Any other aggregate, `DISTINCT` inside
 an aggregate other than `count`, and `FILTER` or `ORDER BY` inside one are refused when the view is created,
-with the list above.
+with the list above. `arg_min` and `arg_max` (`min_by`, `max_by`) are refused: when several rows tie on the
+value, DuckDB's batch result depends on the order it reads rows in, so `verify` could not check the view.
+
+The quantiles are exact, the same as DuckDB's: `q` is a constant fraction, or a list of them, which gives a
+list (`quantile_cont(latency_ms, [0.5, 0.9, 0.99])`). `median(x)` is `quantile_cont(x, 0.5)`.
+`approx_count_distinct` is DuckDB's estimate over the distinct values the state keeps, so it equals the batch
+query's; it costs the same as `count(DISTINCT)`, since DuckLake cannot store DuckDB's sketch. These four keep
+values: a window's lists grow with its rows, and a `GROUP BY` view keeps one row per group and value, with a
+quantile recomputed over the touched groups' values each epoch.
 
 The variances keep each group's count, sum and sum of squares, so they follow updates and deletes as `avg`
-does. They are computed as (Σx² − (Σx)²/n) in DOUBLE, which matches DuckDB's batch result to about 10
-significant digits while a group's mean is within about 10⁴ times its standard deviation; beyond that the
-difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
-(`var_samp(x - 1000000)`) to keep full precision, since the variance does not change.
+does, and the two-argument statistics `f(y, x)` keep the count and the sums of y, x, y², x² and xy over the
+rows where neither is NULL. They are computed from these sums in DOUBLE, which matches DuckDB's batch result to
+about 10 significant digits while a group's mean is within about 10⁴ times its standard deviation; beyond that
+the difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
+(`var_samp(x - 1000000)`) to keep full precision, since the variance does not change. A group whose values are
+all equal has a variance of exactly 0, as in DuckDB, so `corr` is NaN and `regr_slope` NaN over a constant x,
+with `regr_intercept` and `regr_r2` NULL then.
 
 ## Views over lake tables and other views
 

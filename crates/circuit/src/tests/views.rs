@@ -235,3 +235,90 @@ fn global_count_distinct_over_retractions() {
     check_view(sql, &EPOCHS, true);
     check_view("SELECT count(DISTINCT user_id) AS users FROM changes WHERE amount > 3", &EPOCHS, true);
 }
+
+#[test]
+fn windowed_distinct_counts_and_quantiles() {
+    // count(DISTINCT) and approx_count_distinct keep each window's distinct values, the quantiles every value;
+    // NULLs are left out, a list of fractions gives a list, and a TIMESTAMP has quantiles too.
+    let sql = "SELECT window_start, game_id, count(DISTINCT user_id) AS users, approx_count_distinct(user_id) AS approx_users,
+                      median(amount) AS med, quantile_cont(amount, 0.9) AS p90, quantile_disc(amount, [0.25, 0.75]) AS quartiles,
+                      quantile(ts, 0.5) AS mid_ts, count(*) AS n
+               FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    // In HAVING, over hopping windows, and through a lookup join.
+    check_view(
+        "SELECT c.window_end, g.studio, count(DISTINCT c.user_id) AS users, median(c.amount) AS med
+         FROM HOP(clicks, ts, INTERVAL 1 MINUTE, INTERVAL 20 SECOND) c JOIN games g ON g.game_id = c.game_id
+         GROUP BY c.window_end, g.studio HAVING count(DISTINCT c.user_id) > 3 AND quantile_cont(c.amount, 0.25) > 2",
+        &EPOCHS,
+        true,
+    );
+}
+
+#[test]
+fn windowed_covariance_correlation_and_regression() {
+    let all = "covar_pop(amount, second(ts)) AS cp, covar_samp(amount, second(ts)) AS cs, corr(amount, second(ts)) AS r,
+               regr_count(amount, second(ts)) AS rn, regr_avgx(amount, second(ts)) AS ax, regr_avgy(amount, second(ts)) AS ay,
+               regr_sxx(amount, second(ts)) AS sxx, regr_syy(amount, second(ts)) AS syy, regr_sxy(amount, second(ts)) AS sxy,
+               regr_slope(amount, second(ts)) AS slope, regr_intercept(amount, second(ts)) AS icpt, regr_r2(amount, second(ts)) AS r2";
+    let sql = format!("SELECT window_start, game_id, {all} FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
+    check_view(&sql, &EPOCHS, false);
+    check_view(&sql, &EPOCHS, true);
+    // Grouped by amount, y is constant in every group: corr is NaN, regr_r2 1, and stddev exactly 0 (not a
+    // rounding residue); x constant gives NaN slopes and NULL intercepts. Rows with a NULL on either side are
+    // left out of every pair.
+    let constant = "SELECT window_start, amount, stddev_pop(amount) AS sd, corr(amount, second(ts)) AS r, regr_r2(amount, second(ts)) AS r2,
+                           regr_slope(second(ts), 7) AS flat, regr_intercept(second(ts), 7) AS no_icpt, covar_samp(amount, 1) AS c1
+                    FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(constant, &EPOCHS, false);
+}
+
+#[test]
+fn windowed_covariance_over_retractions() {
+    // The paired sums are invertible, so a window over a source that retracts keeps them like avg.
+    let sql = "SELECT window_start, game_id, count(*) AS n, covar_samp(amount, second(ts)) AS cs, regr_slope(amount, second(ts)) AS slope
+               FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn global_quantiles_and_approx_count_distinct() {
+    let sql = "SELECT game_id, median(amount) AS med, quantile_disc(amount, 0.9) AS p90, quantile_cont(amount, [0.1, 0.5]) AS qs,
+                      approx_count_distinct(user_id) AS users, count(DISTINCT user_id) AS exact_users, min(amount) AS lo
+               FROM clicks GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view("SELECT median(price) AS m, approx_count_distinct(game_id) AS g FROM purchases HAVING median(price) > 3", &EPOCHS, true);
+}
+
+#[test]
+fn global_quantiles_over_retractions() {
+    // A value's count goes down as its rows are retracted; a group with no value left has NULL quantiles and
+    // counts 0.
+    let sql = "SELECT game_id, count(*) AS n, median(amount) AS med, quantile_disc(amount, 0.75) AS p75, approx_count_distinct(amount) AS amounts
+               FROM changes GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}
+
+#[test]
+fn global_covariance_correlation_and_regression() {
+    let sql = "SELECT game_id, covar_pop(amount, length(user_id) * 3 + second(ts)) AS cp, corr(amount, second(ts)) AS r,
+                      regr_slope(amount, second(ts)) AS slope, regr_intercept(amount, second(ts)) AS icpt, regr_r2(amount, second(ts)) AS r2,
+                      regr_count(amount, second(ts)) AS rn, regr_sxy(amount, second(ts)) AS sxy
+               FROM clicks GROUP BY ALL HAVING regr_count(amount, second(ts)) > 3";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    // Constant y per group.
+    check_view("SELECT amount, corr(amount, second(ts)) AS r, regr_r2(amount, second(ts)) AS r2, stddev(amount) AS sd FROM clicks GROUP BY ALL", &EPOCHS, true);
+}
+
+#[test]
+fn global_covariance_over_retractions() {
+    let sql = "SELECT game_id, count(*) AS n, covar_samp(amount, second(ts)) AS cs, corr(amount, second(ts)) AS r, regr_avgx(amount, second(ts)) AS ax
+               FROM changes GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+}

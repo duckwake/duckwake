@@ -5,7 +5,29 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ## [Unreleased]
 
+### Added
+
+- More aggregates, in windowed and `GROUP BY` views ([#29](https://github.com/duckwake/duckwake/issues/29)):
+  - `covar_pop`, `covar_samp`, `corr` and the `regr_*` functions (`regr_count`, `regr_avgx`, `regr_avgy`,
+    `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`). Each group keeps the count
+    and the sums of y, x, y², x² and xy over the rows where neither is NULL, so they follow updates and deletes
+    like `avg`, with DuckDB's NaN and NULL results for constant groups.
+  - `median`, `quantile_cont` and `quantile_disc` (`quantile`), exact, with a constant fraction or a list of
+    them.
+  - `approx_count_distinct`, equal to the batch query's estimate.
+  - `count(DISTINCT x)` in windowed views.
+
+  In `GROUP BY` views the last three keep each group's values with their counts, as `count(DISTINCT)` does, and
+  follow updates and deletes. In windowed views they keep each window's values as a list, over inputs that only
+  insert.
+- `arg_min` and `arg_max` (and `min_by`, `max_by`) are refused with the reason: when rows tie, DuckDB's batch
+  result depends on row order, so `duckwake_verify` could not check the view.
+
 ### Fixed
+
+- A group whose values are all equal has a variance and standard deviation of exactly 0, as in DuckDB's batch
+  query. Before, rounding in `q − s²/n` could leave a tiny positive variance whose square root (about 10⁻⁸
+  times the values) `duckwake_verify` reported as a difference.
 
 - Release notes link to files in the repository at the release's tag; the relative links copied from the
   changelog led nowhere on the release page.
