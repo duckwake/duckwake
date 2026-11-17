@@ -63,10 +63,11 @@ retract, as Feldera's `ExpandAggregates` does (Kafka views keep the cheaper part
 | `DISTINCT` | the state sums weights; a row leaves with −1 when its weight returns to 0; sink `Upsert` by the whole row |
 | Global `count`, `sum`, `avg` | already weighted |
 | Global `MIN`/`MAX`, `bool_and`/`bool_or` | value rows in the state table (`__i` the aggregate, `__v<i>` the value, `__n` its count); the extreme is recomputed for the epoch's groups from the values still present. `bool_and`/`bool_or` are `MIN`/`MAX` of a BOOLEAN |
-| Global `count(DISTINCT)` | the same value rows, always (also over inputs that only insert); the count is the number of values whose count is above 0 |
-| Global and windowed variances | weighted count, sum and sum of squares (`__a<i>_n`, `_s`, `_q`), like `avg` |
+| Global `count(DISTINCT)`, `approx_count_distinct`, quantiles | the same value rows, always (also over inputs that only insert); the count is the number of values whose count is above 0, `approx_count_distinct` is DuckDB's estimate over the values present (the same as the batch query's: the sketch depends only on the set), and a quantile is DuckDB's over the touched group's values, each repeated by its count (`list_resize`) |
+| Global and windowed variances | weighted count, sum and sum of squares (`__a<i>_n`, `_s`, `_q`), like `avg`. The second moment `q − s²/n` is taken as 0 below `n·q·10⁻¹⁵`, its rounding: DuckDB's Welford computation gives exactly 0 for a constant group |
+| Global and windowed `covar_*`, `corr`, `regr_*` | weighted count and sums of y, x, y², x², xy over the rows where both are non-NULL (`__a<i>_n`, `_y`, `_x`, `_yy`, `_xx`, `_xy`), with DuckDB's NaN and NULL at the edges (`paired_finalize`) |
 | Windowed `count`, `sum`, `avg` | partials `sum(__w)`, `sum(x * __w)` and a weighted non-NULL count; a window and group whose weight returns to 0 is not emitted |
-| Windowed `MIN`/`MAX` | refused for now |
+| Windowed `MIN`/`MAX`, `count(DISTINCT)`, `approx_count_distinct`, quantiles | refused for now (over inputs that only insert, the last three keep each window's values as a LIST partial: distinct values merged with `list_distinct(list_concat(...))`, all values with `list_concat`, finalized with `list_aggregate`) |
 | Late-data table | refused for now: late rows would need their weights (C4) |
 
 A window is still emitted once, when it closes; a retraction into a closed window is a late row. The
@@ -313,14 +314,15 @@ records the ones it took up.
   twice.
 - **Operators.** Filter, project and lookup joins (any lake table in `FROM`; a lookup table is read whole each
   epoch, so a change to it reaches only rows that arrive later). TUMBLE/HOP windows and
-  global `GROUP BY` (with `HAVING` and expressions over aggregates) with `count`, `sum`, `min`, `max`,
-  `avg`, `bool_and`, `bool_or`, the variances and standard deviations, and in `GROUP BY` views
-  `count(DISTINCT)`. Windowed views take `HAVING` too, applied as windows close (`Plan::window_having`). `UNION ALL` of plain views, each branch over any source: the view reads every source in one
+  global `GROUP BY` (with `HAVING` and expressions over aggregates) with `count`, `count(DISTINCT)`,
+  `approx_count_distinct`, `sum`, `min`, `max`, `avg`, `bool_and`, `bool_or`, the variances and standard
+  deviations, `median` and the exact quantiles, `covar_*`, `corr` and `regr_*`. Windowed views take `HAVING` too, applied as windows close (`Plan::window_having`). `UNION ALL` of plain views, each branch over any source: the view reads every source in one
   epoch and commits all their offsets in one checkpoint row. `SELECT DISTINCT` over plain views: its state keeps every distinct row with its count, and a
   row is written the first time its count turns positive. `DISTINCT` over windows and aggregates,
-  `DISTINCT ON`, `count(DISTINCT ...)` in windows, `approx_count_distinct`, quantiles, `list`/`string_agg`,
-  `covar`/`corr`/`regr_*`, `arg_min`/`arg_max` and stream-stream joins are rejected at create time. Every operator handles retracting input (see Retractions above) except
-  `MIN`/`MAX` in windows and late-data tables. Lake tables, and views whose tables change, are the
+  `DISTINCT ON`, `list`/`string_agg`/`mode`, `approx_quantile`, `arg_min`/`arg_max` (a tie makes DuckDB's
+  batch result depend on row order, so `verify` could not check them) and stream-stream joins are rejected at
+  create time. Every operator handles retracting input (see Retractions above) except `MIN`/`MAX`,
+  `count(DISTINCT)`, `approx_count_distinct` and the quantiles in windows, and late-data tables. Lake tables, and views whose tables change, are the
   retracting inputs; Kafka sources only insert (no CDC yet).
 - **Storage.** Local disk or `s3://` (S3 and S3-compatible stores); not `gs://` or Azure natively (GCS through
   its S3 API works). Credentials come from the environment of each process; there is no secret store

@@ -37,6 +37,10 @@ pub enum MergeOp {
     AddNullable,
     Min,
     Max,
+    /// A list of values (quantiles): the lists concatenated.
+    Concat,
+    /// A list of distinct values (`count(DISTINCT)`, `approx_count_distinct`): their union.
+    Union,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,17 +173,109 @@ pub enum AggKind {
     StddevPop,
     /// `count(DISTINCT x)`: the state counts each group's values (`GlobalPlan::counted_values`).
     CountDistinct,
+    /// `approx_count_distinct(x)`: kept like `count(DISTINCT x)`, and DuckDB's estimate is taken over the values
+    /// still present, which equals the batch query's (the HyperLogLog sketch depends only on the set of values).
+    ApproxCountDistinct,
+    /// `quantile_cont(x, q)` (and `median(x)`, which is `quantile_cont(x, 0.5)`), `quantile_disc(x, q)` (and
+    /// `quantile(x, q)`): exact, from every value with its count. `AggSpec::param` holds `q`.
+    QuantileCont,
+    QuantileDisc,
+    /// The two-argument statistics, `f(y, x)` over the rows where both are non-NULL: from the weighted count and
+    /// the sums of y, x, y², x² and xy, so they are invertible like the variances (`paired_finalize`).
+    CovarPop,
+    CovarSamp,
+    Corr,
+    RegrCount,
+    RegrAvgx,
+    RegrAvgy,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
+    RegrSlope,
+    RegrIntercept,
+    RegrR2,
 }
 
 impl AggKind {
     /// Finalized from the counted values rather than from the group row's own partials.
     fn counts_values(self) -> bool {
-        matches!(self, AggKind::Min | AggKind::Max | AggKind::CountDistinct)
+        self.always_counts_values() || matches!(self, AggKind::Min | AggKind::Max)
+    }
+
+    /// Kept as counted values in every GROUP BY view, not only over a source that can retract.
+    fn always_counts_values(self) -> bool {
+        matches!(self, AggKind::CountDistinct | AggKind::ApproxCountDistinct | AggKind::QuantileCont | AggKind::QuantileDisc)
+    }
+
+    /// Takes two arguments, `f(y, x)`, and keeps the paired sums.
+    fn is_paired(self) -> bool {
+        matches!(
+            self,
+            AggKind::CovarPop
+                | AggKind::CovarSamp
+                | AggKind::Corr
+                | AggKind::RegrCount
+                | AggKind::RegrAvgx
+                | AggKind::RegrAvgy
+                | AggKind::RegrSxx
+                | AggKind::RegrSyy
+                | AggKind::RegrSxy
+                | AggKind::RegrSlope
+                | AggKind::RegrIntercept
+                | AggKind::RegrR2
+        )
+    }
+
+    fn is_moments(self) -> bool {
+        matches!(self, AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop)
+    }
+
+    /// The kind of a canonical name from `canonical_agg`; `count` is `Count` (DISTINCT is decided by the caller).
+    fn of(canonical: &str) -> AggKind {
+        match canonical {
+            "count_star" => AggKind::CountStar,
+            "count" => AggKind::Count,
+            "sum" => AggKind::Sum,
+            "avg" => AggKind::Avg,
+            "min" => AggKind::Min,
+            "max" => AggKind::Max,
+            "var_samp" => AggKind::VarSamp,
+            "var_pop" => AggKind::VarPop,
+            "stddev_samp" => AggKind::StddevSamp,
+            "stddev_pop" => AggKind::StddevPop,
+            "approx_count_distinct" => AggKind::ApproxCountDistinct,
+            "quantile_cont" => AggKind::QuantileCont,
+            "quantile_disc" => AggKind::QuantileDisc,
+            "covar_pop" => AggKind::CovarPop,
+            "covar_samp" => AggKind::CovarSamp,
+            "corr" => AggKind::Corr,
+            "regr_count" => AggKind::RegrCount,
+            "regr_avgx" => AggKind::RegrAvgx,
+            "regr_avgy" => AggKind::RegrAvgy,
+            "regr_sxx" => AggKind::RegrSxx,
+            "regr_syy" => AggKind::RegrSyy,
+            "regr_sxy" => AggKind::RegrSxy,
+            "regr_slope" => AggKind::RegrSlope,
+            "regr_intercept" => AggKind::RegrIntercept,
+            "regr_r2" => AggKind::RegrR2,
+            other => unreachable!("not a canonical aggregate: {other}"),
+        }
+    }
+
+    /// The name of the DuckDB aggregate that finalizes a list of the counted values.
+    fn list_aggregate(self) -> &'static str {
+        match self {
+            AggKind::ApproxCountDistinct => "approx_count_distinct",
+            AggKind::QuantileCont => "quantile_cont",
+            AggKind::QuantileDisc => "quantile_disc",
+            other => unreachable!("{other:?} is not finalized over a list"),
+        }
     }
 }
 
 /// The aggregate DuckWake runs for `fname`: synonyms map to one name, and `bool_and`/`bool_or` are MIN and MAX
-/// of a BOOLEAN (false < true), which gives them retractions and windows for free. None when unsupported.
+/// of a BOOLEAN (false < true), which gives them retractions and windows for free. `median` is
+/// `quantile_cont(x, 0.5)` and `quantile` is `quantile_disc`, as in DuckDB. None when unsupported.
 fn canonical_agg(fname: &str) -> Option<&'static str> {
     Some(match fname {
         "count_star" => "count_star",
@@ -192,18 +288,47 @@ fn canonical_agg(fname: &str) -> Option<&'static str> {
         "var_pop" => "var_pop",
         "stddev_samp" | "stddev" => "stddev_samp",
         "stddev_pop" => "stddev_pop",
+        "approx_count_distinct" => "approx_count_distinct",
+        "quantile_cont" | "median" => "quantile_cont",
+        "quantile_disc" | "quantile" => "quantile_disc",
+        "covar_pop" => "covar_pop",
+        "covar_samp" => "covar_samp",
+        "corr" => "corr",
+        "regr_count" => "regr_count",
+        "regr_avgx" => "regr_avgx",
+        "regr_avgy" => "regr_avgy",
+        "regr_sxx" => "regr_sxx",
+        "regr_syy" => "regr_syy",
+        "regr_sxy" => "regr_sxy",
+        "regr_slope" => "regr_slope",
+        "regr_intercept" => "regr_intercept",
+        "regr_r2" => "regr_r2",
         _ => return None,
     })
 }
 
-const SUPPORTED_LIST: &str =
-    "count, count(DISTINCT), sum, avg, min, max, bool_and, bool_or, var_samp, var_pop, variance, stddev_samp, stddev_pop, stddev";
+const SUPPORTED_LIST: &str = "count, count(DISTINCT), approx_count_distinct, sum, avg, min, max, bool_and, bool_or, \
+     var_samp, var_pop, variance, stddev_samp, stddev_pop, stddev, median, quantile_cont, quantile_disc, quantile, \
+     covar_pop, covar_samp, corr, regr_count, regr_avgx, regr_avgy, regr_sxx, regr_syy, regr_sxy, regr_slope, \
+     regr_intercept, regr_r2";
+
+/// Why `arg_min`/`arg_max` and their synonyms are refused, for their error message.
+const ARG_MIN_MAX_WHY: &str = "when several rows tie on the value, DuckDB's batch result depends on the order it reads \
+     rows in, so duckwake_verify could not check the view";
+
+/// The second moment `q - s²/n` of values with weighted count `n`, sum `s` and sum of squares `q` (DOUBLE), as 0
+/// when it is within the rounding of computing it that way (below `n·q·10⁻¹⁵`, or negative): DuckDB computes it
+/// with Welford's method, which gives exactly 0 for a constant group, and a constant group must not come out as
+/// a tiny variance here (its standard deviation, or a slope over it, would differ from the batch query's).
+fn second_moment(n: &str, s: &str, q: &str) -> String {
+    let raw = format!("({q} - CAST({s} AS DOUBLE) * CAST({s} AS DOUBLE) / {n})");
+    format!("(CASE WHEN {raw} <= {q} * {n} * 1e-15 THEN 0 ELSE {raw} END)")
+}
 
 /// The variance or standard deviation of a group from its weighted count `n`, sum `s` and sum of squares `q`
 /// (DOUBLE). NULL below two values for the sample variants and below one for the population ones, as DuckDB.
-/// The difference `q - s²/n` can come out a hair below 0 from rounding; it is clamped there.
 fn moments_finalize(kind: AggKind, n: &str, s: &str, q: &str) -> String {
-    let m2 = format!("greatest({q} - CAST({s} AS DOUBLE) * CAST({s} AS DOUBLE) / {n}, 0)");
+    let m2 = second_moment(n, s, q);
     let var = match kind {
         AggKind::VarSamp | AggKind::StddevSamp => format!("CASE WHEN {n} > 1 THEN {m2} / ({n} - 1) END"),
         _ => format!("CASE WHEN {n} > 0 THEN {m2} / {n} END"),
@@ -216,11 +341,73 @@ fn squared(x: &str) -> String {
     format!("(CAST({x} AS DOUBLE) * CAST({x} AS DOUBLE))")
 }
 
+/// The paired sums of a two-argument statistic `f(y, x)`, by suffix: the weighted count of the rows where both
+/// are non-NULL, and over those rows the sums of y, x, y², x² and xy.
+const PAIRED: [&str; 6] = ["n", "y", "x", "yy", "xx", "xy"];
+
+/// One paired sum over the rows of an epoch, with their weights `__w`, for arguments `y` and `x`.
+fn paired_partial(part: &str, y: &str, x: &str) -> String {
+    let both = format!("{y} IS NOT NULL AND {x} IS NOT NULL");
+    let d = |e: &str| format!("CAST({e} AS DOUBLE)");
+    let term = match part {
+        "n" => return format!("CAST(sum(CASE WHEN {both} THEN __w ELSE 0 END) AS BIGINT)"),
+        "y" => d(y),
+        "x" => d(x),
+        "yy" => format!("{} * {}", d(y), d(y)),
+        "xx" => format!("{} * {}", d(x), d(x)),
+        _ => format!("{} * {}", d(y), d(x)),
+    };
+    format!("sum(CASE WHEN {both} THEN ({term}) * __w END)")
+}
+
+/// A two-argument statistic from its paired sums, `col` naming each by its suffix in `PAIRED`, with DuckDB's
+/// results at the edges: NULL over no pairs (`regr_count` 0); NaN for `corr` when either side is constant and for
+/// `regr_slope` when x is, and then NULL for `regr_intercept` and `regr_r2`; `regr_r2` 1 when only y is constant.
+/// The co-moment is exactly 0 when either side is constant, as DuckDB's online algorithm gives.
+fn paired_finalize(kind: AggKind, col: &dyn Fn(&str) -> String) -> String {
+    let (n, sy, sx) = (col("n"), col("y"), col("x"));
+    let m2y = second_moment(&n, &sy, &col("yy"));
+    let m2x = second_moment(&n, &sx, &col("xx"));
+    let c = format!("(CASE WHEN {m2x} = 0 OR {m2y} = 0 THEN 0 ELSE {} - {sy} * {sx} / {n} END)", col("xy"));
+    match kind {
+        AggKind::CovarPop => format!("CASE WHEN {n} > 0 THEN {c} / {n} END"),
+        AggKind::CovarSamp => format!("CASE WHEN {n} > 1 THEN {c} / ({n} - 1) END"),
+        AggKind::Corr => format!("CASE WHEN {n} = 0 THEN NULL WHEN {m2x} = 0 OR {m2y} = 0 THEN 'NaN'::DOUBLE ELSE {c} / sqrt({m2x} * {m2y}) END"),
+        AggKind::RegrCount => format!("coalesce({n}, 0)"),
+        AggKind::RegrAvgx => format!("CASE WHEN {n} > 0 THEN {sx} / {n} END"),
+        AggKind::RegrAvgy => format!("CASE WHEN {n} > 0 THEN {sy} / {n} END"),
+        AggKind::RegrSxx => format!("CASE WHEN {n} > 0 THEN {m2x} END"),
+        AggKind::RegrSyy => format!("CASE WHEN {n} > 0 THEN {m2y} END"),
+        AggKind::RegrSxy => format!("CASE WHEN {n} > 0 THEN {c} END"),
+        AggKind::RegrSlope => format!("CASE WHEN {n} = 0 THEN NULL WHEN {m2x} = 0 THEN 'NaN'::DOUBLE ELSE {c} / {m2x} END"),
+        AggKind::RegrIntercept => format!("CASE WHEN {n} = 0 OR {m2x} = 0 THEN NULL ELSE {sy} / {n} - {c} / {m2x} * ({sx} / {n}) END"),
+        AggKind::RegrR2 => format!("CASE WHEN {n} = 0 OR {m2x} = 0 THEN NULL WHEN {m2y} = 0 THEN 1.0 ELSE {c} * {c} / ({m2x} * {m2y}) END"),
+        other => unreachable!("{other:?} is not a paired statistic"),
+    }
+}
+
+/// The finalized value of a list of values: `count(DISTINCT)` of a list kept without duplicates, or a DuckDB
+/// aggregate over it (`approx_count_distinct`, the quantiles with their fraction).
+fn list_finalize(kind: AggKind, list: &str, param: Option<&str>) -> String {
+    match kind {
+        AggKind::CountDistinct => format!("coalesce(len({list}), 0)"),
+        AggKind::ApproxCountDistinct => format!("coalesce(list_aggregate({list}, 'approx_count_distinct'), 0)"),
+        k => format!("list_aggregate({list}, '{}', {})", k.list_aggregate(), param.expect("a quantile's fraction")),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggSpec {
     pub kind: AggKind,
-    /// Index of the argument column `__x<arg>` in the pre-aggregate output; None for count(*).
+    /// Index of the argument column `__x<arg>` in the pre-aggregate output; None for count(*). For a paired
+    /// statistic `f(y, x)`, y's.
     pub arg: Option<usize>,
+    /// A paired statistic's second argument, x.
+    #[serde(default)]
+    pub arg2: Option<usize>,
+    /// A quantile's fraction (or list of fractions), as SQL: a constant.
+    #[serde(default)]
+    pub param: Option<String>,
 }
 
 /// A global aggregate compiled into three operators. Every row between operators carries a weight
@@ -344,6 +531,8 @@ impl Plan {
                     MergeOp::AddNullable => format!("coalesce(s.{c} + p.{c}, s.{c}, p.{c})"),
                     MergeOp::Min => format!("least(s.{c}, p.{c})"),
                     MergeOp::Max => format!("greatest(s.{c}, p.{c})"),
+                    MergeOp::Concat => format!("list_concat(s.{c}, p.{c})"),
+                    MergeOp::Union => format!("list_distinct(list_concat(s.{c}, p.{c}))"),
                 };
                 format!("{c} = {e}")
             })
@@ -390,11 +579,17 @@ impl GlobalPlan {
                 AggKind::Min => cols.push(format!("min(__x{k}) AS __a{i}")),
                 AggKind::Max => cols.push(format!("max(__x{k}) AS __a{i}")),
                 // Counted from the value rows (`aggregate_stmts`).
-                AggKind::CountDistinct => {}
-                AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop => {
+                kind if kind.always_counts_values() => {}
+                kind if kind.is_moments() => {
                     cols.push(format!("sum({}) AS __a{i}_s", signed(&x(k))));
                     cols.push(format!("sum({}) AS __a{i}_q", signed(&squared(&x(k)))));
                     cols.push(format!("{} AS __a{i}_n", weighted_count(&x(k))));
+                }
+                _ => {
+                    let x2 = x(a.arg2.expect("a paired statistic's second argument"));
+                    for part in PAIRED {
+                        cols.push(format!("{} AS __a{i}_{part}", paired_partial(part, &x(k), &x2)));
+                    }
                 }
             }
         }
@@ -425,12 +620,22 @@ impl GlobalPlan {
                 (AggKind::Min | AggKind::Max, Some(_)) => cols.push(format!("CAST(e.__a{i} AS {}) AS __a{i}", ty(&format!("__a{i}")))),
                 (AggKind::Min, None) => cols.push(format!("least(o.__a{i}, d.__a{i}) AS __a{i}")),
                 (AggKind::Max, None) => cols.push(format!("greatest(o.__a{i}, d.__a{i}) AS __a{i}")),
-                // A touched group with no value left has no extrema row: it counts 0.
-                (AggKind::CountDistinct, _) => cols.push(format!("CAST(coalesce(e.__a{i}, 0) AS BIGINT) AS __a{i}")),
-                (AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop, _) => {
+                // A touched group with no value left has no extrema row: it counts 0, and its quantiles are NULL.
+                (AggKind::CountDistinct | AggKind::ApproxCountDistinct, _) => {
+                    cols.push(format!("CAST(coalesce(e.__a{i}, 0) AS BIGINT) AS __a{i}"))
+                }
+                (AggKind::QuantileCont | AggKind::QuantileDisc, _) => {
+                    cols.push(format!("CAST(e.__a{i} AS {}) AS __a{i}", ty(&format!("__a{i}"))))
+                }
+                (kind, _) if kind.is_moments() => {
                     cols.push(add(&format!("__a{i}_s")));
                     cols.push(add(&format!("__a{i}_q")));
                     cols.push(add(&format!("__a{i}_n")));
+                }
+                _ => {
+                    for part in PAIRED {
+                        cols.push(add(&format!("__a{i}_{part}")));
+                    }
                 }
             }
         }
@@ -466,15 +671,21 @@ impl GlobalPlan {
                 vmatch("d", "o")
             ),
         ));
+        // Each value row carries its count `__n`: the quantiles take each value that many times.
         let extremes: Vec<String> = self
             .value_aggs()
             .map(|(i, kind)| {
-                let f = match kind {
-                    AggKind::Min => "min",
-                    AggKind::Max => "max",
-                    _ => "count",
-                };
-                format!("{f}(__v{i}) FILTER (WHERE __i = {i}) AS __a{i}")
+                let only = format!("FILTER (WHERE __i = {i})");
+                match kind {
+                    AggKind::Min => format!("min(__v{i}) {only} AS __a{i}"),
+                    AggKind::Max => format!("max(__v{i}) {only} AS __a{i}"),
+                    AggKind::CountDistinct => format!("count(__v{i}) {only} AS __a{i}"),
+                    AggKind::ApproxCountDistinct => format!("approx_count_distinct(__v{i}) {only} AS __a{i}"),
+                    _ => {
+                        let values = format!("flatten(list(list_resize([__v{i}], __n, __v{i})) {only})");
+                        format!("{} AS __a{i}", list_finalize(kind, &values, self.aggs[i].param.as_deref()))
+                    }
+                }
             })
             .collect();
         let group = if self.keys == 0 { String::new() } else { format!(" GROUP BY {}", self.key_cols().join(", ")) };
@@ -614,10 +825,14 @@ impl GlobalPlan {
         let mut cols = self.key_cols();
         for (i, a) in self.aggs.iter().enumerate() {
             cols.push(match a.kind {
-                AggKind::CountStar | AggKind::Count | AggKind::Min | AggKind::Max | AggKind::CountDistinct => format!("__a{i}"),
+                AggKind::CountStar | AggKind::Count | AggKind::Min | AggKind::Max => format!("__a{i}"),
+                k if k.always_counts_values() => format!("__a{i}"),
                 AggKind::Sum => format!("CASE WHEN __a{i}_n = 0 THEN NULL ELSE __a{i}_s END AS __a{i}"),
                 AggKind::Avg => format!("CASE WHEN __a{i}_n = 0 THEN NULL ELSE CAST(__a{i}_s AS DOUBLE) / __a{i}_n END AS __a{i}"),
-                k => format!("{} AS __a{i}", moments_finalize(k, &format!("__a{i}_n"), &format!("__a{i}_s"), &format!("__a{i}_q"))),
+                k if k.is_moments() => {
+                    format!("{} AS __a{i}", moments_finalize(k, &format!("__a{i}_n"), &format!("__a{i}_s"), &format!("__a{i}_q")))
+                }
+                k => format!("{} AS __a{i}", paired_finalize(k, &|part: &str| format!("__a{i}_{part}"))),
             });
         }
         cols
@@ -929,7 +1144,7 @@ fn compile_windowed(
             finals.push(format!("CAST({} AS {sink_type}) AS {}", ident(&k), ident(&sink_name)));
             continue;
         }
-        let finalize = windowed_agg(plan, item, aggs, &mut args, &format!("__p{i}"), weighted)?;
+        let finalize = windowed_agg(conn, plan, item, aggs, &mut args, &format!("__p{i}"), weighted)?;
         agg_items.push((i, finalize.clone()));
         finals.push(format!("CAST({finalize} AS {sink_type}) AS {}", ident(&sink_name)));
     }
@@ -958,8 +1173,10 @@ fn compile_windowed(
             .collect();
         having_refs(&mut having, &mut |e: &Value| -> Result<Option<Value>> {
             if e["class"] == "FUNCTION" && aggs.contains(e["function_name"].as_str().unwrap_or("")) {
+                // The partials are named apart from `__h<j>`: a single partial named like the finalized value
+                // would be read instead of it (a list, for count(DISTINCT)).
                 let h = format!("__h{}", columns.len());
-                let fin = windowed_agg(plan, e, aggs, &mut args, &h, weighted)?;
+                let fin = windowed_agg(conn, plan, e, aggs, &mut args, &format!("{h}p"), weighted)?;
                 columns.push(format!("{fin} AS {h}"));
                 return Ok(Some(column_ref(&h, "")));
             }
@@ -1057,38 +1274,113 @@ fn having_refs(e: &mut Value, f: &mut dyn FnMut(&Value) -> Result<Option<Value>>
 /// ExpandAggregates does when the input is not append-only); over Kafka they count rows, which is the same there
 /// and cheaper. A sum keeps its weighted non-NULL count too, so that it is NULL again once every value is
 /// retracted.
-fn windowed_agg(plan: &mut Plan, item: &Value, aggs: &HashSet<String>, args: &mut Vec<Value>, p: &str, weighted: bool) -> Result<String> {
+/// The canonical name of aggregate call `item` (see `canonical_agg`), its name as written, and whether it is
+/// `count(DISTINCT ...)` (or `approx_count_distinct`, where DISTINCT changes nothing); refuses what DuckWake does
+/// not maintain.
+fn agg_call(item: &Value, aggs: &HashSet<String>) -> Result<(&'static str, String, bool)> {
     let raw = item["function_name"].as_str().unwrap().to_ascii_lowercase();
+    if matches!(raw.as_str(), "arg_min" | "arg_max" | "argmin" | "argmax" | "min_by" | "max_by" | "arg_min_null" | "arg_max_null") {
+        bail!("{raw}() is not supported: {ARG_MIN_MAX_WHY}");
+    }
     let Some(fname) = canonical_agg(&raw) else {
         bail!("aggregate {raw}() is not supported yet (supported: {SUPPORTED_LIST})");
     };
-    if item["distinct"] == true {
-        bail!("{raw}(DISTINCT ...) is not supported in windowed views yet; count(DISTINCT ...) is supported in non-windowed GROUP BY views");
+    let distinct = item["distinct"] == true;
+    if distinct && !matches!(fname, "count" | "approx_count_distinct") {
+        bail!("{raw}(DISTINCT ...) is not supported yet; count(DISTINCT ...) is");
     }
     if !item["filter"].is_null() || item["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty()) {
-        bail!("FILTER and ORDER BY inside aggregates are not supported ({raw})");
+        bail!("FILTER and ORDER BY inside aggregates are not supported yet ({raw})");
     }
-    let fn_args: Vec<Value> = item["arguments"].as_array().cloned().unwrap_or_default().iter()
-        .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
-    if fn_args.iter().any(|a| contains_fn(a, aggs)) {
+    if agg_fn_args(item).iter().any(|a| contains_fn(a, aggs)) {
         bail!("nested aggregates are not supported ({raw})");
     }
-    let x = match fname {
-        "count_star" => String::new(),
-        _ => {
-            let [a] = fn_args.as_slice() else { bail!("{raw}() takes exactly one argument here") };
-            let key = norm(a);
-            let k = args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
-                args.push(a.clone());
-                args.len() - 1
-            });
-            format!("__x{k}")
-        }
+    Ok((fname, raw, distinct))
+}
+
+fn agg_fn_args(item: &Value) -> Vec<Value> {
+    item["arguments"].as_array().cloned().unwrap_or_default().iter().map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect()
+}
+
+/// The arguments of aggregate call `item` (canonical name `fname`, written `raw`): the indexes of its input
+/// columns `__x<k>` among `args` (shared by calls with the same argument; for `f(y, x)` y's, then x's), and a
+/// quantile's fraction as SQL, which must be a constant.
+fn agg_arguments(
+    conn: &Connection,
+    item: &Value,
+    fname: &str,
+    raw: &str,
+    args: &mut Vec<Value>,
+) -> Result<(Option<usize>, Option<usize>, Option<String>)> {
+    let fn_args = agg_fn_args(item);
+    let mut index = |a: &Value| {
+        let key = norm(a);
+        Some(args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
+            args.push(a.clone());
+            args.len() - 1
+        }))
     };
+    match (fname, fn_args.as_slice()) {
+        ("count_star", _) => Ok((None, None, None)),
+        ("quantile_cont", [x]) if raw == "median" => Ok((index(x), None, Some("0.5".into()))),
+        ("quantile_cont" | "quantile_disc", [x, q]) if raw != "median" => {
+            let mut column = false;
+            walk(q, &mut |v| column |= v["class"] == "COLUMN_REF");
+            if column {
+                bail!("{raw}(): the fraction must be a constant, such as 0.9 or [0.5, 0.9]");
+            }
+            Ok((index(x), None, Some(expr_sql(conn, q)?)))
+        }
+        ("quantile_cont" | "quantile_disc", _) if raw == "median" => bail!("median() takes one argument"),
+        ("quantile_cont" | "quantile_disc", _) => bail!("{raw}() takes a value and a constant fraction, such as {raw}(x, 0.9)"),
+        (f, [y, x]) if AggKind::of(f).is_paired() => {
+            let y = index(y);
+            Ok((y, index(x), None))
+        }
+        (f, _) if AggKind::of(f).is_paired() => bail!("{raw}() takes two arguments, (y, x)"),
+        (_, [a]) => Ok((index(a), None, None)),
+        _ => bail!("{raw}() takes exactly one argument here"),
+    }
+}
+
+fn windowed_agg(
+    conn: &Connection,
+    plan: &mut Plan,
+    item: &Value,
+    aggs: &HashSet<String>,
+    args: &mut Vec<Value>,
+    p: &str,
+    weighted: bool,
+) -> Result<String> {
+    let (fname, raw, distinct) = agg_call(item, aggs)?;
+    let (arg, arg2, param) = agg_arguments(conn, item, fname, &raw, args)?;
+    let x = arg.map(|k| format!("__x{k}")).unwrap_or_default();
     let mut partial = |name: &str, sql: String, op: MergeOp| {
         plan.partials.push(format!("{sql} AS {name}"));
         plan.merge_ops.push((name.to_string(), op));
     };
+    let kind = if fname == "count" && distinct { AggKind::CountDistinct } else { AggKind::of(fname) };
+    // Values kept as a list per window: each distinct value once, or every value for the quantiles. A window's
+    // list is bounded by its rows; over a source that can retract it would need a count per value.
+    if kind.always_counts_values() {
+        if weighted {
+            bail!("{raw}() in a window over a source that can retract needs a count per value: not supported yet");
+        }
+        let (list, op) = match kind {
+            AggKind::CountDistinct | AggKind::ApproxCountDistinct => (format!("list(DISTINCT {x}) FILTER (WHERE {x} IS NOT NULL)"), MergeOp::Union),
+            _ => (format!("list({x}) FILTER (WHERE {x} IS NOT NULL)"), MergeOp::Concat),
+        };
+        partial(p, list, op);
+        return Ok(list_finalize(kind, &ident(p), param.as_deref()));
+    }
+    if kind.is_paired() {
+        let x2 = format!("__x{}", arg2.unwrap());
+        for part in PAIRED {
+            let op = if part == "n" { MergeOp::Add } else { MergeOp::AddNullable };
+            partial(&format!("{p}{part}"), paired_partial(part, &x, &x2), op);
+        }
+        return Ok(paired_finalize(kind, &|part: &str| ident(&format!("{p}{part}"))));
+    }
     Ok(match (fname, weighted) {
         ("count_star", false) => {
             partial(p, "count(*)".into(), MergeOp::Add);
@@ -1214,7 +1506,7 @@ fn compile_global(
     // Aggregates in the select list and HAVING, deduplicated; each becomes a column __a<i>.
     let mut specs: Vec<(Value, AggSpec)> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
-    let mut extract = |e: &mut Value| -> Result<()> { replace_aggs(e, aggs, &mut specs, &mut args) };
+    let mut extract = |e: &mut Value| -> Result<()> { replace_aggs(conn, e, aggs, &mut specs, &mut args) };
     let mut post_items = items.clone();
     for e in post_items.iter_mut() {
         extract(e)?;
@@ -1284,15 +1576,28 @@ fn compile_global(
                 state.push((format!("__a{i}"), x.clone().unwrap()));
                 x.unwrap()
             }
-            AggKind::CountDistinct => {
+            AggKind::CountDistinct | AggKind::ApproxCountDistinct => {
                 state.push((format!("__a{i}"), "BIGINT".into()));
                 "BIGINT".to_string()
             }
-            AggKind::VarSamp | AggKind::VarPop | AggKind::StddevSamp | AggKind::StddevPop => {
+            AggKind::QuantileCont | AggKind::QuantileDisc => {
+                let f = if a.kind == AggKind::QuantileCont { "quantile_cont" } else { "quantile_disc" };
+                let sql = format!("SELECT {f}(__x{}, {}) FROM ({pre_sql})", a.arg.unwrap(), a.param.as_deref().unwrap());
+                let ty = describe(conn, &sql).context("binding the quantile")?.remove(0).1;
+                state.push((format!("__a{i}"), ty.clone()));
+                ty
+            }
+            kind if kind.is_moments() => {
                 state.push((format!("__a{i}_s"), sum_type(a.arg.unwrap())?));
                 state.push((format!("__a{i}_q"), "DOUBLE".into()));
                 state.push((format!("__a{i}_n"), "BIGINT".into()));
                 "DOUBLE".to_string()
+            }
+            kind => {
+                for part in PAIRED {
+                    state.push((format!("__a{i}_{part}"), if part == "n" { "BIGINT" } else { "DOUBLE" }.into()));
+                }
+                if kind == AggKind::RegrCount { "BIGINT" } else { "DOUBLE" }.to_string()
             }
         };
         agg_cols.push(format!("__a{i} {out_type}"));
@@ -1312,10 +1617,10 @@ fn compile_global(
     describe(conn, &format!("SELECT {} FROM {agg_table}{having_sql}", plan.query.finish.join(", ")))
         .context("binding the select list over the aggregates (every non-aggregate column must be a GROUP BY key)")?;
 
-    // MIN and MAX over a source that can retract, and count(DISTINCT) over any: value rows in the same state
-    // table.
+    // MIN and MAX over a source that can retract, and count(DISTINCT), approx_count_distinct and the quantiles
+    // over any: value rows in the same state table.
     let counted_values = (plan.retracts() && specs.iter().any(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max)))
-        || specs.iter().any(|(_, a)| a.kind == AggKind::CountDistinct);
+        || specs.iter().any(|(_, a)| a.kind.always_counts_values());
     if counted_values {
         state.push(("__i".into(), "INTEGER".into()));
         for (i, (_, a)) in specs.iter().enumerate().filter(|(_, (_, a))| a.kind.counts_values()) {
@@ -1351,48 +1656,15 @@ fn column_ref(name: &str, alias: &str) -> Value {
            "query_location_length": 0, "column_names": [name]})
 }
 
-/// Replaces each aggregate call in `e` by `__a<i>`, recording its spec and argument.
-fn replace_aggs(e: &mut Value, aggs: &HashSet<String>, specs: &mut Vec<(Value, AggSpec)>, args: &mut Vec<Value>) -> Result<()> {
+/// Replaces each aggregate call in `e` by `__a<i>`, recording its spec and arguments.
+fn replace_aggs(conn: &Connection, e: &mut Value, aggs: &HashSet<String>, specs: &mut Vec<(Value, AggSpec)>, args: &mut Vec<Value>) -> Result<()> {
     if e["class"] == "FUNCTION" && aggs.contains(e["function_name"].as_str().unwrap_or("")) {
-        let fname = e["function_name"].as_str().unwrap().to_ascii_lowercase();
-        let distinct = e["distinct"] == true;
-        let kind = match (canonical_agg(&fname), distinct) {
-            (Some("count"), true) => AggKind::CountDistinct,
-            (_, true) => bail!("{fname}(DISTINCT ...) is not supported yet; count(DISTINCT ...) is"),
-            (Some("count_star"), _) => AggKind::CountStar,
-            (Some("count"), _) => AggKind::Count,
-            (Some("sum"), _) => AggKind::Sum,
-            (Some("avg"), _) => AggKind::Avg,
-            (Some("min"), _) => AggKind::Min,
-            (Some("max"), _) => AggKind::Max,
-            (Some("var_samp"), _) => AggKind::VarSamp,
-            (Some("var_pop"), _) => AggKind::VarPop,
-            (Some("stddev_samp"), _) => AggKind::StddevSamp,
-            (Some("stddev_pop"), _) => AggKind::StddevPop,
-            _ => bail!("aggregate {fname}() is not supported yet (supported: {SUPPORTED_LIST})"),
-        };
-        if !e["filter"].is_null() || e["order_bys"]["orders"].as_array().is_some_and(|o| !o.is_empty()) {
-            bail!("FILTER and ORDER BY inside aggregates are not supported yet ({fname})");
-        }
-        let fn_args: Vec<Value> = e["arguments"].as_array().cloned().unwrap_or_default().iter()
-            .map(|a| a.get("expression").cloned().unwrap_or_else(|| a.clone())).collect();
-        if fn_args.iter().any(|a| contains_fn(a, aggs)) {
-            bail!("nested aggregates are not supported ({fname})");
-        }
-        let arg = match kind {
-            AggKind::CountStar => None,
-            _ => {
-                let [a] = fn_args.as_slice() else { bail!("{fname}() takes exactly one argument here") };
-                let key = norm(a);
-                Some(args.iter().position(|x| norm(x) == key).unwrap_or_else(|| {
-                    args.push(a.clone());
-                    args.len() - 1
-                }))
-            }
-        };
+        let (fname, raw, distinct) = agg_call(e, aggs)?;
+        let kind = if fname == "count" && distinct { AggKind::CountDistinct } else { AggKind::of(fname) };
+        let (arg, arg2, param) = agg_arguments(conn, e, fname, &raw, args)?;
         let key = norm(e);
         let i = specs.iter().position(|(n, _)| norm(n) == key).unwrap_or_else(|| {
-            specs.push((e.clone(), AggSpec { kind, arg }));
+            specs.push((e.clone(), AggSpec { kind, arg, arg2, param }));
             specs.len() - 1
         });
         let alias = e["alias"].as_str().unwrap_or("").to_string();
@@ -1400,8 +1672,8 @@ fn replace_aggs(e: &mut Value, aggs: &HashSet<String>, specs: &mut Vec<(Value, A
         return Ok(());
     }
     match e {
-        Value::Array(a) => a.iter_mut().try_for_each(|x| replace_aggs(x, aggs, specs, args)),
-        Value::Object(o) => o.values_mut().try_for_each(|x| replace_aggs(x, aggs, specs, args)),
+        Value::Array(a) => a.iter_mut().try_for_each(|x| replace_aggs(conn, x, aggs, specs, args)),
+        Value::Object(o) => o.values_mut().try_for_each(|x| replace_aggs(conn, x, aggs, specs, args)),
         _ => Ok(()),
     }
 }
@@ -1798,6 +2070,14 @@ mod tests {
         let state: Vec<_> = p.state_columns.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(state, ["__g0", "__cnt", "__a0", "__i", "__v0", "__n"]);
         assert!(err("SELECT game_id, count(*) FROM clicks GROUP BY ROLLUP (game_id)").contains("ROLLUP"));
+        // The quantiles and approx_count_distinct share the value rows; a paired statistic keeps six sums.
+        let p = compile(&c, "j", "SELECT game_id, median(amount) AS m, approx_count_distinct(user_id) AS u, corr(amount, amount) AS r FROM clicks GROUP BY ALL", &s).unwrap();
+        let state: Vec<_> = p.state_columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            state,
+            ["__g0", "__cnt", "__a0", "__a1", "__a2_n", "__a2_y", "__a2_x", "__a2_yy", "__a2_xx", "__a2_xy", "__i", "__v0", "__v1", "__n"]
+        );
+        assert!(err("SELECT game_id, min_by(user_id, amount) FROM clicks GROUP BY ALL").contains("tie"));
     }
 
     #[test]
@@ -1807,8 +2087,11 @@ mod tests {
         assert!(err("SELECT DISTINCT ON (game_id) * FROM clicks").contains("DISTINCT ON"));
         assert!(err("SELECT DISTINCT game_id, count(*) FROM clicks GROUP BY ALL").contains("DISTINCT"));
         assert!(err("SELECT ts, row_number() OVER () FROM clicks").contains("window functions"));
-        assert!(err("SELECT window_start, approx_count_distinct(user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("not supported yet"));
-        assert!(err("SELECT window_start, count(DISTINCT user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("DISTINCT"));
+        assert!(err("SELECT window_start, mode(user_id) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("not supported yet"));
+        assert!(err("SELECT window_start, arg_max(user_id, amount) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("tie"));
+        assert!(err("SELECT window_start, sum(DISTINCT amount) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("DISTINCT"));
+        assert!(err("SELECT window_start, quantile_cont(amount, amount) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("constant"));
+        assert!(err("SELECT window_start, corr(amount) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("corr"));
         assert!(err("SELECT game_id, count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("group by window"));
         assert!(err("SELECT window_start, sum(amount) / count(*) FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL").contains("top-level"));
         // HAVING in a window compiles, filtering windows as they close.
