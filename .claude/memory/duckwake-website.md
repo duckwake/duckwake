@@ -17,4 +17,12 @@ being reviewed next to the code they describe.
 **How to apply:** a docs change goes in this repository's `docs/`; a new page there needs an entry in
 `sync-docs.mjs`'s map and in `astro.config.mjs`'s sidebar. Check claims on the site's own pages against the code
 (the Concepts page first said 2 s for the default epoch interval; it is 10 s). This session's proxy cannot reach
-the live site; the user checks it in a browser. Related: [[duckwake-design-doc]], [[duckwake-branches-prs]].
+the live site; the user checks it in a browser.
+
+**Positioning (2026-11-16):** `brand/POSITIONING.md` in the website repository is the source for how DuckWake is
+described: tagline "Real-time DuckLake tables, exactly once.", the buyer (data engineers on DuckDB and DuckLake
+with Kafka), three pillars (your lake is the result; exactly once, and you can check it; nothing new to run), the
+home page copy checked claim by claim, and the words not to use ("streaming database", "production-grade",
+"sub-second", "any SQL"). Built with the pmm-positioning and product-marketing-toolkit skills; the buyer's interest
+is still a hypothesis until users are interviewed. Benchmark numbers always carry the machine and "four worker
+flags on". Related: [[duckwake-design-doc]], [[duckwake-branches-prs]].

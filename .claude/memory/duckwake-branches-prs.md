@@ -20,6 +20,13 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
    windowed `HAVING`), #15 (a worker survives a view dropped while its epoch stages), #14 (SQL reference
    restructured), #11 (release copies extensions into the website's `public/`), #16 (dbt/ mirrored to
    duckwake/dbt-duckwake). PR #6 carries this memory.
+7. 2026-11-16: PR #17 released **v0.2.0** (tag on its merge commit `9e7fe99`): binaries for 4 platforms, the
+   extension repository (also on the website under `/extensions`, `PUBLISH_EXTENSIONS=true` with `PAGES_TOKEN`),
+   the image `ghcr.io/duckwake/duckwake` (public since that day) and dbt-duckwake's `v0.2.0`. A manual run of the
+   release workflow (Actions -> release -> Run workflow, on the release branch) first caught that `macos-14`
+   runners were retired on 2026-11-02 (now `macos-15`); run one before every tag, since `v*` tags cannot move.
+   The version bump also needs `THIRD_PARTY_LICENSES.md` regenerated (`cargo about`). PR #18 makes release notes
+   link to files at the tag.
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository

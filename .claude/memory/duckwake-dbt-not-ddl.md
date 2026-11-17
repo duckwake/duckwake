@@ -33,5 +33,7 @@ the package rewrites `ref()` to a source model into the bare source name. On 202
 2026-11-16): `.github/workflows/dbt-mirror.yml` on pushes to main, the release's `dbt-package` job tags `vX.Y.Z`
 there; both use the secret `DBT_MIRROR_TOKEN` (a fine-grained token, Contents write on dbt-duckwake only, set by
 the user; it expires, and the mirror then fails naming it). The first mirror run published `main` there the same
-day, identical to `scripts/mirror_dbt.sh layout`. Never edit dbt-duckwake by hand. The dbt Hub listing is a
-PR to dbt-labs/hubcap after the first tag (needs the user's go-ahead). Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).
+day, identical to `scripts/mirror_dbt.sh layout`. Never edit dbt-duckwake by hand. v0.2.0 is tagged there
+(2026-11-16). The dbt Hub listing waits: on 2026-11-16 the user chose to list it only once it has run in
+production for a while, since hubcap's template requires ticking "used in production". A ready draft of the
+hubcap PR (hub.json entry `"duckwake": ["dbt-duckwake"]`, Hub name `duckwake/duckwake`) was given to the user. Full design: `docs/design/dbt-duckwake.md` ([[duckwake-design-doc]]).
