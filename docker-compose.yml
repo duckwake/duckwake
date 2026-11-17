@@ -32,6 +32,11 @@ services:
         exec /entrypoint.sh redpanda start --mode=dev-container --smp=1 --memory=1G
     volumes: ["./docker/kafka:/etc/redpanda-dev:ro"]
     ports: ["19092:19092", "19093:19093", "19094:19094", "19095:19095"]
+    # The broker's internal RPC listens on 33145, inside Linux's default ephemeral port range (32768-60999). An
+    # outgoing connection in the container (rpk polling the admin API above while the broker starts) could take
+    # 33145 first, and the broker then failed to start with "posix_listen failed for address 0.0.0.0:33145:
+    # Address already in use" (CI, 2026-11-17). Outgoing connections here use ports above it.
+    sysctls: { net.ipv4.ip_local_port_range: "40000 60999" }
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true' && rpk security user list | grep -qw duckwake && rpk cluster config get enable_sasl | grep -q true"]
       interval: 2s

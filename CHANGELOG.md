@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- The repository builds as a DuckDB community extension: a root `Makefile` for DuckDB's extension CI, which
+  checks out `extension-ci-tools` and builds the library with `cargo build -p duckwake_extension`, and a
+  sqllogictest in `test/sql` that runs without PostgreSQL or Kafka
+  ([#54](https://github.com/duckwake/duckwake/issues/54)). Once DuckDB accepts the submission, the extension
+  installs signed with `INSTALL duckwake FROM community`.
+
 - More aggregates, in windowed and `GROUP BY` views ([#29](https://github.com/duckwake/duckwake/issues/29)):
   - `covar_pop`, `covar_samp`, `corr` and the `regr_*` functions (`regr_count`, `regr_avgx`, `regr_avgy`,
     `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`). Each group keeps the count
@@ -25,6 +31,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
+  RPC port, 33145, when an outgoing connection in its container had taken that port; the container's ephemeral
+  ports now start at 40000.
 - A group whose values are all equal has a variance and standard deviation of exactly 0, as in DuckDB's batch
   query. Before, rounding in `q − s²/n` could leave a tiny positive variance whose square root (about 10⁻⁸
   times the values) `duckwake_verify` reported as a difference.
