@@ -31,6 +31,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
+  RPC port, 33145, when an outgoing connection in its container had taken that port; the container's ephemeral
+  ports now start at 40000.
 - A group whose values are all equal has a variance and standard deviation of exactly 0, as in DuckDB's batch
   query. Before, rounding in `q − s²/n` could leave a tiny positive variance whose square root (about 10⁻⁸
   times the values) `duckwake_verify` reported as a difference.
