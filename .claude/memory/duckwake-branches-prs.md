@@ -27,6 +27,14 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
    runners were retired on 2026-11-02 (now `macos-15`); run one before every tag, since `v*` tags cannot move.
    The version bump also needs `THIRD_PARTY_LICENSES.md` regenerated (`cargo about`). PR #18 makes release notes
    link to files at the tag.
+8. 2026-11-17: the roadmap became GitHub issues #20-#55 (label `roadmap` plus a category label: `sql`,
+   `sources`, `dbt`, `ops`, `engine`, `distribution`; issue types Feature/Task/Bug; joins and CDC have
+   sub-issues); the user builds the Projects board from them, not stage labels like P3. PR #56 added
+   quantiles, `approx_count_distinct`, `covar`/`corr`/`regr_*` and windowed `count(DISTINCT)`; PR #57 the
+   community-extension build (root `Makefile`, `test/sql`) and a Redpanda port fix. DuckWake became a DuckDB
+   community extension (duckdb/community-extensions#3654, from the fork `duckwake/community-extensions`,
+   branch `duckwake`, maintainer harrydevforlife) at commit `16ec8d6`; each release moves its `ref` there.
+   The fork's macOS jobs never got a runner (cancelled after 15 min queued); DuckDB's own CI runs them.
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository

@@ -72,8 +72,9 @@ and views spread to workers that join, by measured load. Views can be replaced a
 they run; per-view limits fail one view instead of its worker, and a worker short of memory shrinks its epochs.
 Sources connect with SASL (PLAIN, SCRAM) and TLS, data files can live on S3, and no
 credential is stored in the lake. Every test checks the views against the same SQL run as one batch query. Views and sources can also be
-authored as dbt models with the [dbt-duckwake](dbt/README.md) package. Not yet:
-`CREATE CONTINUOUS VIEW` DDL, a signed extension and stream–stream joins.
+authored as dbt models with the [dbt-duckwake](dbt/README.md) package. The extension
+installs signed with `INSTALL duckwake FROM community`. Not yet: `CREATE CONTINUOUS VIEW` DDL and stream–stream
+joins.
 See [gaps](docs/internals.md#simplifications-and-gaps) and the [roadmap](docs/roadmap.md) to production.
 
 ## Contributing

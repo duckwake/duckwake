@@ -133,7 +133,9 @@ default.
 - Avro and Protobuf with a schema registry; Kafka keys and headers
 - Splitting one topic's partitions across workers
 - A Windows build
-- A signed community extension (`INSTALL duckwake FROM community`), once DuckDB's Rust extension path supports it
+- A signed community extension (`INSTALL duckwake FROM community`). Built 2026-11-17
+  ([duckdb/community-extensions#3654](https://github.com/duckdb/community-extensions/pull/3654)) for Linux (amd64,
+  arm64) and `osx_arm64`; Windows waits for [#53](https://github.com/duckwake/duckwake/issues/53)
 
 ## Long term
 
