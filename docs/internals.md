@@ -301,7 +301,7 @@ records the ones it took up.
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
-  parser hooks, so it needs a C++ shim. The extension is unsigned and built per platform. The server's Quack token is one shared secret; there are no users or roles.
+  parser hooks, so it needs a C++ shim. The extension is a signed community extension for Linux (amd64, arm64) and `osx_arm64`; other platforms install it unsigned from an extension repository. The server's Quack token is one shared secret; there are no users or roles.
 - **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
   certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
   view is marked failed, so a view starting while its brokers are down needs `start` again; once

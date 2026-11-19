@@ -80,3 +80,7 @@ settings → Change visibility).
    changelog section, runs clippy and the unit tests, then builds and publishes. Check the release page, the
    image tags, `docker run --rm --entrypoint duckwake ghcr.io/duckwake/duckwake:X.Y.Z --version`, and the
    `vX.Y.Z` tag in duckwake/dbt-duckwake.
+6. Move the community extension to the release: in a fork of `duckdb/community-extensions`, set `ref` in
+   `extensions/duckwake/description.yml` to the tag's commit (and `version`), and open a pull request. Its CI
+   builds and tests the extension for every platform; once DuckDB merges it, `INSTALL duckwake FROM community`
+   serves the release.

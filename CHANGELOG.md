@@ -7,11 +7,13 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
-- The repository builds as a DuckDB community extension: a root `Makefile` for DuckDB's extension CI, which
-  checks out `extension-ci-tools` and builds the library with `cargo build -p duckwake_extension`, and a
-  sqllogictest in `test/sql` that runs without PostgreSQL or Kafka
-  ([#54](https://github.com/duckwake/duckwake/issues/54)). Once DuckDB accepts the submission, the extension
-  installs signed with `INSTALL duckwake FROM community`.
+- DuckWake is a DuckDB community extension: `INSTALL duckwake FROM community` installs it signed, with no
+  `-unsigned`, on Linux (amd64, arm64) and macOS on Apple Silicon
+  ([duckdb/community-extensions#3654](https://github.com/duckdb/community-extensions/pull/3654),
+  [#54](https://github.com/duckwake/duckwake/issues/54)). The repository builds for DuckDB's extension CI: a root
+  `Makefile`, which builds the library with `cargo build -p duckwake_extension`, and a sqllogictest in
+  `test/sql` that runs without PostgreSQL or Kafka. Intel Macs and other platforms install unsigned from
+  `https://duckwake.github.io/extensions`.
 
 - More aggregates, in windowed and `GROUP BY` views ([#29](https://github.com/duckwake/duckwake/issues/29)):
   - `covar_pop`, `covar_samp`, `corr` and the `regr_*` functions (`regr_count`, `regr_avgx`, `regr_avgy`,

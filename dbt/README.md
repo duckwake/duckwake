@@ -33,13 +33,13 @@ analytics:
     prod:
       type: duckdb
       path: ':memory:'
-      config_options:
-        allow_unsigned_extensions: true            # until the extension is signed
       extensions:
         - ducklake
         - postgres
         - name: duckwake
-          repo: "'https://your-host/extensions'"   # dbt-duckdb pastes this into INSTALL ... FROM: keep the quotes
+          repo: community                          # INSTALL duckwake FROM community, signed
+          # From an extension repository instead (unsigned): repo: "'https://duckwake.github.io/extensions'"
+          # (keep the inner quotes) and config_options: {allow_unsigned_extensions: true}
       attach:
         - path: "ducklake:{{ env_var('DUCKWAKE_CATALOG') }}"   # postgres:dbname=lake host=... user=...
           alias: lake
