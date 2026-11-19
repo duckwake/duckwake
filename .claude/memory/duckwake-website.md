@@ -25,4 +25,17 @@ with Kafka), three pillars (your lake is the result; exactly once, and you can c
 home page copy checked claim by claim, and the words not to use ("streaming database", "production-grade",
 "sub-second", "any SQL"). Built with the pmm-positioning and product-marketing-toolkit skills; the buyer's interest
 is still a hypothesis until users are interviewed. Benchmark numbers always carry the machine and "four worker
-flags on". Related: [[duckwake-design-doc]], [[duckwake-branches-prs]].
+flags on".
+
+**Animations (duckwake.github.io PR #6, merged 2026-11-18):** at the user's request, six scenes built with Motion
+(`motion` 14.9.1) in that repository's `src/components/motion/` and `src/scripts/motion/`: the live hero table,
+one epoch (`EngineFlow`), a worker killed mid-epoch (`ExactlyOnce`), a view over a lake table's change feed
+(`ChangeFeed`), watermarks (`Watermark`) and failover (`Failover`), on the home page and Concepts (now
+`concepts.mdx`). Each shows the engine's real behaviour, with sources cited in the `*-data.ts` files: when the
+watermark rule, lease timeout, rebalancing, change-feed weights or what an epoch commits change here, change the
+scene too. Motion leaves an interrupted animation's `finished` pending forever, so the runtime (`scene.ts`)
+settles every wait on its own clock; route all waits through it. Docs synced from this repository stay plain
+Markdown (GitHub renders them), so scenes go only on pages written in the website repository. The home page's
+use cases (`src/components/UseCases.astro`, PR #7 there) show four real views with their SQL, each shape covered
+by a test here (`crates/circuit/src/tests/views.rs`); change them when the SQL surface does.
+Related: [[duckwake-design-doc]], [[duckwake-branches-prs]].
