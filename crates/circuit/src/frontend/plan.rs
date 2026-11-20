@@ -91,12 +91,13 @@ pub struct Plan {
 
 /// How a view reads its Kafka source as upserts (`upsert_key := [...]` on `create_view`).
 ///
-/// Each key has a current row, its last applied message, which a later message replaces; a message with no value
-/// (a tombstone) deletes it. Without `version` a message applies when it comes later in its partition (keys must
-/// stay in one partition, as Kafka's default partitioner keeps them). With `version` a message applies only when
-/// its version is above the current row's (NULL lowest; on a tie the earlier message stays), so a message
-/// redelivered or older than the row is ignored; a deleted key keeps its version as a tombstone for
-/// `tombstone_retention`, so a stale message cannot bring it back meanwhile.
+/// Each key has a current row. Read in order, a message with a value replaces it, and a message without one (a
+/// tombstone) deletes it; with `version`, a message replaces the row only when its version is at least the row's
+/// (NULL lowest), so a message older than the row is ignored. A key's messages must stay in one partition, as
+/// Kafka's default partitioner keeps them: across partitions their order is not defined. A deleted key keeps
+/// nothing, so a message older than the deleted row brings the key back.
+///
+/// As a set: a key's current row is the best (`order`) of its messages after its last tombstone.
 ///
 /// A key column comes from the message key: a JSON object's field of that name, or for a single key column the
 /// whole key (a JSON scalar or plain text); when the message has no key, or it does not decode, from the value.
@@ -105,17 +106,7 @@ pub struct UpsertSpec {
     pub key: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// With `version`: how long a deleted key's tombstone is kept (a DuckDB interval). Default `2 days`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tombstone_retention: Option<String>,
 }
-
-/// The default `tombstone_retention`.
-pub const TOMBSTONE_RETENTION: &str = "2 days";
-
-/// The state columns an upsert view keeps besides the source's columns: whether the key is deleted (a tombstone),
-/// the position of its current row's message, and when it was deleted.
-pub const UPSERT_STATE: [(&str, &str); 4] = [("__del", "BOOLEAN"), ("__p", "INTEGER"), ("__o", "BIGINT"), ("__at", "TIMESTAMP")];
 
 impl UpsertSpec {
     /// The view's key columns, quoted.
@@ -145,7 +136,7 @@ impl UpsertSpec {
     }
 
     /// The messages of `input` (with `_partition`, `_offset`, `_key`, `__del` and the source's columns) as rows
-    /// with their key columns, position `__p`, `__o` and `__del`.
+    /// with their key columns, position `__p`, `__o` and `__del` (a tombstone).
     pub fn messages_sql(&self, columns: &[(String, String)], input: &str) -> String {
         let cols: Vec<String> = columns
             .iter()
@@ -154,56 +145,50 @@ impl UpsertSpec {
         format!("SELECT {}, _partition AS __p, _offset AS __o, __del FROM {input}", cols.join(", "))
     }
 
-    /// The order that ranks a key's candidate rows, best first: the highest version, the earlier message on a
-    /// tie; without a version the later message.
+    /// The order that ranks a key's messages, best first: the highest version (NULL lowest), then the later
+    /// message; without a version the later message.
     pub fn order(&self) -> String {
         match &self.version {
-            Some(v) => format!("{} DESC NULLS LAST, __p, __o", ident(v)),
+            Some(v) => format!("{} DESC NULLS LAST, __p DESC, __o DESC", ident(v)),
             None => "__p DESC, __o DESC".into(),
         }
     }
 
-    /// Whether candidate `e` replaces the current row `s`.
+    /// Whether `e`, a later message of the key, replaces its current row `s`: always without a version, else
+    /// when its version is at least the row's (NULL lowest).
     pub fn newer(&self, e: &str, s: &str) -> String {
         match &self.version {
             Some(v) => {
                 let v = ident(v);
-                format!("({e}.{v} > {s}.{v} OR ({s}.{v} IS NULL AND {e}.{v} IS NOT NULL))")
+                format!("coalesce({e}.{v} >= {s}.{v}, {s}.{v} IS NULL)")
             }
-            None => format!("({e}.__p > {s}.__p OR ({e}.__p = {s}.__p AND {e}.__o > {s}.__o))"),
+            None => "TRUE".into(),
         }
     }
 
-    /// Of `messages` (`messages_sql`), per key: its best row (`order`) and the position `__tp`, `__to` of its last
-    /// tombstone, if any. Keys with only tombstones have the row's columns NULL and `__p` NULL.
-    pub fn best_sql(&self, columns: &[(String, String)], messages: &str) -> String {
+    /// Of `messages` (`messages_sql`), one row per key: the best of its messages after its last tombstone, with
+    /// `__del` true when there is none (the key ends deleted), and `__cut` true when the messages hold a
+    /// tombstone (whatever row the key had before them is gone).
+    pub fn best_sql(&self, messages: &str) -> String {
         let keys = self.keys().join(", ");
-        let cols: Vec<String> = columns.iter().map(|(c, _)| if self.key.contains(c) { format!("coalesce(w.{0}, t.{0}) AS {0}", ident(c)) } else { format!("w.{}", ident(c)) }).collect();
         format!(
-            "SELECT {cols}, w.__p, w.__o, t.__tp, t.__to FROM
-               (SELECT * FROM {messages} WHERE NOT __del QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY {order}) = 1) w
-               FULL JOIN (SELECT {keys}, __p AS __tp, __o AS __to FROM {messages} WHERE __del
-                          QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY __p DESC, __o DESC) = 1) t ON {on}",
-            cols = cols.join(", "),
+            "SELECT * EXCLUDE (__n, __tn), __tn IS NOT NULL AS __cut FROM (
+               SELECT *, max(CASE WHEN __del THEN __n END) OVER (PARTITION BY {keys}) AS __tn
+               FROM (SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY __p, __o) AS __n FROM {messages}))
+             WHERE __n >= coalesce(__tn, 0)
+             QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY __del, {order}) = 1",
             order = self.order(),
-            on = self.keys_match("w", "t"),
         )
     }
 
-    /// Whether a key's last tombstone in `b` (a `best_sql` row) comes after its best row there.
-    pub fn deleted_after(b: &str) -> String {
-        format!("({b}.__tp IS NOT NULL AND ({b}.__p IS NULL OR {b}.__tp > {b}.__p OR ({b}.__tp = {b}.__p AND {b}.__to > {b}.__o)))")
-    }
-
-    /// The view's input as one batch: of every message in `input`, each key's current row, unless a later
-    /// tombstone deleted it. What `verify` and the tests compare the view's table against.
+    /// The view's input as one batch: each key's current row after every message in `input`. What `verify` and
+    /// the tests compare the view's table against.
     pub fn batch_sql(&self, columns: &[(String, String)], input: &str) -> String {
-        let cols: Vec<String> = columns.iter().map(|(c, _)| format!("b.{}", ident(c))).collect();
+        let cols: Vec<String> = columns.iter().map(|(c, _)| ident(c)).collect();
         format!(
-            "SELECT {} FROM ({}) b WHERE b.__p IS NOT NULL AND NOT {}",
+            "SELECT {} FROM ({}) WHERE NOT __del",
             cols.join(", "),
-            self.best_sql(columns, &format!("({})", self.messages_sql(columns, input))),
-            UpsertSpec::deleted_after("b")
+            self.best_sql(&format!("({})", self.messages_sql(columns, input)))
         )
     }
 }
@@ -1092,7 +1077,7 @@ pub fn compile_with<S: SourceSchema>(
         }
     };
     if let Some(u) = upsert {
-        check_upsert(conn, u, &stream.source, src)?;
+        check_upsert(u, &stream.source, src)?;
         if window.is_some() {
             bail!("upsert_key keeps one row per key, replaced as it changes; a window over it is not supported (read the upsert view from a windowed view instead, once windows take updates: #38)");
         }
@@ -1177,11 +1162,8 @@ pub fn compile_with<S: SourceSchema>(
         if let Some(k) = u.key.iter().find(|k| !plan.sink_columns.iter().any(|(c, _)| c == *k)) {
             bail!("select the upsert_key column {k:?} under its name, so the view's table keeps one row per key");
         }
-        plan.state_columns = src_cols
-            .iter()
-            .map(|c| (*c).clone())
-            .chain(UPSERT_STATE.iter().map(|(c, t)| (c.to_string(), t.to_string())))
-            .collect();
+        // The state holds each key's current row: the source's columns.
+        plan.state_columns = src_cols.iter().map(|c| (*c).clone()).collect();
         plan.upsert = Some(u.clone());
     }
     if plan.distinct && (plan.window.is_some() || has_group || has_agg || !node["having"].is_null()) {
@@ -1217,7 +1199,7 @@ pub fn compile_with<S: SourceSchema>(
 }
 
 /// Refuses an upsert spec the source cannot take: it must be a Kafka source, and name its columns.
-fn check_upsert<S: SourceSchema>(conn: &Connection, u: &UpsertSpec, name: &str, src: &S) -> Result<()> {
+fn check_upsert<S: SourceSchema>(u: &UpsertSpec, name: &str, src: &S) -> Result<()> {
     if src.is_lake() {
         bail!("upsert_key reads a Kafka source's messages as upserts; {name} is a lake table or view, whose updates and deletes a view already follows");
     }
@@ -1237,12 +1219,6 @@ fn check_upsert<S: SourceSchema>(conn: &Connection, u: &UpsertSpec, name: &str, 
         Some(v) if !has(v) => bail!("upsert_version {v:?} is not a column of source {name}"),
         Some(v) if u.key.contains(v) => bail!("upsert_version {v:?} is a key column; it must be a column that grows with each change"),
         _ => {}
-    }
-    if let Some(r) = &u.tombstone_retention {
-        if u.version.is_none() {
-            bail!("tombstone_retention applies with upsert_version only: without a version, deleted keys keep no tombstone");
-        }
-        conn.query_row("SELECT CAST(? AS INTERVAL)", [r], |_| Ok(())).with_context(|| format!("tombstone_retention {r:?} is not an interval"))?;
     }
     Ok(())
 }

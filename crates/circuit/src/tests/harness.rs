@@ -209,7 +209,7 @@ fn order_messages(epochs: &[(i64, i64)], e: usize) -> String {
              CASE WHEN {i} % 7 = 3 THEN NULL ELSE {i} % 13 END AS order_id,
              CASE WHEN {i} % 7 = 3 THEN NULL ELSE ['new', 'paid', 'shipped', NULL][{i} % 4 + 1] END AS status,
              CASE WHEN {i} % 7 = 3 OR {i} % 5 = 0 THEN NULL ELSE (({i} * 37) % 23)::DECIMAL(18,2) END AS amount,
-             CASE WHEN {i} % 7 = 3 OR {i} % 9 = 4 THEN NULL ELSE ({i} * 7919) % 50 END AS ver,
+             CASE WHEN {i} % 7 = 3 OR {i} % 9 = 4 THEN NULL ELSE ({i} * 7919) % 50 // 5 END AS ver,
              CASE WHEN {i} % 7 = 3 THEN 'tombstone' END AS _err"
         )
     };

@@ -93,7 +93,7 @@ GROUP BY ALL
 does not maintain, reads that table through its change feed. View config: `epoch_interval`, `max_rows`,
 `late_data`, `checkpoint`, `inline_row_limit`, `max_state_rows`, `max_late_rows`, `start` (`earliest`, the
 default, or `latest`), `upsert_key` (a column or a list; [upsert views](../docs/sql.md#upsert-views)),
-`upsert_version`, `tombstone_retention`, `worker` (where a new view starts; default any live worker) and `start_on_create`
+`upsert_version`, `worker` (where a new view starts; default any live worker) and `start_on_create`
 (default true).
 
 ## What `dbt run` does

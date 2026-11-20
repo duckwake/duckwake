@@ -101,13 +101,10 @@ enum Cmd {
         /// message replaces its key's row and a tombstone (no value) deletes it.
         #[arg(long)]
         upsert_key: Option<String>,
-        /// With --upsert-key: the column whose higher value wins, so a message redelivered or older than the
-        /// key's row is ignored.
+        /// With --upsert-key: the column whose value decides, so a message older than the key's row is
+        /// ignored; of equal versions the later message wins.
         #[arg(long)]
         upsert_version: Option<String>,
-        /// With --upsert-version: how long a deleted key's tombstone is kept (default 2 days).
-        #[arg(long)]
-        tombstone_retention: Option<String>,
     },
     /// duckwake_add_source_column(source, column, type): views that read the source keep their columns.
     AddSourceColumn { source: String, column: String, r#type: String },
@@ -436,7 +433,6 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             replace,
             upsert_key,
             upsert_version,
-            tombstone_retention,
         } => {
             if sink.is_some() {
                 eprintln!("warning: --sink is deprecated; name the view after its table: create-view analytics.<table>");
@@ -453,7 +449,6 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 if_exists: api::if_exists(if_exists.as_deref(), replace)?,
                 upsert_key,
                 upsert_version,
-                tombstone_retention,
             };
             let (def, outcome, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
             use duckwake_core::catalog::Outcome;

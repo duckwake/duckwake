@@ -8,7 +8,7 @@
 # The worker is killed over and over (kill -9 from outside, and aborts injected at every step of the epoch);
 # after every crash every view verifies against a batch recomputation at its own checkpoint. After draining,
 # the upsert views are also checked against the topic read directly, with SQL written here rather than the
-# engine's: one row per order, its last message, or its highest version unless a later tombstone deleted it.
+# engine's: one row per order, the best of its messages after its last tombstone.
 # Then a reset rewinds the versioned view a few epochs; it and its reader replay to the same tables.
 # WORKER_FLAGS="--pipeline ..." runs it pipelined.
 TOPIC=${TOPIC:-orders}
@@ -45,15 +45,15 @@ differ() {
 MESSAGES="SELECT coalesce(try_cast(json_extract_string(_key, '\$.order_id') AS BIGINT), try_cast(_key AS BIGINT), order_id) AS k,
                  _partition AS p, _offset AS o, _error IS NOT NULL AS dead, order_id, status, amount, ver, ts
           FROM orders WHERE _error IS NULL OR _error = 'tombstone'"
-# Last message wins: an order's last message, unless it is a tombstone.
-LATEST="SELECT * FROM ($MESSAGES) QUALIFY row_number() OVER (PARTITION BY k ORDER BY p DESC, o DESC) = 1 AND NOT dead"
-# Highest version wins (the first of equal ones), unless a tombstone comes after it.
-versioned() {
-  echo "WITH m AS ($MESSAGES),
-        best AS (SELECT * FROM m WHERE NOT dead QUALIFY row_number() OVER (PARTITION BY k ORDER BY ver DESC NULLS LAST, p, o) = 1),
-        gone AS (SELECT k, max(o) AS t FROM m WHERE dead GROUP BY k)
-        SELECT b.* FROM best b LEFT JOIN gone g USING (k) WHERE g.t IS NULL OR g.t < b.o"
+# An order's current row: the best of its messages after its last tombstone (its messages are in one partition,
+# so offsets order them). Best is the later message, or the highest version and then the later message.
+expected() {
+  echo "WITH m AS ($MESSAGES), cut AS (SELECT k, max(o) AS t FROM m WHERE dead GROUP BY k)
+        SELECT m.* FROM m LEFT JOIN cut USING (k) WHERE NOT dead AND (cut.t IS NULL OR m.o > cut.t)
+        QUALIFY row_number() OVER (PARTITION BY k ORDER BY $1) = 1"
 }
+LATEST=$(expected "o DESC")
+VERSIONED=$(expected "ver DESC NULLS LAST, o DESC")
 
 log "reset lake and topic"; reset_env
 log "create the source and the views"
@@ -71,7 +71,7 @@ create orders_by_status --sql "SELECT status, count(*) AS n, sum(amount) AS tota
   count(DISTINCT amount) AS amounts FROM analytics.orders_latest GROUP BY status"
 for v in "${VIEWS[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 
-log "refused: an upsert view with an aggregate, a key not in its columns, a retention without a version"
+log "refused: an upsert view with an aggregate, a key not in its columns, a version without a key"
 failed=0
 refused() {
   local want=$1; shift
@@ -81,7 +81,7 @@ refused() {
 }
 refused "aggregates and DISTINCT go in another view" --upsert-key order_id --sql "SELECT status, count(*) AS n FROM orders GROUP BY status"
 refused "select the upsert_key column" --upsert-key order_id --sql "SELECT status, amount FROM orders"
-refused "tombstone_retention applies with upsert_version only" --upsert-key order_id --tombstone-retention "1 day" --sql "SELECT order_id, status FROM orders"
+refused "upsert_version needs upsert_key" --upsert-version ver --sql "SELECT order_id, status FROM orders"
 
 log "produce $((RATE * DURATION)) order updates over $KEYS orders at $RATE/s (every 13th a tombstone, every 17th twice, every 7th stale)"
 "$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
@@ -132,15 +132,18 @@ check_topic() {
   d=$(differ orders_latest "order_id, status, amount, ts" "$LATEST")
   echo "orders_latest: $(sql "SELECT count(*) FROM lake.analytics.orders_latest") orders, $d rows differ from the topic's last messages"
   [[ $d == 0 ]] || failed=1
-  d=$(differ orders_versioned "order_id, status, amount, ver, ts" "$(versioned)")
+  d=$(differ orders_versioned "order_id, status, amount, ver, ts" "$VERSIONED")
   echo "orders_versioned: $(sql "SELECT count(*) FROM lake.analytics.orders_versioned") orders, $d rows differ from the topic's highest versions"
   [[ $d == 0 ]] || failed=1
-  d=$(differ orders_paid "order_id, cents, ver" "SELECT order_id, amount * 100 AS cents, ver FROM ($(versioned)) WHERE status = 'paid'")
+  d=$(differ orders_paid "order_id, cents, ver" "SELECT order_id, amount * 100 AS cents, ver FROM ($VERSIONED) WHERE status = 'paid'")
   echo "orders_paid: $(sql "SELECT count(*) FROM lake.analytics.orders_paid") orders, $d rows differ"
   [[ $d == 0 ]] || failed=1
 }
 log "the upsert views against the topic"; check_topic
-echo "tombstones read: $(sql "SELECT count(*) FROM orders WHERE _error = 'tombstone'"), deleted orders kept as tombstones: $(sql "SELECT count(*) FROM lake.__duckwake.state_orders_versioned WHERE __del")"
+# The state holds each order's current row and nothing for a deleted one: as many rows as the view's table.
+state=$(sql "SELECT count(*) FROM lake.__duckwake.state_orders_versioned")
+echo "tombstones read: $(sql "SELECT count(*) FROM orders WHERE _error = 'tombstone'"); orders_versioned's state holds $state rows"
+[[ $state == $(sql "SELECT count(*) FROM lake.analytics.orders_versioned") ]] || { echo "the state holds more than the current rows"; failed=1; }
 [[ $(sql "SELECT count(*) FROM lake.analytics.orders_latest") -gt 0 ]] || { echo "orders_latest is empty"; failed=1; }
 dead=$(sql "SELECT count(*) FROM lake.__duckwake.dead_letter WHERE job_id LIKE 'orders_%'" || echo "?")
 echo "dead letters of the upsert views (tombstones are not dead letters there): $dead"

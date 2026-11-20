@@ -6,7 +6,7 @@
 
   Config: epoch_interval, max_rows, late_data, checkpoint, inline_row_limit, max_state_rows, max_late_rows,
   start ('earliest' or 'latest', for views over lake tables and views), upsert_key (a column or a list of them),
-  upsert_version, tombstone_retention, worker, start_on_create (default true).
+  upsert_version, worker, start_on_create (default true).
 #}
 {% materialization streaming_view, adapter='duckdb' %}
   {%- set name = duckwake._view_name(this) -%}
@@ -22,7 +22,7 @@
   {%- endif -%}
 
   {%- set args = [duckwake._lit(name), duckwake._lit(query)] -%}
-  {%- for key in ['epoch_interval', 'late_data', 'checkpoint', 'start', 'upsert_version', 'tombstone_retention'] -%}
+  {%- for key in ['epoch_interval', 'late_data', 'checkpoint', 'start', 'upsert_version'] -%}
     {%- if config.get(key) is not none -%}{% do args.append(key ~ ' := ' ~ duckwake._lit(config.get(key))) %}{%- endif -%}
   {%- endfor -%}
   {%- set upsert_key = config.get('upsert_key') -%}

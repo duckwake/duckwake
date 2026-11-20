@@ -323,7 +323,7 @@ impl Spec for CreateSource {
 
 /// `duckwake_create_view(name, sql, late_data :=, epoch_interval :=, max_rows :=, checkpoint :=,
 /// inline_row_limit :=, start :=, max_state_rows :=, max_late_rows :=, if_exists :=, replace :=, upsert_key :=,
-/// upsert_version :=, tombstone_retention :=)`: the table `name` and the job that maintains it. The result starts
+/// upsert_version :=)`: the table `name` and the job that maintains it. The result starts
 /// with what happened: created, unchanged, altered or replaced.
 struct CreateView;
 impl Spec for CreateView {
@@ -345,14 +345,12 @@ impl Spec for CreateView {
             ("replace", Boolean),
             ("upsert_key", Varchar),
             ("upsert_version", Varchar),
-            ("tombstone_retention", Varchar),
         ]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
         let o = ViewOptions {
             upsert_key: a.opt("upsert_key").map(String::from),
             upsert_version: a.opt("upsert_version").map(String::from),
-            tombstone_retention: a.opt("tombstone_retention").map(String::from),
             late_data: a.opt("late_data").map(String::from),
             checkpoint: a.opt("checkpoint").map(String::from),
             epoch_interval: a.opt("epoch_interval").map(String::from),

@@ -329,7 +329,7 @@ fn global_covariance_over_retractions() {
 const UPSERT_EPOCHS: [(i64, i64); 6] = [(0, 7), (7, 40), (40, 45), (45, 46), (46, 200), (200, 260)];
 
 fn upsert(key: &[&str], version: Option<&str>) -> UpsertSpec {
-    UpsertSpec { key: key.iter().map(|k| k.to_string()).collect(), version: version.map(String::from), tombstone_retention: None }
+    UpsertSpec { key: key.iter().map(|k| k.to_string()).collect(), version: version.map(String::from) }
 }
 
 #[test]
@@ -347,8 +347,9 @@ fn upsert_last_message_wins() {
 
 #[test]
 fn upsert_with_version() {
-    // With a version a message older than (or as old as) the key's row is ignored, a deleted key keeps its
-    // version as a tombstone, and a NULL version is the lowest.
+    // With a version a message older than the key's row is ignored, of equal versions the later message wins
+    // (the harness's versions repeat), a NULL version is the lowest, and a deleted key comes back with its next
+    // message whatever its version.
     let sql = "SELECT order_id, status, amount, ver FROM orders";
     check_upsert(sql, &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, false);
     check_upsert(sql, &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, true);

@@ -10,11 +10,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - Upsert views over Kafka topics ([#41](https://github.com/duckwake/duckwake/issues/41)):
   `duckwake_create_view(..., upsert_key := 'order_id')` (`create-view --upsert-key`) reads a topic of changes as
   one row per key. The key comes from the message key (a JSON object's field, or the whole key), else the
-  value; a later message replaces its key's row and a tombstone (no value) deletes it. `upsert_version` makes
-  the higher version win, so redelivered and out-of-order messages change nothing, and keeps deleted keys'
-  versions for `tombstone_retention` (default 2 days). The view's table is a plain DuckLake table; aggregates go
-  in views that read it through the change feed. `verify` checks it, `reset` rewinds it, and dbt-duckwake
-  takes the three settings as model config. Gate: `scripts/upsert_test.sh`, in order and pipelined.
+  value; a later message replaces its key's row and a tombstone (no value) deletes it. With `upsert_version` a
+  message applies only when its version is at least the row's, so an older message redelivered or replayed
+  out of order changes nothing. The view's state holds each key's current row and nothing for deleted keys. The
+  view's table is a plain DuckLake table; aggregates go in views that read it through the change feed. `verify` checks it, `reset` rewinds it, and dbt-duckwake
+  takes both settings as model config. Gate: `scripts/upsert_test.sh`, in order and pipelined.
 - `duckwake produce --keys N` sends keyed order updates for upsert views, with `--delete-every`,
   `--repeat-every` and `--stale-every`.
 - `duckwake sql` shows each message's key (`_key`) when it queries a source.
