@@ -13,6 +13,10 @@ that covers it instead of adding a duplicate, and keep this index in step.
 - [Testing](.claude/memory/duckwake-testing.md): cargo commands, which binary has the SQL functions, ports, test lake
 - [Website](.claude/memory/duckwake-website.md): duckwake.github.io on Starlight; which docs live where; how they sync; the Motion scenes and use cases
 
+Skills in `.claude/skills/`: [risingwave-reference](.claude/skills/risingwave-reference/SKILL.md), how RisingWave
+builds each part of a streaming engine, mapped to DuckWake's code and roadmap issues; use it when designing a feature
+RisingWave also has, and update its feature map when a feature lands.
+
 @.claude/memory/duckwake-production-grade.md
 @.claude/memory/duckwake-p3-vps.md
 @.claude/memory/duckwake-branches-prs.md
