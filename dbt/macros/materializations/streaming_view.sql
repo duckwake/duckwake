@@ -5,7 +5,8 @@
   (on any worker, or the `worker` config).
 
   Config: epoch_interval, max_rows, late_data, checkpoint, inline_row_limit, max_state_rows, max_late_rows,
-  start ('earliest' or 'latest', for views over lake tables and views), worker, start_on_create (default true).
+  start ('earliest' or 'latest', for views over lake tables and views), upsert_key (a column or a list of them),
+  upsert_version, tombstone_retention, worker, start_on_create (default true).
 #}
 {% materialization streaming_view, adapter='duckdb' %}
   {%- set name = duckwake._view_name(this) -%}
@@ -21,9 +22,14 @@
   {%- endif -%}
 
   {%- set args = [duckwake._lit(name), duckwake._lit(query)] -%}
-  {%- for key in ['epoch_interval', 'late_data', 'checkpoint', 'start'] -%}
+  {%- for key in ['epoch_interval', 'late_data', 'checkpoint', 'start', 'upsert_version', 'tombstone_retention'] -%}
     {%- if config.get(key) is not none -%}{% do args.append(key ~ ' := ' ~ duckwake._lit(config.get(key))) %}{%- endif -%}
   {%- endfor -%}
+  {%- set upsert_key = config.get('upsert_key') -%}
+  {%- if upsert_key is not none -%}
+    {%- if upsert_key is not string -%}{%- set upsert_key = upsert_key | join(', ') -%}{%- endif -%}
+    {% do args.append('upsert_key := ' ~ duckwake._lit(upsert_key)) %}
+  {%- endif -%}
   {%- for key in ['max_rows', 'inline_row_limit', 'max_state_rows', 'max_late_rows'] -%}
     {%- if config.get(key) is not none -%}{% do args.append(key ~ ' := ' ~ (config.get(key) | int)) %}{%- endif -%}
   {%- endfor -%}

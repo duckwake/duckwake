@@ -30,6 +30,20 @@ pub struct Msg {
     pub partition: i32,
     pub offset: i64,
     pub payload: Option<Vec<u8>>,
+    /// The message key: how a view that reads the source as upserts identifies the row.
+    pub key: Option<Vec<u8>>,
+}
+
+impl Msg {
+    /// The payload as staged: lossy UTF-8.
+    pub fn payload_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.payload.as_deref().map(String::from_utf8_lossy)
+    }
+
+    /// The key as staged (`_key`): lossy UTF-8.
+    pub fn key_text(&self) -> Option<String> {
+        self.key.as_deref().map(|k| String::from_utf8_lossy(k).into_owned())
+    }
 }
 
 /// A run of consecutive messages from one partition.
@@ -54,7 +68,7 @@ impl Chunk {
             return Ok(Chunk { partition, first_offset, last_offset, len, fast: None, slow: msgs, bisections: 0 });
         };
         let d = dec.decode(&msgs)?;
-        // Tombstones go the SQL way too, which dead-letters them as invalid JSON. Fast rows' payloads are dropped.
+        // Tombstones go the SQL way too, which stages them as `TOMBSTONE` rows. Fast rows' payloads are dropped.
         let mut slow_at = vec![false; len];
         for &i in d.fallback.iter().chain(&d.dead) {
             slow_at[i] = true;
@@ -416,7 +430,7 @@ async fn read_partition(pc: PartitionClient, p: i32, mut next: i64, feed: Feed, 
                         continue;
                     }
                     next = r.offset + 1;
-                    msgs.push(Msg { partition: p, offset: r.offset, payload: r.record.value });
+                    msgs.push(Msg { partition: p, offset: r.offset, payload: r.record.value, key: r.record.key });
                 }
                 let mut msgs = msgs.into_iter();
                 loop {
@@ -501,7 +515,7 @@ async fn read_range(pc: &PartitionClient, p: i32, start: i64, end: i64, out: &mu
                 continue;
             }
             next = r.offset + 1;
-            out.push(Msg { partition: p, offset: r.offset, payload: r.record.value });
+            out.push(Msg { partition: p, offset: r.offset, payload: r.record.value, key: r.record.key });
         }
     }
     Ok(())
@@ -516,11 +530,19 @@ pub async fn ensure_topic(c: &Client, topic: &str, partitions: i32) -> Result<()
 }
 
 pub async fn produce(c: &Client, topic: &str, partition: i32, payloads: Vec<Vec<u8>>) -> Result<()> {
+    produce_keyed(c, topic, partition, payloads.into_iter().map(|v| (None, Some(v))).collect()).await
+}
+
+/// A message's key and value; a `None` value is a tombstone.
+pub type Keyed = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Produces `(key, value)` messages to one partition.
+pub async fn produce_keyed(c: &Client, topic: &str, partition: i32, messages: Vec<Keyed>) -> Result<()> {
     let pc = partition_client(c, topic, partition).await?;
     let now = chrono::Utc::now();
-    let records = payloads
+    let records = messages
         .into_iter()
-        .map(|v| rskafka::record::Record { key: None, value: Some(v), headers: Default::default(), timestamp: now })
+        .map(|(key, value)| rskafka::record::Record { key, value, headers: Default::default(), timestamp: now })
         .collect();
     pc.produce(records, rskafka::client::partition::Compression::NoCompression).await?;
     Ok(())

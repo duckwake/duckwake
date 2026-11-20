@@ -7,6 +7,18 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- Upsert views over Kafka topics ([#41](https://github.com/duckwake/duckwake/issues/41)):
+  `duckwake_create_view(..., upsert_key := 'order_id')` (`create-view --upsert-key`) reads a topic of changes as
+  one row per key. The key comes from the message key (a JSON object's field, or the whole key), else the
+  value; a later message replaces its key's row and a tombstone (no value) deletes it. `upsert_version` makes
+  the higher version win, so redelivered and out-of-order messages change nothing, and keeps deleted keys'
+  versions for `tombstone_retention` (default 2 days). The view's table is a plain DuckLake table; aggregates go
+  in views that read it through the change feed. `verify` checks it, `reset` rewinds it, and dbt-duckwake
+  takes the three settings as model config. Gate: `scripts/upsert_test.sh`, in order and pipelined.
+- `duckwake produce --keys N` sends keyed order updates for upsert views, with `--delete-every`,
+  `--repeat-every` and `--stale-every`.
+- `duckwake sql` shows each message's key (`_key`) when it queries a source.
+
 - DuckWake is a DuckDB community extension: `INSTALL duckwake FROM community` installs it signed, with no
   `-unsigned`, on Linux (amd64, arm64) and macOS on Apple Silicon
   ([duckdb/community-extensions#3654](https://github.com/duckdb/community-extensions/pull/3654),
@@ -31,7 +43,14 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - `arg_min` and `arg_max` (and `min_by`, `max_by`) are refused with the reason: when rows tie, DuckDB's batch
   result depends on row order, so `duckwake_verify` could not check the view.
 
+### Changed
+
+- A Kafka message without a value (a tombstone) is a dead letter with the error `tombstone` instead of
+  `invalid json`, in the views that do not read its source as upserts.
+
 ### Fixed
+
+- The dead-letter query in the `DuckWakeDeadLetters` alert's docs named a column `_err`; it is `error`.
 
 - The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
   RPC port, 33145, when an outgoing connection in its container had taken that port; the container's ephemeral

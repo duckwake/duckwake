@@ -14,6 +14,7 @@ mod map;
 mod sink;
 mod source;
 mod union;
+mod upsert;
 mod window;
 
 pub use aggregate::{Aggregate, Grouping};
@@ -27,6 +28,7 @@ pub use map::Map;
 pub use sink::{Sink, SinkKind, COUNT_COLUMN};
 pub use source::Source;
 pub use union::Union;
+pub use upsert::Upsert;
 pub use window::Window;
 
 use crate::codegen::{Cx, Rel, Step};
@@ -93,6 +95,7 @@ pub enum Op {
     Map(Map),
     Aggregate(Aggregate),
     Distinct(Distinct),
+    Upsert(Upsert),
     Union(Union),
     Sink(Sink),
     Integrate(Integrate),
@@ -113,6 +116,7 @@ macro_rules! dispatch {
             Op::Map($o) => $e,
             Op::Aggregate($o) => $e,
             Op::Distinct($o) => $e,
+            Op::Upsert($o) => $e,
             Op::Union($o) => $e,
             Op::Sink($o) => $e,
             Op::Integrate($o) => $e,

@@ -34,7 +34,7 @@ COMMIT;
 Every view runs as a [DBSP](https://arxiv.org/abs/2203.16684) circuit, the model Feldera is built on
 (the `duckwake_circuit` crate). The compiled view becomes an operator graph Q over whole collections: `Source` (each row with weight
 `__w`, +1 for Kafka), `Window`, `LateSplit`, `From` (the stream under the view's alias, joined with its lookup
-tables), `Filter` (`WHERE`, `HAVING`), `Map` (a select list), `Aggregate`, `Sink`. The frontend cuts the view
+tables), `Filter` (`WHERE`, `HAVING`), `Map` (a select list), `Aggregate`, `Upsert` (each key's current row, for upsert views), `Sink`. The frontend cuts the view
 into these pieces from DuckDB's parse tree, each kept as SQL text in the view's own names. An analysis
 marks which edges are append-only; a view whose operators assume append-only input (append sinks, late-data
 tables) is refused when that input can retract. `incrementalize`
@@ -69,6 +69,19 @@ retract, as Feldera's `ExpandAggregates` does (Kafka views keep the cheaper part
 | Windowed `count`, `sum`, `avg` | partials `sum(__w)`, `sum(x * __w)` and a weighted non-NULL count; a window and group whose weight returns to 0 is not emitted |
 | Windowed `MIN`/`MAX`, `count(DISTINCT)`, `approx_count_distinct`, quantiles | refused for now (over inputs that only insert, the last three keep each window's values as a LIST partial: distinct values merged with `list_distinct(list_concat(...))`, all values with `list_concat`, finalized with `list_aggregate`) |
 | Late-data table | refused for now: late rows would need their weights (C4) |
+
+**Upsert views (C2).** A view created with `upsert_key` gets an `Upsert` operator after its `Source`
+(`ops/upsert.rs`): non-linear, so it runs as UpsertΔ, with each key's current row in the view's state table
+plus `__del` (a deleted key kept as a tombstone, with a version only), the message's position `__p`, `__o`, and
+`__at`, when it was deleted. Per epoch it stages each key's best message and last tombstone
+(`UpsertSpec::best_sql`), the stored rows of the keys they touch (`uold`; when pipelined, the previous epoch's
+uncommitted `unew` overlays the state), and the changed keys' new rows (`unew`). Its output is a Z-set: a
+changed key's old row −1, its new row +1. Everything after it sees a retracting input, so a filter or a
+projection is linear as usual and the sink is `Upsert` by the key columns. The commit replaces the touched
+keys' state rows and, with a version, removes tombstones older than `tombstone_retention` every 60th epoch.
+The batch query the view must equal, used by `verify` and the tests, is `UpsertSpec::batch_sql` over every
+message. Tombstones are staged as typed rows with `_err` 'tombstone' and the message key in `_key`; the
+`Source` of an upsert view takes them with `__del`, and the commit leaves them out of its dead letters.
 
 A window is still emitted once, when it closes; a retraction into a closed window is a late row. The
 harness's `changes` source deletes and updates rows of the previous epoch and cancels rows within an epoch,

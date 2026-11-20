@@ -1,6 +1,6 @@
 //! The compiled plan as Q, a graph of operators over whole collections.
 use crate::ir::{Circuit, Port, View};
-use crate::ops::{Aggregate, Distinct, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Union, Window};
+use crate::ops::{Aggregate, Distinct, Filter, From, Grouping, LateSplit, Map, Op, Sink, SinkKind, Source, Union, Upsert, Window};
 use crate::plan::{Plan, Query};
 
 impl Circuit {
@@ -11,6 +11,7 @@ impl Circuit {
     ///   Sink(late data)
     /// - global aggregate: Source → From → Filter → Map → Aggregate → Filter(HAVING) → Map → Sink(upsert)
     /// - UNION ALL: a stateless chain per branch, each from its own source, into Union → Sink(append)
+    /// - upsert (`upsert_key`): Source → Upsert → From → Filter → Map → Sink(upsert), by the view's keys
     ///
     /// Over a source that can retract, a stateless view's sink keeps a count per row, and DISTINCT's an
     /// upsert by the whole row.
@@ -26,7 +27,10 @@ impl Circuit {
             c.analyze();
             return c;
         }
-        let src = c.add(source_op(plan, &plan.source), vec![]);
+        let mut src = c.add(source_op(plan, &plan.source), vec![]);
+        if plan.upsert.is_some() {
+            src = c.add(Op::Upsert(Upsert), vec![src]);
+        }
         let (stream, split) = match &plan.window {
             Some(w) => {
                 let win = c.add(Op::Window(Window(w.clone())), vec![src]);
@@ -61,6 +65,8 @@ impl Circuit {
             last = c.add(Op::Distinct(Distinct), vec![last]);
             let kind = if plan.retracts() { SinkKind::Upsert } else { SinkKind::Append };
             c.add(Op::Sink(Sink { kind }), vec![last]);
+        } else if plan.upsert.is_some() {
+            c.add(Op::Sink(Sink { kind: SinkKind::Upsert }), vec![last]);
         } else {
             c.add(rows_sink, vec![last]);
         }

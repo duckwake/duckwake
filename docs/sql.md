@@ -70,6 +70,9 @@ CALL duckwake_create_view('analytics.clicks_per_min',
 | `max_state_rows` | none | Most rows the view's state may hold; past it the view fails alone ([limits](cli.md#limits)). |
 | `max_late_rows` | none | Most late rows one epoch may write; past it the view fails alone. |
 | `start` | `'earliest'` | Over lake tables and other views: `earliest` starts from the rows they already hold, `latest` from rows written after the view is created ([backfill](#backfill)). |
+| `upsert_key` | none | Read the Kafka source as upserts, one row per key: the key column, or several comma-separated ([upsert views](#upsert-views)). |
+| `upsert_version` | none | With `upsert_key`: the column whose higher value wins. Without it the later message wins. |
+| `tombstone_retention` | `'2 days'` | With `upsert_version`: how long a deleted key's tombstone is kept. |
 | `if_exists` | `'fail'` | When the view exists: `fail`; `update` changes only its settings and refuses a changed query; `replace` replaces it and recomputes from the start. `replace := true` is the same as `'replace'`. |
 | `inline_row_limit` | `10000` | Rows of the view's table kept inlined in the catalog before they go to Parquet. |
 | `checkpoint` | `'ducklake'` | Where the state lives; `ducklake` is the only backend. |
@@ -199,12 +202,54 @@ Maintenance never expires a snapshot a view still needs: it keeps every snapshot
 any view that is not dropped, paused and stopped ones included. `duckwake_snapshots_held_seconds` says how far
 back that is ([alerts](alerts.md#duckwakesnapshotsheld)).
 
+## Upsert views
+
+A topic of changes, where each message is the latest version of a record, reads as a table with `upsert_key`:
+
+```sql
+CALL duckwake_create_view('analytics.orders',
+  'SELECT order_id, status, amount, ts FROM orders',
+  upsert_key := 'order_id', upsert_version := 'ver');
+```
+
+The view's table is a plain DuckLake table with one row per key. A message replaces its key's row, and a
+tombstone (a message with a key and no value) deletes it.
+
+- **The key.** It comes from the message key: a JSON object's field of the same name (`{"order_id": 42}`), or,
+  for one key column, the whole key (`42`, as JSON or plain text). A message without a key takes it from its
+  value. Several key columns are comma-separated: `upsert_key := 'tenant, order_id'`.
+- **Which message wins.** Without `upsert_version`, the later message in the partition wins. A key's
+  messages must stay in one partition, as Kafka's default partitioner keeps them. With `upsert_version`, a
+  message replaces its key's row only when its version is higher. NULL versions count as the lowest, and of
+  equal versions the first message stays. A message redelivered or replayed out of order then changes nothing.
+- **Deletes.** A tombstone deletes its key's row when it comes after that row's message. With
+  `upsert_version`, the deleted key keeps its version as a tombstone in the view's state for
+  `tombstone_retention`, so an older message that arrives later does not bring it back. Tombstones past the
+  retention are removed every 60th epoch; after that, a message with an older version recreates the row.
+  Without a version, a deleted key keeps nothing.
+- **What the view can do.** It filters, selects and computes columns, and can look up lake tables. The key
+  columns must be selected under their names. A filter applies to each key's current row: when an order's
+  latest version no longer matches, its row leaves the table. Aggregates, `DISTINCT`, windows and `UNION ALL`
+  are refused. Put them in another view that reads this one's table through the change feed, which carries its
+  updates and deletes:
+
+  ```sql
+  SELECT status, count(*) AS n, sum(amount) AS total FROM analytics.orders GROUP BY status
+  ```
+
+- **Malformed messages.** A message that is not valid JSON, or is missing its event time, is a dead letter,
+  as in any view. A tombstone is a dead letter (`error` 'tombstone') only for the views that do not read the
+  source as upserts.
+
+`verify` recomputes the table from the topic with the same rules. `duckwake sql` shows each message's `_key`
+next to `_partition` and `_offset` when it queries the source.
+
 ## The same in the CLI
 
 | SQL function (server, extension) | CLI |
 | --- | --- |
 | `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
-| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--if-exists fail\|update\|replace] [--replace]` |
+| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--upsert-key] [--upsert-version] [--tombstone-retention] [--if-exists fail\|update\|replace] [--replace]` |
 | `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |
 | `duckwake_alter_view(view, ...)` | `alter-view NAME [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows]` |
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME [--worker W]` (default `any`) / `stop` / `pause` |

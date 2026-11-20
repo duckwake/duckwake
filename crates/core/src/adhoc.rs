@@ -34,18 +34,18 @@ pub fn referenced_sources<'a>(sql: &str, sources: &'a HashMap<String, SourceDef>
 }
 
 /// Replaces `temp.main.<source>` with the newest `limit` events: the source's columns plus `_partition`,
-/// `_offset`, `_error` (why the event could not be decoded, else NULL) and `_payload` (the raw value).
+/// `_offset`, `_error` (why the event could not be decoded, else NULL: 'tombstone' for a message without a
+/// value), `_payload` (the raw value) and `_key` (the message key).
 /// Returns the number of events read.
 pub fn load_snapshot(conn: &Connection, rt: &Handle, src: &SourceDef, limit: usize) -> Result<usize> {
     let msgs = rt.block_on(kafka::read_tail(&src.options, limit))?;
     let raw = format!("temp.main.{}", ident(&format!("__raw_{}", src.name)));
     let ok = format!("temp.main.{}", ident(&format!("__ok_{}", src.name)));
-    conn.execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR)"))?;
+    conn.execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR)"))?;
     {
         let mut app = conn.appender_to_catalog_and_db(&format!("__raw_{}", src.name), "temp", "main")?;
         for m in &msgs {
-            let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-            app.append_row(duckdb::params![m.partition, m.offset, payload.as_deref()])?;
+            app.append_row(duckdb::params![m.partition, m.offset, m.payload_text().as_deref(), m.key_text()])?;
         }
         app.flush()?;
     }
@@ -55,9 +55,10 @@ pub fn load_snapshot(conn: &Connection, rt: &Handle, src: &SourceDef, limit: usi
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TEMP TABLE {ok} AS SELECT * FROM {raw} WHERE {IS_JSON_OBJECT};
          CREATE OR REPLACE TEMP TABLE {name} AS
-           SELECT {cols}, _partition, _offset, _err AS _error, payload AS _payload FROM ({decode})
+           SELECT {cols}, _partition, _offset, _err AS _error, payload AS _payload, _key FROM ({decode})
            UNION ALL
-           SELECT {nulls}, _partition, _offset, 'invalid json' AS _error, payload AS _payload
+           SELECT {nulls}, _partition, _offset,
+                  CASE WHEN payload IS NULL THEN 'tombstone' ELSE 'invalid json' END AS _error, payload AS _payload, _key
            FROM {raw} WHERE NOT ({IS_JSON_OBJECT})
            ORDER BY _partition, _offset;
          DROP TABLE {raw}; DROP TABLE {ok};",

@@ -148,7 +148,7 @@ until `idle_timeout`. Look at the view's checkpoints (`watermark`) and the topic
 
 **warning.** More than 1% of a view's events cannot be decoded. They are in `lake.__duckwake.dead_letter` with
 their payload and the error:
-`SELECT _err, count(*) FROM lake.__duckwake.dead_letter WHERE job_id = '<view>' GROUP BY ALL`. A producer
+`SELECT error, count(*) FROM lake.__duckwake.dead_letter WHERE job_id = '<view>' GROUP BY ALL`. A producer
 changed its format, or a source column has the wrong type (add one with `duckwake add-source-column`).
 
 ## DuckWakeLateRows

@@ -712,6 +712,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
                 limits: Default::default(),
                 start: None,
                 if_exists: catalog::IfExists::Fail,
+                upsert: None,
             },
         )?;
         if r.start.unwrap_or(true) {

@@ -130,8 +130,12 @@ impl Operator for Sink {
     }
 }
 
-/// The columns an upsert sink replaces rows by: a global aggregate's group keys, or every column.
+/// The columns an upsert sink replaces rows by: an upsert view's keys, a global aggregate's group keys, or every
+/// column.
 fn upsert_keys(plan: &Plan) -> Vec<String> {
+    if let Some(u) = &plan.upsert {
+        return u.key.clone();
+    }
     match &plan.global {
         Some(g) => g.sink_keys.clone(),
         None => plan.sink_columns.iter().map(|(c, _)| c.clone()).collect(),

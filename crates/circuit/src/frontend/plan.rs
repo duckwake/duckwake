@@ -83,6 +83,134 @@ pub struct Plan {
     /// Windowed views with HAVING: which closed windows are emitted.
     #[serde(default)]
     pub window_having: Option<WindowHaving>,
+    /// A view that reads its Kafka source as upserts: one row per key, replaced by its newer messages and
+    /// removed by a tombstone (`UpsertSpec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsert: Option<UpsertSpec>,
+}
+
+/// How a view reads its Kafka source as upserts (`upsert_key := [...]` on `create_view`).
+///
+/// Each key has a current row, its last applied message, which a later message replaces; a message with no value
+/// (a tombstone) deletes it. Without `version` a message applies when it comes later in its partition (keys must
+/// stay in one partition, as Kafka's default partitioner keeps them). With `version` a message applies only when
+/// its version is above the current row's (NULL lowest; on a tie the earlier message stays), so a message
+/// redelivered or older than the row is ignored; a deleted key keeps its version as a tombstone for
+/// `tombstone_retention`, so a stale message cannot bring it back meanwhile.
+///
+/// A key column comes from the message key: a JSON object's field of that name, or for a single key column the
+/// whole key (a JSON scalar or plain text); when the message has no key, or it does not decode, from the value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertSpec {
+    pub key: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// With `version`: how long a deleted key's tombstone is kept (a DuckDB interval). Default `2 days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_retention: Option<String>,
+}
+
+/// The default `tombstone_retention`.
+pub const TOMBSTONE_RETENTION: &str = "2 days";
+
+/// The state columns an upsert view keeps besides the source's columns: whether the key is deleted (a tombstone),
+/// the position of its current row's message, and when it was deleted.
+pub const UPSERT_STATE: [(&str, &str); 4] = [("__del", "BOOLEAN"), ("__p", "INTEGER"), ("__o", "BIGINT"), ("__at", "TIMESTAMP")];
+
+impl UpsertSpec {
+    /// The view's key columns, quoted.
+    pub fn keys(&self) -> Vec<String> {
+        self.key.iter().map(|k| ident(k)).collect()
+    }
+
+    /// Null-safe equality of the keys of `a` and `b`.
+    pub fn keys_match(&self, a: &str, b: &str) -> String {
+        self.keys().iter().map(|k| format!("{a}.{k} IS NOT DISTINCT FROM {b}.{k}")).collect::<Vec<_>>().join(" AND ")
+    }
+
+    /// One key column's value: from the message key `_key`, else from the value's column.
+    fn key_expr(&self, column: &str, ty: &str) -> String {
+        let c = ident(column);
+        let field = format!("TRY_CAST(json_extract_string(_key, {}) AS {ty})", sql_lit(&format!("$.\"{column}\"")));
+        let whole = if self.key.len() == 1 {
+            format!("TRY_CAST(json_extract_string(_key, '$') AS {ty})")
+        } else {
+            "NULL".to_string()
+        };
+        let raw = if self.key.len() == 1 { format!("TRY_CAST(_key AS {ty})") } else { "NULL".to_string() };
+        // json_type raises on text that is not JSON, and CASE is the only short circuit DuckDB keeps.
+        format!(
+            "coalesce(CASE WHEN json_valid(_key) THEN CASE WHEN json_type(_key) = 'OBJECT' THEN {field} ELSE {whole} END ELSE {raw} END, {c}) AS {c}"
+        )
+    }
+
+    /// The messages of `input` (with `_partition`, `_offset`, `_key`, `__del` and the source's columns) as rows
+    /// with their key columns, position `__p`, `__o` and `__del`.
+    pub fn messages_sql(&self, columns: &[(String, String)], input: &str) -> String {
+        let cols: Vec<String> = columns
+            .iter()
+            .map(|(c, t)| if self.key.contains(c) { self.key_expr(c, t) } else { ident(c) })
+            .collect();
+        format!("SELECT {}, _partition AS __p, _offset AS __o, __del FROM {input}", cols.join(", "))
+    }
+
+    /// The order that ranks a key's candidate rows, best first: the highest version, the earlier message on a
+    /// tie; without a version the later message.
+    pub fn order(&self) -> String {
+        match &self.version {
+            Some(v) => format!("{} DESC NULLS LAST, __p, __o", ident(v)),
+            None => "__p DESC, __o DESC".into(),
+        }
+    }
+
+    /// Whether candidate `e` replaces the current row `s`.
+    pub fn newer(&self, e: &str, s: &str) -> String {
+        match &self.version {
+            Some(v) => {
+                let v = ident(v);
+                format!("({e}.{v} > {s}.{v} OR ({s}.{v} IS NULL AND {e}.{v} IS NOT NULL))")
+            }
+            None => format!("({e}.__p > {s}.__p OR ({e}.__p = {s}.__p AND {e}.__o > {s}.__o))"),
+        }
+    }
+
+    /// Of `messages` (`messages_sql`), per key: its best row (`order`) and the position `__tp`, `__to` of its last
+    /// tombstone, if any. Keys with only tombstones have the row's columns NULL and `__p` NULL.
+    pub fn best_sql(&self, columns: &[(String, String)], messages: &str) -> String {
+        let keys = self.keys().join(", ");
+        let cols: Vec<String> = columns.iter().map(|(c, _)| if self.key.contains(c) { format!("coalesce(w.{0}, t.{0}) AS {0}", ident(c)) } else { format!("w.{}", ident(c)) }).collect();
+        format!(
+            "SELECT {cols}, w.__p, w.__o, t.__tp, t.__to FROM
+               (SELECT * FROM {messages} WHERE NOT __del QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY {order}) = 1) w
+               FULL JOIN (SELECT {keys}, __p AS __tp, __o AS __to FROM {messages} WHERE __del
+                          QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY __p DESC, __o DESC) = 1) t ON {on}",
+            cols = cols.join(", "),
+            order = self.order(),
+            on = self.keys_match("w", "t"),
+        )
+    }
+
+    /// Whether a key's last tombstone in `b` (a `best_sql` row) comes after its best row there.
+    pub fn deleted_after(b: &str) -> String {
+        format!("({b}.__tp IS NOT NULL AND ({b}.__p IS NULL OR {b}.__tp > {b}.__p OR ({b}.__tp = {b}.__p AND {b}.__to > {b}.__o)))")
+    }
+
+    /// The view's input as one batch: of every message in `input`, each key's current row, unless a later
+    /// tombstone deleted it. What `verify` and the tests compare the view's table against.
+    pub fn batch_sql(&self, columns: &[(String, String)], input: &str) -> String {
+        let cols: Vec<String> = columns.iter().map(|(c, _)| format!("b.{}", ident(c))).collect();
+        format!(
+            "SELECT {} FROM ({}) b WHERE b.__p IS NOT NULL AND NOT {}",
+            cols.join(", "),
+            self.best_sql(columns, &format!("({})", self.messages_sql(columns, input))),
+            UpsertSpec::deleted_after("b")
+        )
+    }
+}
+
+/// `s` as a SQL string literal.
+fn sql_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// HAVING in a windowed view, applied as windows close: `condition` over a state row with `columns` added
@@ -468,17 +596,17 @@ impl Plan {
 
     /// Whether the plan keeps a state table in `__duckwake`.
     pub fn has_state(&self) -> bool {
-        self.is_windowed() || self.is_global() || self.distinct
+        self.is_windowed() || self.is_global() || self.distinct || self.upsert.is_some()
     }
 
     /// Whether the view's state depends on every event of its topic, so retention's deletes break it.
     pub fn needs_whole_topic(&self) -> bool {
-        self.is_global() || self.distinct
+        self.is_global() || self.distinct || self.upsert.is_some()
     }
 
     /// Over a source that can retract, every view's table but a windowed one's has rows replaced or removed.
     pub fn sink_mode(&self) -> SinkMode {
-        if self.is_global() || (self.retracts() && !self.is_windowed()) { SinkMode::Upsert } else { SinkMode::Append }
+        if self.is_global() || self.upsert.is_some() || (self.retracts() && !self.is_windowed()) { SinkMode::Upsert } else { SinkMode::Append }
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -488,6 +616,8 @@ impl Plan {
             "aggregate"
         } else if self.distinct {
             "distinct"
+        } else if self.upsert.is_some() {
+            "upsert"
         } else if !self.union.is_empty() {
             "union"
         } else {
@@ -893,6 +1023,17 @@ impl GlobalTables {
 /// Compiles `sql` for job `job`. Creates the (empty) staging table so DuckDB can bind and DESCRIBE the
 /// rewritten queries, which also validates lookup-join tables and column names.
 pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, S>) -> Result<Plan> {
+    compile_with(conn, job, sql, sources, None)
+}
+
+/// `compile`, for a view that reads its Kafka source as upserts when `upsert` is given.
+pub fn compile_with<S: SourceSchema>(
+    conn: &Connection,
+    job: &str,
+    sql: &str,
+    sources: &HashMap<String, S>,
+    upsert: Option<&UpsertSpec>,
+) -> Result<Plan> {
     let ast = serialize(conn, sql)?;
     let stmts = ast["statements"].as_array().ok_or_else(|| anyhow!("no statements"))?;
     if stmts.len() != 1 {
@@ -900,6 +1041,9 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     }
     let mut stmt = stmts[0].clone();
     if stmt["node"]["type"] == "SET_OPERATION_NODE" {
+        if upsert.is_some() {
+            bail!("upsert_key reads one Kafka source as upserts; a UNION ALL view cannot use it");
+        }
         return compile_union(conn, job, &stmt, sources);
     }
     let node = &mut stmt["node"];
@@ -947,7 +1091,18 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
             Some(WindowSpec { kind: *kind, time_col: time_col.clone(), size_us, slide_us })
         }
     };
-    let table_ref = base_table_template(conn, &input_table, &stream.alias)?;
+    if let Some(u) = upsert {
+        check_upsert(conn, u, &stream.source, src)?;
+        if window.is_some() {
+            bail!("upsert_key keeps one row per key, replaced as it changes; a window over it is not supported (read the upsert view from a windowed view instead, once windows take updates: #38)");
+        }
+    }
+    // The stream an upsert view reads in its batch form: each key's current row, over the staged messages.
+    let stream_table = match upsert {
+        Some(_) => format!("memory.main.{}", ident(&format!("up_{job}"))),
+        None => input_table.clone(),
+    };
+    let table_ref = base_table_template(conn, &stream_table, &stream.alias)?;
     *stream_slot(&mut node["from_table"]).ok_or_else(|| anyhow!("lost stream reference"))? = table_ref.clone();
 
     // The view in pieces: the FROM with a placeholder where the stream goes, the WHERE, the stream's columns.
@@ -962,7 +1117,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         alias: stream.alias.clone(),
         columns,
         from: from_template(conn, &node["from_table"], &table_ref)?,
-        lookups: lookup_tables(&node["from_table"], &input_table),
+        lookups: lookup_tables(&node["from_table"], &stream_table),
         filter: (!node["where_clause"].is_null()).then(|| expr_sql(conn, &node["where_clause"])).transpose()?,
         ..Query::default()
     };
@@ -973,7 +1128,15 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         cols.push("window_start TIMESTAMP".into());
         cols.push("window_end TIMESTAMP".into());
     }
-    conn.execute_batch(&format!("CREATE OR REPLACE TABLE {input_table} ({})", cols.join(", ")))?;
+    if let Some(u) = upsert {
+        // The messages as staged: their position, key and whether they are tombstones.
+        cols.extend(["_partition INTEGER".into(), "_offset BIGINT".into(), "_key VARCHAR".into(), "__del BOOLEAN".into()]);
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE {input_table} ({})", cols.join(", ")))?;
+        let owned: Vec<(String, String)> = src_cols.iter().map(|c| (*c).clone()).collect();
+        conn.execute_batch(&format!("CREATE OR REPLACE VIEW {stream_table} AS {}", u.batch_sql(&owned, &input_table)))?;
+    } else {
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE {input_table} ({})", cols.join(", ")))?;
+    }
 
     let batch_sql = deserialize(conn, &stmt)?;
     let sink_columns = describe(conn, &batch_sql).context("binding the view")?;
@@ -995,6 +1158,7 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         retracting: if src.append_only() { vec![] } else { vec![stream.source.clone()] },
         change_feeds: if src.is_lake() { vec![stream.source.clone()] } else { vec![] },
         window_having: None,
+        upsert: None,
     };
 
     let node = &mut stmt["node"];
@@ -1002,6 +1166,24 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
         || node["group_expressions"].as_array().is_some_and(|g| !g.is_empty());
     let has_agg = node["select_list"].as_array().unwrap().iter().any(|e| contains_fn(e, &aggs));
     plan.distinct = node["modifiers"].as_array().is_some_and(|m| m.iter().any(|m| m["type"] == "DISTINCT_MODIFIER"));
+    if let Some(u) = upsert {
+        if has_group || has_agg || plan.distinct || !node["having"].is_null() {
+            bail!(
+                "upsert_key makes a view keep one row per key of its source; it filters and selects columns, but \
+                 aggregates and DISTINCT go in another view that reads it"
+            );
+        }
+        // Each key's row is replaced by key in the view's table, so the table must carry the keys.
+        if let Some(k) = u.key.iter().find(|k| !plan.sink_columns.iter().any(|(c, _)| c == *k)) {
+            bail!("select the upsert_key column {k:?} under its name, so the view's table keeps one row per key");
+        }
+        plan.state_columns = src_cols
+            .iter()
+            .map(|c| (*c).clone())
+            .chain(UPSERT_STATE.iter().map(|(c, t)| (c.to_string(), t.to_string())))
+            .collect();
+        plan.upsert = Some(u.clone());
+    }
     if plan.distinct && (plan.window.is_some() || has_group || has_agg || !node["having"].is_null()) {
         bail!("SELECT DISTINCT is supported over plain views; over windows and aggregates it is not supported yet");
     }
@@ -1032,6 +1214,37 @@ pub fn compile<S: SourceSchema>(conn: &Connection, job: &str, sql: &str, sources
     }
     compile_windowed(conn, &mut stmt, &stream.alias, &aggs, &mut plan)?;
     Ok(plan)
+}
+
+/// Refuses an upsert spec the source cannot take: it must be a Kafka source, and name its columns.
+fn check_upsert<S: SourceSchema>(conn: &Connection, u: &UpsertSpec, name: &str, src: &S) -> Result<()> {
+    if src.is_lake() {
+        bail!("upsert_key reads a Kafka source's messages as upserts; {name} is a lake table or view, whose updates and deletes a view already follows");
+    }
+    if u.key.is_empty() {
+        bail!("upsert_key needs at least one column");
+    }
+    let has = |c: &str| src.columns().iter().any(|(n, _)| n == c);
+    for k in &u.key {
+        if !has(k) {
+            bail!("upsert_key column {k:?} is not a column of source {name}");
+        }
+    }
+    if u.key.iter().collect::<HashSet<_>>().len() != u.key.len() {
+        bail!("upsert_key names a column twice");
+    }
+    match &u.version {
+        Some(v) if !has(v) => bail!("upsert_version {v:?} is not a column of source {name}"),
+        Some(v) if u.key.contains(v) => bail!("upsert_version {v:?} is a key column; it must be a column that grows with each change"),
+        _ => {}
+    }
+    if let Some(r) = &u.tombstone_retention {
+        if u.version.is_none() {
+            bail!("tombstone_retention applies with upsert_version only: without a version, deleted keys keep no tombstone");
+        }
+        conn.query_row("SELECT CAST(? AS INTERVAL)", [r], |_| Ok(())).with_context(|| format!("tombstone_retention {r:?} is not an interval"))?;
+    }
+    Ok(())
 }
 
 /// `SELECT ... UNION ALL SELECT ...`: each branch compiled as a view of its own (staging table
@@ -1094,6 +1307,7 @@ fn compile_union<S: SourceSchema>(conn: &Connection, job: &str, stmt: &Value, so
         retracting,
         change_feeds,
         window_having: None,
+        upsert: None,
     })
 }
 
