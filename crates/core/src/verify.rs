@@ -42,6 +42,8 @@ pub struct Report {
     pub late_rows: i64,
     pub late_duplicates: i64,
     pub closed_windows_left_in_state: i64,
+    /// When the output differs: up to five rows on each side, so a failure shows the values, not just counts.
+    pub differing_rows: Vec<String>,
 }
 
 impl Report {
@@ -65,6 +67,13 @@ impl Report {
 
 fn count(conn: &Connection, sql: &str) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |r| r.get(0))?)
+}
+
+/// Up to five rows of `sql`, each printed as a struct and prefixed with `label`.
+fn sample(conn: &Connection, label: &str, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("SELECT t::VARCHAR FROM ({sql}) t LIMIT 5"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|r| Ok(format!("{label}: {}", r?))).collect()
 }
 
 /// A transaction that rolls back unless `commit` ends it: an error between BEGIN and COMMIT must not leave the
@@ -326,6 +335,14 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     conn.execute_batch(&approx("memory.main.v_expected"))?;
     conn.execute_batch(&approx("memory.main.v_sink"))?;
 
+    const MISSING: &str = "SELECT * FROM memory.main.v_expected EXCEPT ALL SELECT * FROM memory.main.v_sink";
+    const UNEXPECTED: &str = "SELECT * FROM memory.main.v_sink EXCEPT ALL SELECT * FROM memory.main.v_expected";
+    let (missing_from_sink, unexpected_in_sink) = (count(conn, MISSING)?, count(conn, UNEXPECTED)?);
+    let mut differing_rows = Vec::new();
+    if missing_from_sink > 0 || unexpected_in_sink > 0 {
+        differing_rows.extend(sample(conn, "missing", MISSING)?);
+        differing_rows.extend(sample(conn, "unexpected", UNEXPECTED)?);
+    }
     Ok(Report {
         job: job.into(),
         from_epoch: base.map(|(epoch, _)| epoch),
@@ -335,12 +352,13 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         lake_rows,
         expected_rows: count(conn, "SELECT * FROM memory.main.v_expected")?,
         sink_rows: count(conn, "SELECT * FROM memory.main.v_sink")?,
-        missing_from_sink: count(conn, "SELECT * FROM memory.main.v_expected EXCEPT ALL SELECT * FROM memory.main.v_sink")?,
-        unexpected_in_sink: count(conn, "SELECT * FROM memory.main.v_sink EXCEPT ALL SELECT * FROM memory.main.v_expected")?,
+        missing_from_sink,
+        unexpected_in_sink,
         dead_expected: count(conn, dead_expected)?,
         dead_mismatch,
         late_rows,
         late_duplicates,
         closed_windows_left_in_state: left_in_state,
+        differing_rows,
     })
 }

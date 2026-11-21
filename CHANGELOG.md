@@ -45,6 +45,7 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Changed
 
+- `verify` lists up to five differing rows on each side when a view's output does not match, not only their counts.
 - A Kafka message without a value (a tombstone) is a dead letter with the error `tombstone` instead of
   `invalid json`, in the views that do not read its source as upserts.
 
