@@ -58,13 +58,15 @@ pub fn load_snapshot(conn: &Connection, rt: &Handle, src: &SourceDef, limit: usi
            SELECT {cols}, _partition, _offset, _err AS _error, payload AS _payload, _key FROM ({decode})
            UNION ALL
            SELECT {nulls}, _partition, _offset,
-                  CASE WHEN payload IS NULL THEN 'tombstone' ELSE 'invalid json' END AS _error, payload AS _payload, _key
+                  CASE WHEN payload IS NULL THEN 'tombstone' ELSE 'invalid json' END AS _error, payload AS _payload,
+                  {key} AS _key
            FROM {raw} WHERE NOT ({IS_JSON_OBJECT})
            ORDER BY _partition, _offset;
          DROP TABLE {raw}; DROP TABLE {ok};",
         cols = cols.join(", "),
         nulls = nulls.join(", "),
         decode = decode_sql(src, &ok),
+        key = crate::decode::key_sql(src),
     ))?;
     Ok(msgs.len())
 }

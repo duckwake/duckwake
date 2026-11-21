@@ -559,9 +559,9 @@ fn fake_event(opts: &SourceOptions, late: bool) -> Value {
     let mut obj = serde_json::Map::new();
     for (c, t) in &opts.columns {
         let t = t.to_ascii_uppercase();
-        let v = if c == &opts.event_time || t.starts_with("TIMESTAMP") {
+        let v = if opts.event_time.as_ref() == Some(c) || t.starts_with("TIMESTAMP") {
             let mut ts = chrono::Utc::now() - chrono::Duration::milliseconds(rng.random_range(0..1500));
-            if late && c == &opts.event_time {
+            if late && opts.event_time.as_ref() == Some(c) {
                 ts -= chrono::Duration::minutes(5);
             }
             json!(ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string())

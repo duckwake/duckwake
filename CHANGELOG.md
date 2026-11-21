@@ -7,6 +7,16 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- Debezium sources ([#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` reads a topic of
+  Debezium change events, with or without `schemas.enable`. Its views set `upsert_key` to the table's primary
+  key: inserts, snapshot reads and updates replace a key's row from `after`, deletes remove it (keyed by the
+  message key, or by `before` when there is none), and truncates and other events are dead letters that name
+  them. Debezium's epoch numbers in `TIMESTAMP` and `DATE` columns are read as times. An event with a value
+  Debezium left out (`__debezium_unavailable_value`, a PostgreSQL table without `REPLICA IDENTITY FULL`) stops
+  the view with an error that says so. `duckwake produce --keys N --debezium` writes such a topic. Gate:
+  `FORMAT=debezium scripts/upsert_test.sh`, in order and pipelined.
+- A source's `event_time` is optional when its format is `debezium`; a window over a source without one is
+  refused.
 - Upsert views over Kafka topics ([#41](https://github.com/duckwake/duckwake/issues/41)):
   `duckwake_create_view(..., upsert_key := 'order_id')` (`create-view --upsert-key`) reads a topic of changes as
   one row per key. The key comes from the message key (a JSON object's field, or the whole key), else the

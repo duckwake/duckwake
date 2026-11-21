@@ -78,7 +78,9 @@ A source is config only, `models/sources/clicks.sql`:
 ```
 
 It takes the source options of [`duckwake_create_source`](../docs/cli.md#views-and-sources) (`security_protocol`,
-`sasl_password := 'env:KAFKA_PASSWORD'` and so on; a password is never written into the model).
+`sasl_password := 'env:KAFKA_PASSWORD'` and so on; a password is never written into the model). A topic of
+Debezium change events is `format='debezium'`, with no `event_time` needed; its views set `upsert_key`
+([Debezium sources](../docs/sql.md#debezium-sources)).
 
 A view is a `SELECT`, `models/analytics/clicks_per_min.sql`:
 

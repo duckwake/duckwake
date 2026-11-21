@@ -76,6 +76,8 @@ jobs:
           # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
           - { name: backfill, run: scripts/backfill_test.sh }
           - { name: upsert, run: scripts/upsert_test.sh }
+          # C3: the same over Debezium change events, and an event with a value Debezium left out.
+          - { name: debezium, run: FORMAT=debezium scripts/upsert_test.sh }
           # dbt-duckwake: the example project deployed and changed with dbt (installs dbt-duckdb into a venv).
           - { name: dbt, run: scripts/dbt_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
@@ -97,6 +99,7 @@ jobs:
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
           - { name: backfill pipelined, run: scripts/backfill_test.sh, flags: true }
           - { name: upsert pipelined, run: scripts/upsert_test.sh, flags: true }
+          - { name: debezium pipelined, run: FORMAT=debezium scripts/upsert_test.sh, flags: true }
           - { name: schema pipelined, run: scripts/schema_test.sh, flags: true }
           - { name: limits pipelined, run: scripts/limits_test.sh, flags: true }
     name: suite (${{ matrix.name }})

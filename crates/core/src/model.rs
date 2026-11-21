@@ -14,10 +14,13 @@ pub struct SourceDef {
 pub struct SourceOptions {
     pub brokers: String,
     pub topic: String,
+    /// `json` (each message one row) or `debezium` (Debezium change events, read as upserts by key).
     #[serde(default = "default_format")]
     pub format: String,
-    /// Column carrying event time; must be one of `columns` with type TIMESTAMP.
-    pub event_time: String,
+    /// Column carrying event time; must be one of `columns` with type TIMESTAMP. Required for `json`;
+    /// optional for `debezium`, whose views keep one row per key and have no windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(default = "default_watermark_delay")]
     pub watermark_delay: String,
     /// Partitions with no data for this long stop holding the watermark back.
@@ -51,6 +54,13 @@ pub struct SourceOptions {
     pub ssl_certificate_location: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssl_key_location: Option<String>,
+}
+
+impl SourceOptions {
+    /// Whether the topic carries Debezium change events.
+    pub fn is_debezium(&self) -> bool {
+        self.format == "debezium"
+    }
 }
 
 fn default_format() -> String {
@@ -130,11 +140,18 @@ impl SourceOptions {
             v["columns"] = serde_json::to_value(pairs)?;
         }
         let o: SourceOptions = serde_json::from_value(v).context("parsing source options")?;
-        if o.format != "json" {
-            bail!("only format 'json' is supported for Kafka sources");
+        match (o.format.as_str(), &o.event_time) {
+            ("json", None) => bail!("event_time is required: the column holding each event's time"),
+            ("json" | "debezium", _) => {}
+            (f, _) => bail!("format must be 'json' or 'debezium', not {f:?}"),
         }
-        if !o.columns.iter().any(|(c, t)| c == &o.event_time && t.eq_ignore_ascii_case("TIMESTAMP")) {
-            bail!("event_time column {:?} must be listed in columns with type TIMESTAMP", o.event_time);
+        if let Some(et) = &o.event_time {
+            if !o.columns.iter().any(|(c, t)| c == et && t.eq_ignore_ascii_case("TIMESTAMP")) {
+                bail!("event_time column {et:?} must be listed in columns with type TIMESTAMP");
+            }
+        }
+        if o.is_debezium() && o.decode == "arrow" {
+            bail!("decode 'arrow' reads flat JSON objects; a Debezium source decodes its envelope in SQL (decode 'auto' or 'sql')");
         }
         for (c, t) in &o.columns {
             check_column(c, t)?;
@@ -292,8 +309,8 @@ impl LakeInput {
 }
 
 impl crate::circuit::SourceSchema for LakeInput {
-    fn event_time(&self) -> &str {
-        COMMIT_TS
+    fn event_time(&self) -> Option<&str> {
+        Some(COMMIT_TS)
     }
     fn columns(&self) -> &[(String, String)] {
         &self.columns
@@ -317,7 +334,7 @@ pub enum Input<'a> {
 }
 
 impl crate::circuit::SourceSchema for Input<'_> {
-    fn event_time(&self) -> &str {
+    fn event_time(&self) -> Option<&str> {
         match self {
             Input::Kafka(s) => s.event_time(),
             Input::Lake(l) => l.event_time(),
@@ -337,6 +354,9 @@ impl crate::circuit::SourceSchema for Input<'_> {
     }
     fn is_lake(&self) -> bool {
         matches!(self, Input::Lake(_))
+    }
+    fn changelog(&self) -> bool {
+        matches!(self, Input::Kafka(s) if s.changelog())
     }
     fn time_columns(&self) -> Vec<String> {
         match self {
@@ -407,17 +427,40 @@ impl JobDef {
 }
 
 impl crate::circuit::SourceSchema for SourceDef {
-    fn event_time(&self) -> &str {
-        &self.options.event_time
+    fn event_time(&self) -> Option<&str> {
+        self.options.event_time.as_deref()
     }
     fn columns(&self) -> &[(String, String)] {
         &self.options.columns
+    }
+    fn changelog(&self) -> bool {
+        self.options.is_debezium()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_formats_and_event_time() {
+        let opts = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"brokers": "x", "topic": "t", "columns": {"ts": "TIMESTAMP", "id": "BIGINT"}});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            SourceOptions::from_json(&v).map_err(|e| format!("{e:#}"))
+        };
+        assert!(opts(serde_json::json!({"event_time": "ts"})).is_ok());
+        assert!(opts(serde_json::json!({})).unwrap_err().contains("event_time is required"));
+        let d = opts(serde_json::json!({"format": "debezium"})).unwrap();
+        assert!(d.is_debezium() && d.event_time.is_none());
+        assert!(opts(serde_json::json!({"format": "debezium", "event_time": "id"})).unwrap_err().contains("type TIMESTAMP"));
+        assert!(opts(serde_json::json!({"format": "debezium", "decode": "arrow"})).unwrap_err().contains("decodes its envelope in SQL"));
+        assert!(opts(serde_json::json!({"format": "avro", "event_time": "ts"})).unwrap_err().contains("'json' or 'debezium'"));
+        // A source stored before event_time became optional reads back the same.
+        let old: SourceOptions = serde_json::from_value(serde_json::json!({"brokers": "x", "topic": "t", "event_time": "ts",
+            "columns": [["ts", "TIMESTAMP"]]})).unwrap();
+        assert_eq!(old.event_time.as_deref(), Some("ts"));
+    }
 
     #[test]
     fn durations() {

@@ -20,8 +20,8 @@ pub(crate) struct TestSource {
 }
 
 impl SourceSchema for TestSource {
-    fn event_time(&self) -> &str {
-        "ts"
+    fn event_time(&self) -> Option<&str> {
+        Some("ts")
     }
     fn columns(&self) -> &[(String, String)] {
         &self.columns
