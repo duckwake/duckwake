@@ -69,6 +69,63 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |r| r.get(0))?)
 }
 
+/// How far apart, relative to the larger, two DOUBLE or FLOAT values may be and still match: 10 significant
+/// digits. Floating-point sums merged across epochs add in another order than one batch query does, and the
+/// statistics computed from running sums (`corr`, `regr_slope`, the variances) lose digits to cancellation
+/// that DuckDB's online algorithms do not: over `scripts/backfill_test.sh`'s data they agree to 12-14 digits.
+pub const FLOAT_TOLERANCE: f64 = 1e-9;
+
+/// Compares the rows of `expected` and `sink` as multisets over `columns`: every column exactly, except DOUBLE
+/// and FLOAT ones, which match within `FLOAT_TOLERANCE`. Returns how many expected rows the sink lacks, how
+/// many sink rows were not expected, and up to five of each.
+///
+/// Rounding both sides to 10 digits instead, as this did before, fails whenever two values a hair apart fall on
+/// either side of a rounding step, which `bf_spread` in `backfill_test.sh` hit about one run in six. Rows that
+/// differ exactly are set aside first; of those, rows equal in their exact columns are paired in the order of
+/// their floats, and a pair whose floats are all within the tolerance matches.
+fn compare(conn: &Connection, expected: &str, sink: &str, columns: &[(String, String)]) -> Result<(i64, i64, Vec<String>)> {
+    let is_float = |t: &str| t == "DOUBLE" || t == "FLOAT";
+    let cols: Vec<String> = columns.iter().map(|(c, _)| ident(c)).collect();
+    let exact: Vec<String> = columns.iter().filter(|(_, t)| !is_float(t)).map(|(c, _)| ident(c)).collect();
+    let floats: Vec<String> = columns.iter().filter(|(_, t)| is_float(t)).map(|(c, _)| ident(c)).collect();
+    let list = cols.join(", ");
+    let (m, u) = ("memory.main.v_missing", "memory.main.v_unexpected");
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE {m} AS SELECT {list} FROM {expected} EXCEPT ALL SELECT {list} FROM {sink};
+         CREATE OR REPLACE TABLE {u} AS SELECT {list} FROM {sink} EXCEPT ALL SELECT {list} FROM {expected};"
+    ))?;
+    if !floats.is_empty() && count(conn, &format!("SELECT * FROM {m}"))? > 0 && count(conn, &format!("SELECT * FROM {u}"))? > 0 {
+        let by = if exact.is_empty() { String::new() } else { format!("PARTITION BY {}", exact.join(", ")) };
+        let order = floats.join(", ");
+        let close = |c: &String| {
+            format!("(a.{c} IS NOT DISTINCT FROM b.{c} OR abs(a.{c} - b.{c}) <= {FLOAT_TOLERANCE:e} * greatest(abs(a.{c}), abs(b.{c})))")
+        };
+        let on: Vec<String> = exact
+            .iter()
+            .map(|c| format!("a.{c} IS NOT DISTINCT FROM b.{c}"))
+            .chain(["a.__rn = b.__rn".to_string()])
+            .chain(floats.iter().map(close))
+            .collect();
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {m} AS SELECT *, row_number() OVER ({by} ORDER BY {order}) AS __rn FROM {m};
+             CREATE OR REPLACE TABLE {u} AS SELECT *, row_number() OVER ({by} ORDER BY {order}) AS __rn FROM {u};
+             CREATE OR REPLACE TABLE memory.main.v_close AS
+               SELECT a.rowid AS a_id, b.rowid AS b_id FROM {m} a JOIN {u} b ON {};
+             DELETE FROM {m} WHERE rowid IN (SELECT a_id FROM memory.main.v_close);
+             DELETE FROM {u} WHERE rowid IN (SELECT b_id FROM memory.main.v_close);",
+            on.join(" AND ")
+        ))?;
+    }
+    let (missing, unexpected) = (format!("SELECT {list} FROM {m}"), format!("SELECT {list} FROM {u}"));
+    let (n_missing, n_unexpected) = (count(conn, &missing)?, count(conn, &unexpected)?);
+    let mut rows = Vec::new();
+    if n_missing > 0 || n_unexpected > 0 {
+        rows.extend(sample(conn, "missing", &missing)?);
+        rows.extend(sample(conn, "unexpected", &unexpected)?);
+    }
+    Ok((n_missing, n_unexpected, rows))
+}
+
 /// Up to five rows of `sql`, each printed as a struct and prefixed with `label`.
 fn sample(conn: &Connection, label: &str, sql: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("SELECT t::VARCHAR FROM ({sql}) t LIMIT 5"))?;
@@ -315,34 +372,8 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         }
     }
     conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.v_expected AS {}", plan.batch_sql))?;
-    // Floating-point sums merged across epochs add in a different order than one batch query, so
-    // DOUBLE and FLOAT columns are compared to 10 significant digits; everything else exactly.
-    let approx = |table: &str| -> String {
-        let cols: Vec<String> = plan
-            .sink_columns
-            .iter()
-            .map(|(c, t)| {
-                let c = ident(c);
-                if t == "DOUBLE" || t == "FLOAT" {
-                    format!("CASE WHEN {c} IS NULL OR {c} = 0 OR isinf({c}) OR isnan({c}) THEN {c} ELSE round({c}, 9 - ceil(log10(abs({c})))::INTEGER) END AS {c}")
-                } else {
-                    c
-                }
-            })
-            .collect();
-        format!("CREATE OR REPLACE TABLE {table} AS SELECT {} FROM {table}", cols.join(", "))
-    };
-    conn.execute_batch(&approx("memory.main.v_expected"))?;
-    conn.execute_batch(&approx("memory.main.v_sink"))?;
-
-    const MISSING: &str = "SELECT * FROM memory.main.v_expected EXCEPT ALL SELECT * FROM memory.main.v_sink";
-    const UNEXPECTED: &str = "SELECT * FROM memory.main.v_sink EXCEPT ALL SELECT * FROM memory.main.v_expected";
-    let (missing_from_sink, unexpected_in_sink) = (count(conn, MISSING)?, count(conn, UNEXPECTED)?);
-    let mut differing_rows = Vec::new();
-    if missing_from_sink > 0 || unexpected_in_sink > 0 {
-        differing_rows.extend(sample(conn, "missing", MISSING)?);
-        differing_rows.extend(sample(conn, "unexpected", UNEXPECTED)?);
-    }
+    let (missing_from_sink, unexpected_in_sink, differing_rows) =
+        compare(conn, "memory.main.v_expected", "memory.main.v_sink", &plan.sink_columns)?;
     Ok(Report {
         job: job.into(),
         from_epoch: base.map(|(epoch, _)| epoch),
@@ -361,4 +392,50 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         closed_windows_left_in_state: left_in_state,
         differing_rows,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(expected: &str, sink: &str) -> (i64, i64, Vec<String>) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE e (g VARCHAR, n BIGINT, r DOUBLE); INSERT INTO e VALUES {expected};
+             CREATE TABLE s (g VARCHAR, n BIGINT, r DOUBLE); INSERT INTO s VALUES {sink};"
+        ))
+        .unwrap();
+        let cols = [("g", "VARCHAR"), ("n", "BIGINT"), ("r", "DOUBLE")].map(|(c, t)| (c.to_string(), t.to_string()));
+        compare(&conn, "e", "s", &cols).unwrap()
+    }
+
+    #[test]
+    fn floats_a_hair_apart_match_even_across_a_rounding_step() {
+        // 0.123456789500001 and 0.123456789499999: 2e-15 apart, but the old rounding gave 0.12345679 and 0.123456789.
+        let (m, u, rows) = run("('a', 1, 0.123456789500001), ('b', 2, -0.0016807972449711778)",
+                               "('a', 1, 0.123456789499999), ('b', 2, -0.0016807972449720)");
+        assert_eq!((m, u), (0, 0), "{rows:?}");
+    }
+
+    #[test]
+    fn floats_further_apart_than_the_tolerance_differ() {
+        let (m, u, rows) = run("('a', 1, 0.5), ('b', 2, 3.0)", "('a', 1, 0.5000001), ('b', 2, 3.0)");
+        assert_eq!((m, u), (1, 1));
+        assert_eq!(rows, ["missing: {'g': a, 'n': 1, 'r': 0.5}", "unexpected: {'g': a, 'n': 1, 'r': 0.5000001}"]);
+    }
+
+    #[test]
+    fn other_columns_compare_exactly_and_rows_as_multisets() {
+        // n differs by one; a duplicated row in the sink is one row too many; NULL and NaN match themselves.
+        let (m, u, _) = run("('a', 1, 0.5), ('b', 2, NULL), ('c', 3, 'NaN'), ('d', 4, 1.0)",
+                            "('a', 2, 0.5), ('b', 2, NULL), ('c', 3, 'NaN'), ('d', 4, 1.0), ('d', 4, 1.0)");
+        assert_eq!((m, u), (1, 2));
+    }
+
+    #[test]
+    fn rows_with_the_same_exact_columns_pair_by_their_floats() {
+        let (m, u, rows) = run("('a', 1, 1.0), ('a', 1, 2.0), ('a', 1, 3.0)",
+                               "('a', 1, 3.0000000000001), ('a', 1, 1.0000000000001), ('a', 1, 2.0)");
+        assert_eq!((m, u), (0, 0), "{rows:?}");
+    }
 }
