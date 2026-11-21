@@ -145,6 +145,23 @@ for v in "${VIEWS[@]}"; do
   [[ $(sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$v'") == running ]] || { echo "$v is not running"; failed=1; }
 done
 
+log "change rows written after the views started, once their windows have closed"
+# The views have caught up, so every window these rows' versions fall in is closed: each change is a late
+# correction (an epoch that reads a version and its change together applies both to the window still open).
+before=$(sql "SELECT count(*) FROM lake.analytics.acc_windows_late WHERE id > 400")
+sleep 3
+sql "UPDATE lake.shop.accounts SET amount = amount + 1 WHERE id > 400 AND id % 7 = 0;
+     DELETE FROM lake.shop.accounts WHERE id > 400 AND id % 11 = 0" >/dev/null
+for v in "${LEVEL1[@]}"; do wait_for "$v" shop accounts || failed=1; done
+wait_for acc_amount_totals analytics acc_amounts || failed=1
+wait_for acc_busy_games analytics acc_by_game || failed=1
+wait_for acc_mixed shop accounts && wait_for acc_mixed analytics acc_by_game || failed=1
+wait_for acc_game_windows analytics acc_by_game || failed=1
+after=$(sql "SELECT count(*) FROM lake.analytics.acc_windows_late WHERE id > 400")
+echo "acc_windows: $((after - before)) late corrections of rows written after it started"
+(( after > before )) || { echo "no late correction for the changed rows"; failed=1; }
+verify_views || failed=1
+
 log "reset a view another view reads: the reader follows it through the change feed"
 "$BIN" stop acc_by_game >/dev/null
 # Stopping does not fence: wait for the worker to let the view go before rewinding it.
