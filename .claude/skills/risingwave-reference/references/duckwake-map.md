@@ -90,8 +90,10 @@ Legend:
 ## Next borrowings, in roadmap order
 
 1. **#42 Debezium (C3).** Debezium's envelope over the upsert operator from C2 (key from the message key,
-   `before`/`after`/`op`). The snapshot (`op = r`) is read at the lowest version. A delete of an unknown key is
-   ignored, as RisingWave and the other engines in `cdc-sources.md` do.
+   `before`/`after`/`op`). RisingWave's Debezium parser treats `r` like `c` (upsert) and `d` as a delete by key.
+   Reading the snapshot (`op = r`) at the lowest version is DuckWake's own plan (`cdc-sources.md`, after DBLog-
+   style backfill), not RisingWave's. A delete of an unknown key is ignored, as the engines compared in
+   `cdc-sources.md` do (that table dates from 2026-11-05).
 2. **#38 windows over updates and deletes.** Keep EOWC. Retractions into closed windows go to `late_data`
    (C4). Windowed `min`/`max` get materialized-input state, as in RisingWave's `HashAgg`.
 3. **#31/#32 joins.** A symmetric hash join with DuckLake state per side, plus interval and window joins whose

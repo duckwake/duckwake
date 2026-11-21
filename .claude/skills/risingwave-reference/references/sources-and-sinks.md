@@ -204,7 +204,7 @@ continuous `INSERT INTO`, left for later".
 | DuckWake item | From RisingWave |
 | --- | --- |
 | #49 Avro/Protobuf, keys and headers | option names, several registry URLs, TopicNameStrategy, `INCLUDE`-style opt-in metadata columns |
-| #42 Debezium topics (C3) | Debezium envelope handling, snapshot reads at the lowest version, `ignore_key`, deletes of unknown keys ignored |
+| #42 Debezium topics (C3) | Debezium envelope handling (`r`/`c`/`u` as upserts, `d` as a delete by key, the `schema`/`payload` wrapper), `timestamptz.handling.mode`; not `ignore_key`, which breaks per-partition order. Reading `r` at the lowest version is DuckWake's own idea, not RisingWave's |
 | #44–#46 database CDC | managed slot and publication, chunked snapshot by key range, TOAST from own state, type table, lost-WAL error |
 | upsert follow-ups | composite version columns, `DO UPDATE IF NOT NULL` partial updates, only on request |
 | several views into one table | `SINK INTO TABLE` with `ON CONFLICT`, if users ask for wide tables |

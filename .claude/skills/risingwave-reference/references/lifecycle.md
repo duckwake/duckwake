@@ -50,6 +50,11 @@ Retention: maintenance keeps every snapshot any view still needs.
 
 Kafka views start at `earliest` or `latest` of the topic; there is no separate backfill.
 
+One user-visible difference: RisingWave's `CREATE MATERIALIZED VIEW` blocks, or with background DDL keeps the MV
+in a "creating" state, until its backfill ends, so nobody queries a half-built MV. A DuckWake view's table can be
+queried at once and fills epoch by epoch; `duckwake_wait` (dbt: `duckwake_wait_built`) waits for it. Hiding a new
+view until it has caught up would reuse zero-downtime replace's build-beside-and-swap (#51).
+
 ## Background DDL, rate limits, parallelism during backfill
 
 - **`SET BACKGROUND_DDL = true`:** `CREATE MATERIALIZED VIEW` returns at once. Progress is in
