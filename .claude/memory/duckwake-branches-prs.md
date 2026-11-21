@@ -35,6 +35,14 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
    community extension (duckdb/community-extensions#3654, from the fork `duckwake/community-extensions`,
    branch `duckwake`, maintainer harrydevforlife) at commit `16ec8d6`; each release moves its `ref` there.
    The fork's macOS jobs never got a runner (cancelled after 15 min queued); DuckDB's own CI runs them.
+9. 2026-11-21: PR #60 (C2, #41: upsert views, `upsert_key`/`upsert_version`), PR #61 (two intermittent CI
+   failures, both engine/test bugs already on main: a windowed view over another view's windows waited up to
+   `position_refresh` once the upstream went idle, now it records its watermark at least once a slide; and
+   `verify` rounded floats, now compares them within 1e-9) and PR #62 (C3, #42 closed: Debezium sources, gates
+   `FORMAT=debezium scripts/upsert_test.sh` and `scripts/debezium_e2e_test.sh` with PostgreSQL and Debezium 3.6.3
+   in compose profile `debezium`; CI reserves the stack's host ports). Branch `skill-risingwave-reference`
+   (the RisingWave reference skill, `.claude/skills/`) is pushed without a PR, at the user's request; it is not
+   on main yet. Next on the roadmap: C4 (#38), windows over updates and deletes.
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository
