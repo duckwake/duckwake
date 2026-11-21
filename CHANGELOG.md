@@ -73,6 +73,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   at most once a slide while idle. Found by `chain_test.sh` on `main`; `chain_test.sh` now checks it every run.
 - The dead-letter query in the `DuckWakeDeadLetters` alert's docs named a column `_err`; it is `error`.
 
+- CI could fail to start the stack with "failed to bind host port for 0.0.0.0:55432 ... address already in use":
+  the published ports (55432, 19092-19095, 19900) are inside Linux's ephemeral port range, and an outgoing
+  connection on the runner could hold one when Docker bound it. CI now reserves them before starting the stack.
 - The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
   RPC port, 33145, when an outgoing connection in its container had taken that port; the container's ephemeral
   ports now start at 40000.

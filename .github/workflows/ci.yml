@@ -121,6 +121,10 @@ jobs:
           curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/duckdb/duckdb" --version
+      # The stack publishes host ports inside Linux's ephemeral range (32768-60999). Reserve them, or an outgoing
+      # connection on the runner (pulling the images) can hold one when Docker binds it: "failed to bind host port
+      # for 0.0.0.0:55432 ... address already in use" (CI, 2026-11-21).
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=19092-19095,19900,55432
       - run: docker compose up -d --wait
       - run: ${{ matrix.run }}
       - if: failure()
