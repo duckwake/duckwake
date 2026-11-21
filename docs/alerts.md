@@ -112,7 +112,9 @@ and the worker log says why (`view stopped: marking it failed`, `cannot start jo
 
 - *over its max_late_rows* or *over its max_state_rows*: see [Limits](cli.md#limits). Fix the cause or raise the
   limit with `duckwake alter-view`, then `duckwake start` it: it continues from its last checkpoint.
-- *an insert-only input changed*: a lake table a windowed view reads had rows updated or deleted.
+- *an insert-only input changed*: a lake table a windowed view created before C4 (0.3) reads had rows updated or
+  deleted. Replace the view (`create-view --if-exists replace`, with `--late-data`) to have it take updates and
+  deletes as late corrections.
 - *cannot start*: the view's definition no longer compiles against its inputs (a dropped table, a source gone).
 
 ## DuckWakeViewStuck

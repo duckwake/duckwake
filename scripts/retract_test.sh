@@ -5,16 +5,20 @@
 # existed, which the views backfill) while the worker is killed over and over: kill -9 from outside, and aborts injected at every step
 # of the epoch. After every crash each view verifies against its batch query over its input as of the
 # snapshot in its checkpoint (time travel), and again once the views have caught up. Then: a reset of a view
-# reaches the views that read it through the change feed, and a window over a view whose rows change is
-# refused. WORKER_FLAGS="--pipeline ..." runs it pipelined.
+# reaches the views that read it through the change feed. WORKER_FLAGS="--pipeline ..." runs it pipelined.
+#
+# C4: two windowed views read retracting inputs. acc_windows windows the table on _commit_ts: a change to a row
+# whose window is still open revises it, and one to a row in a window already closed is a late correction in
+# its late-data table (weight -1), which verify adds back since the closed window still counts it.
+# acc_game_windows windows acc_by_game, a view whose rows are replaced as they change.
 source "$(dirname "$0")/lib.sh"
 KILLS=${KILLS:-8}; EPOCH=${EPOCH:-1s}
 read -r -a POINTS <<< "${POINTS:-external poll commit_begin commit_mid before_commit after_commit maintenance staged_ahead}"
 # Over the table: counted rows, a grouped aggregate (MIN/MAX keep a count per value), DISTINCT, and counted rows
 # that repeat. Over those views: an aggregate over the repeating counted rows, rows of the grouped aggregate,
 # and a UNION ALL of the table and the grouped aggregate (two change feeds read to one snapshot).
-LEVEL1=(acc_rich acc_by_game acc_bands acc_amounts)
-VIEWS=("${LEVEL1[@]}" acc_amount_totals acc_busy_games acc_mixed)
+LEVEL1=(acc_rich acc_by_game acc_bands acc_amounts acc_windows)
+VIEWS=("${LEVEL1[@]}" acc_amount_totals acc_busy_games acc_mixed acc_game_windows)
 
 sql() { "$BIN" sql "$1" --csv 2>/dev/null | tail -1; }
 snapshot() { sql "SELECT id FROM ducklake_current_snapshot('lake')"; }
@@ -75,7 +79,8 @@ change_round() {
     COMMIT;" >/dev/null 2>>"$OUT/generator.log"
 }
 
-log "reset lake"; reset_env
+# Lake tables only: no topic to reset, so it also runs without Docker (PG_LOCAL=1).
+log "reset lake"; rm -rf "$OUT"; mkdir -p "$OUT"; reset_lake
 log "create the table, its first rows, and the views"
 sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.accounts (id INTEGER, game_id VARCHAR, amount DECIMAL(18,2));
      INSERT INTO lake.shop.accounts SELECT i, $GAMES, $AMOUNT FROM range(1, 401) t(i)" >/dev/null
@@ -88,6 +93,13 @@ create acc_amounts "SELECT game_id, floor(amount / 10) * 10 AS bucket FROM shop.
 create acc_amount_totals "SELECT game_id, count(*) AS n, sum(bucket) AS total, max(bucket) AS hi FROM analytics.acc_amounts GROUP BY game_id"
 create acc_busy_games "SELECT game_id, n, lo, hi FROM analytics.acc_by_game WHERE n >= 60"
 create acc_mixed "SELECT game_id, amount FROM shop.accounts WHERE amount >= 95 UNION ALL SELECT game_id, lo FROM analytics.acc_by_game"
+"$BIN" create-view analytics.acc_windows --epoch-interval "$EPOCH" --late-data lake.analytics.acc_windows_late --sql "
+  SELECT window_start, game_id, count(*) AS n, sum(amount) AS total, min(amount) AS lo, max(amount) AS hi,
+         count(DISTINCT floor(amount / 10)) AS bands, median(amount) AS med
+  FROM TUMBLE(shop.accounts, _commit_ts, INTERVAL 2 SECOND) GROUP BY ALL" | sed -n 1p
+"$BIN" create-view analytics.acc_game_windows --epoch-interval "$EPOCH" --late-data lake.analytics.acc_game_windows_late --sql "
+  SELECT window_start, count(*) AS changes, sum(n) AS n, max(hi) AS hi
+  FROM TUMBLE(analytics.acc_by_game, _commit_ts, INTERVAL 3 SECOND) GROUP BY ALL" | sed -n 1p
 for v in "${VIEWS[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 
 log "rewrite the table while the worker is killed $KILLS times"
@@ -121,6 +133,12 @@ for v in "${LEVEL1[@]}"; do wait_for "$v" shop accounts || failed=1; done
 wait_for acc_amount_totals analytics acc_amounts || failed=1
 wait_for acc_busy_games analytics acc_by_game || failed=1
 wait_for acc_mixed shop accounts && wait_for acc_mixed analytics acc_by_game || failed=1
+wait_for acc_game_windows analytics acc_by_game || failed=1
+late=$(sql "SELECT count(*) FILTER (WHERE _duckwake_weight < 0) || ' late corrections, ' || count(*) FILTER (WHERE _duckwake_weight > 0) || ' late additions'
+            FROM lake.analytics.acc_windows_late")
+echo "acc_windows: $(sql "SELECT count(*) FROM lake.analytics.acc_windows") windows; $late"
+[[ $(sql "SELECT count(*) FROM lake.analytics.acc_windows_late WHERE _duckwake_weight < 0") -gt 0 ]] ||
+  { echo "no late correction: the suite did not change rows in closed windows"; failed=1; }
 echo "injected aborts: $(grep -c 'crash injected' "$OUT/worker.log" || true), epochs committed: $(grep -c 'epoch committed' "$OUT/worker.log" || true)"
 verify_views || failed=1
 for v in "${VIEWS[@]}"; do
@@ -137,16 +155,11 @@ to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 
 wait_for acc_by_game shop accounts || failed=1
 wait_for acc_busy_games analytics acc_by_game || failed=1
 wait_for acc_mixed analytics acc_by_game || failed=1
-for v in acc_by_game acc_busy_games acc_mixed; do
+wait_for acc_game_windows analytics acc_by_game || failed=1
+for v in acc_by_game acc_busy_games acc_mixed acc_game_windows; do
   if "$BIN" verify "$v" >"$OUT/verify_$v.txt" 2>&1; then tail -1 "$OUT/verify_$v.txt"; else failed=1; cat "$OUT/verify_$v.txt"; fi
 done
 
-log "a window over a view whose rows change is refused"
-if out=$("$BIN" create-view analytics.acc_windows --sql "SELECT window_start, count(*) AS n
-      FROM TUMBLE(analytics.acc_by_game, _commit_ts, INTERVAL 10 SECOND) GROUP BY ALL" 2>&1); then
-  echo "the windowed view over acc_by_game was created"; failed=1
-elif [[ $out == *"windows over it are not supported yet"* ]]; then echo "$out" | grep -o "acc_by_game is the table.*passes it)"
-else echo "refused for another reason: $out"; failed=1; fi
 kill -TERM "$pid"; wait "$pid" || true
 
 [[ $failed == 0 ]] && echo "RETRACT TEST PASSED" || { echo "RETRACT TEST FAILED"; exit 1; }

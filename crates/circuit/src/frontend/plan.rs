@@ -41,6 +41,41 @@ pub enum MergeOp {
     Concat,
     /// A list of distinct values (`count(DISTINCT)`, `approx_count_distinct`): their union.
     Union,
+    /// Each value's count, a `MAP(value, BIGINT)`: counts added, values whose count returns to 0 dropped. A
+    /// window's `min`, `max`, distinct counts and quantiles over a source that can retract.
+    Counts,
+}
+
+/// The `MAP(value, BIGINT)` of a list of `{key: value, value: count}` entries, the counts of each value summed
+/// and the values whose count is 0 left out.
+fn sum_counts(entries: &str) -> String {
+    format!(
+        "map_from_entries(list_filter(list_transform(list_distinct(list_transform({entries}, lambda e: e.key)), \
+         lambda k: struct_pack(key := k, value := CAST(list_sum(list_transform(list_filter({entries}, lambda e: e.key = k), \
+         lambda e: e.value)) AS BIGINT))), lambda e: e.value <> 0))"
+    )
+}
+
+/// The value counts of an epoch's rows, weighted: argument `x`, NULLs left out.
+fn counts_partial(x: &str) -> String {
+    sum_counts(&format!("list(struct_pack(key := {x}, value := CAST(__w AS BIGINT))) FILTER (WHERE {x} IS NOT NULL)"))
+}
+
+/// An aggregate over a window's value counts `m` (only positive counts are kept).
+fn counts_finalize(kind: AggKind, m: &str, param: Option<&str>) -> String {
+    let values = format!("map_keys({m})");
+    match kind {
+        AggKind::Min => format!("list_min({values})"),
+        AggKind::Max => format!("list_max({values})"),
+        AggKind::CountDistinct => format!("coalesce(len({values}), 0)"),
+        AggKind::ApproxCountDistinct => format!("coalesce(list_aggregate({values}, 'approx_count_distinct'), 0)"),
+        // The quantiles over every value as often as it is counted.
+        k => format!(
+            "list_aggregate(flatten(list_transform(map_entries({m}), lambda e: list_transform(range(e.value), lambda i: e.key))), '{}', {})",
+            k.list_aggregate(),
+            param.expect("a quantile's fraction")
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,6 +683,9 @@ impl Plan {
                     MergeOp::Max => format!("greatest(s.{c}, p.{c})"),
                     MergeOp::Concat => format!("list_concat(s.{c}, p.{c})"),
                     MergeOp::Union => format!("list_distinct(list_concat(s.{c}, p.{c}))"),
+                    MergeOp::Counts => {
+                        sum_counts(&format!("list_concat(coalesce(map_entries(s.{c}), []), coalesce(map_entries(p.{c}), []))"))
+                    }
                 };
                 format!("{c} = {e}")
             })
@@ -1561,10 +1599,11 @@ fn windowed_agg(
     };
     let kind = if fname == "count" && distinct { AggKind::CountDistinct } else { AggKind::of(fname) };
     // Values kept as a list per window: each distinct value once, or every value for the quantiles. A window's
-    // list is bounded by its rows; over a source that can retract it would need a count per value.
-    if kind.always_counts_values() {
+    // list is bounded by its rows. Over a source that can retract, each value's count instead, as for min and max.
+    if kind.always_counts_values() || (weighted && matches!(kind, AggKind::Min | AggKind::Max)) {
         if weighted {
-            bail!("{raw}() in a window over a source that can retract needs a count per value: not supported yet");
+            partial(p, counts_partial(&x), MergeOp::Counts);
+            return Ok(counts_finalize(kind, &ident(p), param.as_deref()));
         }
         let (list, op) = match kind {
             AggKind::CountDistinct | AggKind::ApproxCountDistinct => (format!("list(DISTINCT {x}) FILTER (WHERE {x} IS NOT NULL)"), MergeOp::Union),
@@ -1607,9 +1646,6 @@ fn windowed_agg(
             partial(&s, format!("sum({})", signed(&x)), MergeOp::AddNullable);
             partial(&c, weighted_count(&x), MergeOp::Add);
             format!("CASE WHEN {} = 0 THEN NULL ELSE {} END", ident(&c), ident(&s))
-        }
-        ("min" | "max", true) => {
-            bail!("{raw}() in a window over a source that can retract needs a count per value: not supported yet")
         }
         ("min", false) => {
             partial(p, format!("min({x})"), MergeOp::Min);

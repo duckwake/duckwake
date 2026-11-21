@@ -67,7 +67,7 @@ CALL duckwake_create_view('analytics.clicks_per_min',
 | --- | --- | --- |
 | `epoch_interval` | `'10s'` | How often an epoch runs. |
 | `max_rows` | `100000` | Most events (or lake rows) one epoch reads. |
-| `late_data` | none | A table for events that arrive after their window closed (windowed views). Without it they are counted in the checkpoint (`rows_late`) and dropped. |
+| `late_data` | none | A table for events that arrive after their window closed (windowed views), and for late corrections over lake inputs that update or delete (with a `_duckwake_weight` column). Without it they are counted in the checkpoint (`rows_late`) and dropped. |
 | `max_state_rows` | none | Most rows the view's state may hold; past it the view fails alone ([limits](cli.md#limits)). |
 | `max_late_rows` | none | Most late rows one epoch may write; past it the view fails alone. |
 | `start` | `'earliest'` | Over lake tables and other views: `earliest` starts from the rows they already hold, `latest` from rows written after the view is created ([backfill](#backfill)). |
@@ -184,9 +184,14 @@ SELECT game_id, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game_id
 - **Updates and deletes.** A view removes the rows it no longer holds: a filter's table counts each row in
   `_duckwake_count`, and `DISTINCT` and `GROUP BY` views keep their rows up to date.
 - **Windows.** Windows over a lake input use `_commit_ts`, or a windowed view's `window_start` or `window_end`,
-  and get an exact watermark. A window is final once it closes, so a windowed view needs its lake tables
-  insert-only (an update or delete stops it) and cannot read a view whose rows change. To keep time buckets
-  current instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`.
+  and get an exact watermark. They take updates and deletes, of a table or of a view whose rows change: a
+  change to a row whose window is still open revises that window (`min`, `max`, distinct counts and quantiles
+  keep each value's count, so a deleted extreme gives way to the next value). A window is final once it closes,
+  so a change to a row of a closed window, such as the delete of an old row, is a **late correction**: it goes to
+  the `late_data` table with `_duckwake_weight` -1 (or +1 for a row added), or is counted in `rows_late` and
+  dropped, and the window's row keeps counting the old version. `verify` adds the corrections back; without a
+  late-data table it checks the view as long as no correction was dropped. To keep time buckets current
+  instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`.
 
 ### Backfill
 

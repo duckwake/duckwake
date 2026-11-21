@@ -161,6 +161,22 @@ impl Drop for Txn<'_> {
     }
 }
 
+/// The columns of a view's first input as its staged rows carry them (a window's columns left out of a windowed
+/// view's), quoted: the columns its late-data table holds.
+fn plan_stream_columns(plan: &crate::plan::Plan, def: &crate::model::JobDef, sources: &std::collections::HashMap<String, SourceDef>) -> Result<Vec<String>> {
+    let name = plan.sources().into_iter().next().context("a view without an input")?;
+    let columns = match (sources.get(&name), def.lake_inputs.iter().find(|l| l.name == name)) {
+        (Some(s), _) => s.options.columns.clone(),
+        (None, Some(l)) => l.columns.clone(),
+        (None, None) => bail!("input {name} is gone"),
+    };
+    Ok(columns
+        .iter()
+        .filter(|(c, _)| !(plan.is_windowed() && crate::circuit::codegen::is_window_column(c)))
+        .map(|(c, _)| ident(c))
+        .collect())
+}
+
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::view_sources(&def, catalog::load_sources(conn)?);
@@ -173,9 +189,23 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         .zip(&lakes)
         .map(|(n, l)| if l.is_some() { Ok(None) } else { sources.get(n).map(Some).with_context(|| format!("source {n} is gone")) })
         .collect::<Result<_>>()?;
-    // A windowed view over a lake input has an exact watermark, so it has no late rows to reconstruct.
-    if plan.is_windowed() && def.late_data.is_none() && lakes[0].is_none() {
-        bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
+    // A windowed view over a lake input has an exact watermark, so it has no late rows to reconstruct, unless
+    // its input updates or deletes: a retraction for a window already closed is a late correction.
+    if plan.is_windowed() && def.late_data.is_none() {
+        if lakes[0].is_none() {
+            bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
+        }
+        let dropped: i64 = conn.query_row(
+            &format!("SELECT coalesce(sum(rows_late), 0) FROM {CTL}.checkpoints WHERE job_id = ?"),
+            [job],
+            |r| r.get(0),
+        )?;
+        if dropped > 0 {
+            bail!(
+                "{dropped} late corrections (changes to windows already closed) were counted and dropped, and the windows still \
+                 hold what they changed; verify needs a late-data table to reconstruct them (replace the view with --late-data)"
+            );
+        }
     }
 
     let earliest = srcs
@@ -224,10 +254,19 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
          CREATE OR REPLACE TABLE memory.main.v_dead AS SELECT source, source_partition AS _partition, source_offset AS _offset
            FROM {CTL}.dead_letter WHERE job_id = '{job}';"
     ))?;
+    // Late rows: those added to a closed window (+1) are left out of the batch input; over an input that
+    // retracts, those taken out of one (-1, a late correction) are added back, as the closed window still counts
+    // them (`v_late_back`).
+    let late_stream_cols: Vec<String> = plan_stream_columns(&plan, &def, &sources)?;
     if let Some(late) = &def.late_data {
+        let weight = if plan.retracts() { ident(crate::circuit::ops::LATE_WEIGHT) } else { "1".to_string() };
         conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE memory.main.v_late AS SELECT _source_partition AS _partition, _source_offset AS _offset, window_start FROM {}",
-            quote_table(late)?
+            "CREATE OR REPLACE TABLE memory.main.v_late AS
+               SELECT _source_partition AS _partition, _source_offset AS _offset, window_start FROM {t} WHERE {weight} > 0;
+             CREATE OR REPLACE TABLE memory.main.v_late_back AS
+               SELECT {cols}, window_start, window_end FROM {t} WHERE {weight} < 0;",
+            t = quote_table(late)?,
+            cols = if late_stream_cols.is_empty() { "NULL AS __none".to_string() } else { late_stream_cols.join(", ") },
         ))?;
     } else {
         conn.execute_batch("CREATE OR REPLACE TABLE memory.main.v_late (_partition INTEGER, _offset BIGINT, window_start TIMESTAMP)")?;
@@ -339,12 +378,17 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (mut late_rows, mut late_duplicates, mut left_in_state) = (0, 0, 0);
     if plan.is_windowed() {
         let wm = ckpt.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
+        let back = if def.late_data.is_some() && plan.retracts() {
+            format!(" UNION ALL SELECT {stream_cols}, window_start, window_end FROM memory.main.v_late_back WHERE window_end <= {wm} AND {sink_filter}")
+        } else {
+            String::new()
+        };
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE {input} AS
                SELECT {stream_cols}, window_start, window_end FROM ({w}) x
                WHERE window_end <= {wm} AND {sink_filter}
                  AND NOT EXISTS (SELECT 1 FROM memory.main.v_late l
-                                 WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start)",
+                                 WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start){back}",
             input = plan.input_table,
             w = plan.window_sql(valid)
         ))?;
