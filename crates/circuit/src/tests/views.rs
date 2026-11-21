@@ -1,5 +1,6 @@
 //! Each view kind, epoch by epoch, against the batch query (see `harness`).
-use super::harness::check_view;
+use super::harness::{check_upsert, check_view};
+use crate::plan::UpsertSpec;
 
 const EPOCHS: [(i64, i64); 5] = [(0, 7), (7, 40), (40, 41), (41, 200), (200, 260)];
 
@@ -321,4 +322,52 @@ fn global_covariance_over_retractions() {
                FROM changes GROUP BY ALL";
     check_view(sql, &EPOCHS, false);
     check_view(sql, &EPOCHS, true);
+}
+
+/// The upsert tests' epochs: the fourth holds only message 45, a tombstone of an order that has a row, so a key
+/// is deleted in an epoch without any other message of it.
+const UPSERT_EPOCHS: [(i64, i64); 6] = [(0, 7), (7, 40), (40, 45), (45, 46), (46, 200), (200, 260)];
+
+fn upsert(key: &[&str], version: Option<&str>) -> UpsertSpec {
+    UpsertSpec { key: key.iter().map(|k| k.to_string()).collect(), version: version.map(String::from) }
+}
+
+#[test]
+fn upsert_last_message_wins() {
+    // Without a version the later message of a key replaces its row, and a tombstone deletes it; keys come from
+    // a JSON object key, a plain-text key, or the value when the message has none.
+    let all = "SELECT * FROM orders";
+    check_upsert(all, &upsert(&["order_id"], None), &UPSERT_EPOCHS, false);
+    check_upsert(all, &upsert(&["order_id"], None), &UPSERT_EPOCHS, true);
+    // A filter and a projection apply to each key's current row: a row that stops passing leaves the table.
+    let paid = "SELECT order_id, status, amount * 2 AS doubled FROM orders WHERE status <> 'new'";
+    check_upsert(paid, &upsert(&["order_id"], None), &UPSERT_EPOCHS, false);
+    check_upsert(paid, &upsert(&["order_id"], None), &UPSERT_EPOCHS, true);
+}
+
+#[test]
+fn upsert_with_version() {
+    // With a version a message older than the key's row is ignored, of equal versions the later message wins
+    // (the harness's versions repeat), a NULL version is the lowest, and a deleted key comes back with its next
+    // message whatever its version.
+    let sql = "SELECT order_id, status, amount, ver FROM orders";
+    check_upsert(sql, &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, false);
+    check_upsert(sql, &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, true);
+    check_upsert("SELECT order_id, ver, status FROM orders WHERE amount > 3", &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, true);
+}
+
+#[test]
+fn upsert_with_a_composite_key() {
+    // Two key columns: an object key gives both, a plain-text key neither (then the value does).
+    check_upsert("SELECT order_id, status, amount FROM orders", &upsert(&["order_id", "status"], None), &UPSERT_EPOCHS, false);
+    check_upsert("SELECT order_id, status, ver FROM orders", &upsert(&["order_id", "status"], Some("ver")), &UPSERT_EPOCHS, true);
+}
+
+#[test]
+fn upsert_with_a_lookup() {
+    // Each key's current row looks up a lake table; a LEFT JOIN keeps the rows without a match.
+    let sql = "SELECT o.order_id, o.status, g.studio FROM orders o JOIN games g ON g.game_id = 'g' || (o.order_id % 6)";
+    check_upsert(sql, &upsert(&["order_id"], None), &UPSERT_EPOCHS, false);
+    let left = "SELECT o.order_id, o.ver, g.studio FROM orders o LEFT JOIN games g ON g.game_id = 'g' || (o.order_id % 6)";
+    check_upsert(left, &upsert(&["order_id"], Some("ver")), &UPSERT_EPOCHS, true);
 }

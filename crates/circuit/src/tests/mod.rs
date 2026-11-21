@@ -79,6 +79,15 @@ pub(crate) fn setup() -> (Connection, HashMap<String, TestSource>) {
             ("clicks".to_string(), source("amount", true)),
             ("purchases".to_string(), source("price", true)),
             ("changes".to_string(), source("amount", false)),
+            // A Kafka topic of order updates, read as upserts by `upsert_key` views (`harness::check_upsert`).
+            (
+                "orders".to_string(),
+                TestSource {
+                    columns: cols(&[("ts", "TIMESTAMP"), ("order_id", "BIGINT"), ("status", "VARCHAR"), ("amount", "DECIMAL(18,2)"), ("ver", "BIGINT")]),
+                    append_only: true,
+                    lake: None,
+                },
+            ),
             ("shop.orders".to_string(), orders),
             ("shop.accounts".to_string(), accounts),
             ("per_min".to_string(), per_min),

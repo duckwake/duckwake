@@ -18,7 +18,7 @@ use crate::catalog::{self, state_table};
 use crate::model::{LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
 use crate::kafka;
 use crate::lake::{ident, lit, quote_table, CTL};
-use crate::decode::{decode_sql, IS_JSON_OBJECT};
+use crate::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
 use tokio::runtime::Handle;
@@ -98,7 +98,7 @@ impl Drop for Txn<'_> {
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::view_sources(&def, catalog::load_sources(conn)?);
-    let plan = catalog::compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
+    let plan = catalog::compile(conn, job, &def.sql, &sources, &def.lake_inputs, def.upsert.as_ref())?;
     // The view's inputs, the first holding a windowed view's only stream: Kafka sources or lake inputs.
     let names = plan.sources();
     let lakes: Vec<Option<&LakeInput>> = names.iter().map(|n| def.lake_inputs.iter().find(|l| &l.name == n)).collect();
@@ -222,24 +222,29 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         let msgs = rt.block_on(kafka::read_between(&src.options, &from[k], &ends[k]))?;
         kafka_rows += msgs.len();
         let raw = format!("v_raw_{k}");
-        conn.execute_batch(&format!("CREATE OR REPLACE TABLE memory.main.{raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR)"))?;
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE memory.main.{raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR)"
+        ))?;
         {
             let mut app = conn.appender_to_catalog_and_db(&raw, "memory", "main")?;
             for m in &msgs {
-                let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-                app.append_row(duckdb::params![m.partition, m.offset, payload.as_deref()])?;
+                app.append_row(duckdb::params![m.partition, m.offset, m.payload_text().as_deref(), m.key_text()])?;
             }
             app.flush()?;
         }
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE memory.main.v_ok_{k} AS SELECT * FROM memory.main.{raw} WHERE {IS_JSON_OBJECT};
-             CREATE OR REPLACE TABLE memory.main.v_typed_{k} AS {};",
-            decode_sql(src, &format!("memory.main.v_ok_{k}"))
+             CREATE OR REPLACE TABLE memory.main.v_typed_{k} AS {} UNION ALL {};",
+            decode_sql(src, &format!("memory.main.v_ok_{k}")),
+            tombstones_sql(src, &format!("memory.main.{raw}"))
         ))?;
+        // An upsert view reads tombstones as deletes; for every other view they are dead letters.
+        let tombstones_dead = if plan.upsert.is_some() { format!(" AND _err <> {}", lit(crate::decode::TOMBSTONE)) } else { String::new() };
         dead_expected.push(format!(
-            "SELECT {n} AS source, _partition, _offset FROM memory.main.{raw} WHERE NOT ({IS_JSON_OBJECT})
-             UNION ALL SELECT {n}, _partition, _offset FROM memory.main.v_typed_{k} WHERE _err IS NOT NULL",
-            n = lit(&src.name)
+            "SELECT {n} AS source, _partition, _offset FROM memory.main.{raw} WHERE {invalid}
+             UNION ALL SELECT {n}, _partition, _offset FROM memory.main.v_typed_{k} WHERE _err IS NOT NULL{tombstones_dead}",
+            n = lit(&src.name),
+            invalid = invalid_json_where(),
         ));
     }
     let dead_expected = &dead_expected.join(" UNION ALL ");
@@ -280,6 +285,14 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         late_rows = count(conn, "SELECT * FROM memory.main.v_late")?;
         late_duplicates = late_rows - count(conn, "SELECT DISTINCT * FROM memory.main.v_late")?;
         left_in_state = count(conn, &format!("SELECT * FROM memory.main.v_state WHERE __we <= {wm}"))?;
+    } else if plan.upsert.is_some() {
+        // Every message, tombstones too: the batch query takes each key's current row (`UpsertSpec::batch_sql`).
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT {cols}, _partition, _offset, _key, _err IS NOT NULL AS __del
+               FROM memory.main.v_typed_0 WHERE _err IS NULL OR _err = {}",
+            plan.input_table,
+            lit(crate::decode::TOMBSTONE)
+        ))?;
     } else if plan.is_global() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT {cols}, 1::INTEGER AS __w FROM {valid}", plan.input_table))?;
     } else if plan.union.is_empty() {

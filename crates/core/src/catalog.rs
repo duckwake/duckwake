@@ -22,7 +22,7 @@ pub use duckwake_circuit::sql::state_table;
 pub fn load_compiled(conn: &Connection, job: &str) -> Result<(JobDef, HashMap<String, SourceDef>)> {
     let (mut def, _) = load_job(conn, job)?;
     let sources = view_sources(&def, load_sources(conn)?);
-    let plan = compile(conn, job, &def.sql, &sources, &def.lake_inputs)?;
+    let plan = compile(conn, job, &def.sql, &sources, &def.lake_inputs, def.upsert.as_ref())?;
     if plan.state_columns != def.plan.state_columns || plan.sink_columns != def.plan.sink_columns {
         bail!(
             "view {job} was created by a DuckWake version whose state or table layout differs from this one's; \
@@ -44,21 +44,36 @@ pub fn view_sources(def: &JobDef, mut sources: HashMap<String, SourceDef>) -> Ha
     sources
 }
 
-/// Compiles a view whose FROM names Kafka sources, and lake tables and views resolved to `lakes`.
-pub fn compile(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &[LakeInput]) -> Result<plan::Plan> {
+/// Compiles a view whose FROM names Kafka sources, and lake tables and views resolved to `lakes`; with `upsert`,
+/// a view that reads its Kafka source as upserts.
+pub fn compile(
+    conn: &Connection,
+    job: &str,
+    sql: &str,
+    sources: &HashMap<String, SourceDef>,
+    lakes: &[LakeInput],
+    upsert: Option<&plan::UpsertSpec>,
+) -> Result<plan::Plan> {
     let mut inputs: HashMap<String, Input> = sources.iter().map(|(n, s)| (n.clone(), Input::Kafka(s))).collect();
     inputs.extend(lakes.iter().map(|l| (l.name.clone(), Input::Lake(l))));
-    plan::compile(conn, job, sql, &inputs)
+    plan::compile_with(conn, job, sql, &inputs, upsert)
 }
 
 /// Compiles a new view and settles how it reads each lake input it streams. A window is final once the
 /// watermark passes it, so a later change to one of its rows could not be applied: a windowed view reads lake
 /// tables insert-only (an update or delete then stops it), and refuses a view's table whose rows change.
 /// Every other view takes updates and deletes as retractions.
-fn compile_new(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>, lakes: &mut [LakeInput]) -> Result<plan::Plan> {
+fn compile_new(
+    conn: &Connection,
+    job: &str,
+    sql: &str,
+    sources: &HashMap<String, SourceDef>,
+    lakes: &mut [LakeInput],
+    upsert: Option<&plan::UpsertSpec>,
+) -> Result<plan::Plan> {
     // The view's shape first, every input insert-only: over retracting ones some windowed aggregates are refused.
     let inserts: Vec<LakeInput> = lakes.iter().map(|l| LakeInput { retracts: false, ..l.clone() }).collect();
-    let plan = compile(conn, job, sql, sources, &inserts)?;
+    let plan = compile(conn, job, sql, sources, &inserts, upsert)?;
     let streams = plan.sources();
     let retracting = |l: &LakeInput| l.retracts && streams.contains(&l.name);
     if plan.is_windowed() {
@@ -77,7 +92,7 @@ fn compile_new(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String
     if !lakes.iter().any(retracting) {
         return Ok(plan);
     }
-    compile(conn, job, sql, sources, lakes)
+    compile(conn, job, sql, sources, lakes, upsert)
 }
 
 /// The columns of a view input named `name`: a Kafka source's or a lake input's.
@@ -311,6 +326,8 @@ pub struct CreateView<'a> {
     pub start: Option<&'a str>,
     /// What to do when the view exists.
     pub if_exists: IfExists,
+    /// Read the view's Kafka source as upserts: one row per key (`plan::UpsertSpec`).
+    pub upsert: Option<plan::UpsertSpec>,
 }
 
 /// What `create_view` does when a view of that name exists.
@@ -387,7 +404,7 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome
     }
     let sources = load_sources(conn)?;
     let mut lake_inputs = resolve_lake_inputs(conn, v.job_id, v.sql, &sources)?;
-    let plan = compile_new(conn, v.job_id, v.sql, &sources, &mut lake_inputs)?;
+    let plan = compile_new(conn, v.job_id, v.sql, &sources, &mut lake_inputs, v.upsert.as_ref())?;
     if v.late_data.is_some() && !plan.is_windowed() {
         bail!("only windowed views have late data; drop --late-data for a {} view", plan.kind_name());
     }
@@ -414,6 +431,7 @@ pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome
         start_snapshot,
         source_columns: BTreeMap::new(),
         limits: v.limits,
+        upsert: v.upsert.clone(),
     };
     let mut def = def;
     def.source_columns = def
@@ -477,6 +495,17 @@ fn update_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
     }
     if old.checkpoint != v.checkpoint {
         changed.push(format!("its checkpoint ({} -> {})", old.checkpoint, v.checkpoint));
+    }
+    if old.upsert != v.upsert {
+        let show = |u: &Option<plan::UpsertSpec>| match u {
+            Some(u) => format!(
+                "key {}{}",
+                u.key.join(", "),
+                u.version.as_ref().map(|v| format!(", version {v}")).unwrap_or_default()
+            ),
+            None => "none".into(),
+        };
+        changed.push(format!("its upsert ({} -> {})", show(&old.upsert), show(&v.upsert)));
     }
     if old.inline_row_limit != v.inline_row_limit {
         changed.push(format!("inline_row_limit ({} -> {})", old.inline_row_limit, v.inline_row_limit));

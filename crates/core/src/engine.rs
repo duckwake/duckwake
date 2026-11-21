@@ -23,7 +23,7 @@ use crate::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
 use crate::model::{parse_duration, JobDef, LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
-use crate::decode::{decode_sql, IS_JSON_OBJECT};
+use crate::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde_json::json;
@@ -195,6 +195,8 @@ struct SourceStaged {
     rows_sql: usize,
     bisections: usize,
     rows_dead: i64,
+    /// Of `rows_dead`, the tombstones: an upsert view reads them as deletes, not dead letters.
+    rows_tombstones: i64,
     stage_ms: u128,
 }
 
@@ -1396,8 +1398,8 @@ fn stage_source(
     // Rows decoded in Arrow are appended typed; the rest are staged raw for the SQL decode below.
     let typed_cols: Vec<String> = source.options.columns.iter().map(|(c, t)| format!("{} {t}", ident(c))).collect();
     conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE {typed} (_partition INTEGER, _offset BIGINT, payload VARCHAR, {}, _err VARCHAR);
-         CREATE OR REPLACE TABLE {raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR);",
+        "CREATE OR REPLACE TABLE {typed} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR, {}, _err VARCHAR);
+         CREATE OR REPLACE TABLE {raw} (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR);",
         typed_cols.join(", ")
     ))?;
     if chunks.iter().any(|c| c.fast.as_ref().is_some_and(|b| b.num_rows() > 0)) {
@@ -1410,24 +1412,32 @@ fn stage_source(
     {
         let mut app = conn.appender_to_catalog_and_db(&format!("raw_{g}"), "memory", "main")?;
         for m in chunks.iter().flat_map(|c| &c.slow) {
-            let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-            app.append_row(duckdb::params![m.partition, m.offset, payload.as_deref()])?;
+            app.append_row(duckdb::params![m.partition, m.offset, m.payload_text().as_deref(), m.key_text()])?;
         }
         app.flush()?;
     }
 
     // JSON parse errors must be split off before extracting fields, which would raise on malformed input.
+    // Tombstones are typed rows with `_err` = 'tombstone': upsert views take them as deletes, the others as
+    // dead letters (`dead` holds them all; a job's commit leaves out the ones it reads).
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TABLE {ok} AS SELECT * FROM {raw}
            WHERE {IS_JSON_OBJECT};
          INSERT INTO {typed} BY NAME {decode};
+         INSERT INTO {typed} BY NAME {tombstones};
          CREATE OR REPLACE TABLE {dead} AS
            SELECT _partition, _offset, payload, 'invalid json' AS _err FROM {raw}
-            WHERE NOT ({IS_JSON_OBJECT})
+            WHERE {invalid}
            UNION ALL SELECT _partition, _offset, payload, _err FROM {typed} WHERE _err IS NOT NULL;",
-        decode = decode_sql(source, &ok)
+        decode = decode_sql(source, &ok),
+        tombstones = tombstones_sql(source, &raw),
+        invalid = invalid_json_where(),
     ))?;
-    let rows_dead: i64 = conn.query_row(&format!("SELECT count(*) FROM {dead}"), [], |r| r.get(0))?;
+    let (rows_dead, rows_tombstones): (i64, i64) = conn.query_row(
+        &format!("SELECT count(*), count(*) FILTER (WHERE _err = {}) FROM {dead}", lit(crate::decode::TOMBSTONE)),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
 
     let et = ident(&source.options.event_time);
     let mut stmt = conn.prepare(&format!(
@@ -1447,6 +1457,7 @@ fn stage_source(
         rows_sql: chunks.iter().map(|c| c.slow.len()).sum(),
         bisections: chunks.iter().map(|c| c.bisections).sum(),
         rows_dead,
+        rows_tombstones,
         stage_ms: t.elapsed().as_millis(),
     })
 }
@@ -1487,6 +1498,7 @@ fn stage_lake(
         rows_sql: 0,
         bisections: 0,
         rows_dead: 0,
+        rows_tombstones: 0,
         stage_ms: t.elapsed().as_millis(),
     };
     if to <= from {
@@ -1689,6 +1701,7 @@ fn stage_backfill(
         rows_sql: 0,
         bisections: 0,
         rows_dead: 0,
+        rows_tombstones: 0,
         stage_ms: t.elapsed().as_millis(),
     })
 }
@@ -1823,7 +1836,7 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
         }
         open_ends = Some(ends);
     }
-    let inputs = srcs
+    let inputs: Vec<StagedInput> = srcs
         .iter()
         .zip(watermarks)
         .zip(&lakes)
@@ -1831,12 +1844,14 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
         .map(|(((src, w), l), input)| StagedInput {
             offsets: src.offsets.clone(),
             watermark_us: w,
-            rows_dead: src.rows_dead,
+            // An upsert view reads the source's tombstones as deletes: they are not its dead letters.
+            rows_dead: src.rows_dead - if j.def.upsert.is_some() { src.rows_tombstones } else { 0 },
             commit_us: l.as_ref().and_then(|(_, c, _)| *c),
             snapshots_behind: l.as_ref().map_or(0, |(_, _, b)| *b),
             backfill_done: input.offsets.contains_key(&LAKE_BACKFILL) && !src.offsets.contains_key(&LAKE_BACKFILL),
         })
         .collect();
+    let rows_dead = inputs.iter().map(|i| i.rows_dead).sum();
     Ok(Staged {
         inputs,
         watermark_us,
@@ -1844,7 +1859,7 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
         rows_in: srcs.iter().map(|s| s.rows_in).sum(),
         rows_sql: srcs.iter().map(|s| s.rows_sql).sum(),
         bisections: srcs.iter().map(|s| s.bisections).sum(),
-        rows_dead: srcs.iter().map(|s| s.rows_dead).sum(),
+        rows_dead,
         rows_late,
         rows_out: 0,
         rows_staged,
@@ -2132,11 +2147,13 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
                 .collect();
             let offsets = serde_json::Value::Object(offsets);
             let ts = |us: Option<i64>| us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
+            // An upsert view reads tombstones as deletes; every other view keeps them as dead letters.
+            let not_tombstones = if c.def.upsert.is_some() { format!(" WHERE _err <> {}", lit(crate::decode::TOMBSTONE)) } else { String::new() };
             if lean {
                 for (i, _) in c.inputs.iter().zip(&s.inputs).filter(|(_, si)| si.rows_dead > 0) {
                     let Some(dead) = &i.dead else { continue };
                     dead_rows.push(format!(
-                        "SELECT {}, {epoch}, {}, _partition, _offset, payload, _err, now() FROM {dead}",
+                        "SELECT {}, {epoch}, {}, _partition, _offset, payload, _err, now() FROM {dead}{not_tombstones}",
                         lit(id),
                         lit(&i.name)
                     ));
@@ -2160,7 +2177,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
             for (src, dead) in c.inputs.iter().filter_map(|i| i.dead.as_ref().map(|d| (i, d))) {
                 timed(&mut tm.dead, || {
                     conn.execute(
-                        &format!("INSERT INTO {CTL}.dead_letter SELECT ?, ?, ?, _partition, _offset, payload, _err, now() FROM {dead}"),
+                        &format!("INSERT INTO {CTL}.dead_letter SELECT ?, ?, ?, _partition, _offset, payload, _err, now() FROM {dead}{not_tombstones}"),
                         duckdb::params![id, epoch, src.name],
                     )
                 })?;

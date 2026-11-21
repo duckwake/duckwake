@@ -27,6 +27,26 @@ pub struct ViewOptions {
     pub max_late_rows: Option<u64>,
     /// What to do when the view exists: refuse, update it in place, or replace it (`CREATE OR REPLACE`).
     pub if_exists: catalog::IfExists,
+    /// Read the Kafka source as upserts, one row per key: the key columns, comma-separated, and the column whose
+    /// higher value wins (`plan::UpsertSpec`).
+    pub upsert_key: Option<String>,
+    pub upsert_version: Option<String>,
+}
+
+impl ViewOptions {
+    /// The upsert spec the options give, if any.
+    pub fn upsert(&self) -> Result<Option<crate::plan::UpsertSpec>> {
+        let Some(key) = self.upsert_key.as_deref().filter(|k| !k.trim().is_empty()) else {
+            if self.upsert_version.is_some() {
+                anyhow::bail!("upsert_version needs upsert_key, the column(s) that identify a row");
+            }
+            return Ok(None);
+        };
+        Ok(Some(crate::plan::UpsertSpec {
+            key: key.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
+            version: self.upsert_version.clone().filter(|v| !v.trim().is_empty()),
+        }))
+    }
 }
 
 /// `if_exists := ...` and the older `replace := true` (`--if-exists`, `--replace`) as one setting.
@@ -74,6 +94,7 @@ pub fn create_view(
             },
             start: o.start.as_deref(),
             if_exists: o.if_exists,
+            upsert: o.upsert()?,
         },
     )?;
     match outcome {

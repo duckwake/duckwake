@@ -7,6 +7,10 @@ pub const LAKE: &str = "lake";
 /// Schema inside the lake that holds all control data.
 pub const CTL: &str = "lake.__duckwake";
 
+/// `_err` of a staged Kafka message without a value (a tombstone). An upsert view reads it as the delete of its
+/// key; every other view dead-letters it.
+pub const TOMBSTONE: &str = "tombstone";
+
 /// SQL string literal.
 pub fn lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))

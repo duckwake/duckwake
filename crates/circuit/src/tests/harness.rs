@@ -192,3 +192,126 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
     let n: i64 = c.query_row(&format!("SELECT count(*) FROM {}", quote_table(SINK).unwrap()), [], |r| r.get(0)).unwrap();
     assert!(n > 0, "the view's table is empty for {sql}");
 }
+
+/// Epoch `e`'s messages of the `orders` topic, as staged (`_partition`, `_offset`, `_key`, the columns, `_err`):
+/// one per second of the epoch's range, over 13 orders, a key staying in one partition (its id mod 2). The key
+/// is a JSON object every third message, plain text the next, and absent the one after (then the value's
+/// `order_id` is the key). Every 7th message is a tombstone, every 11th is sent again right after itself, and
+/// `ver` goes up and down so that later messages are often older: views with a version ignore those.
+fn order_messages(epochs: &[(i64, i64)], e: usize) -> String {
+    let (from, to) = epochs[e];
+    let msg = |i: &str, offset: &str| {
+        format!(
+            "{i} % 13 % 2 AS _partition, {offset} AS _offset,
+             CASE WHEN {i} % 3 = 0 OR {i} % 7 = 3 THEN '{{\"order_id\": ' || ({i} % 13) || '}}'
+                  WHEN {i} % 3 = 1 THEN ({i} % 13)::VARCHAR END AS _key,
+             CASE WHEN {i} % 7 = 3 THEN NULL ELSE TIMESTAMP '2026-01-01' + to_seconds({i}) END AS ts,
+             CASE WHEN {i} % 7 = 3 THEN NULL ELSE {i} % 13 END AS order_id,
+             CASE WHEN {i} % 7 = 3 THEN NULL ELSE ['new', 'paid', 'shipped', NULL][{i} % 4 + 1] END AS status,
+             CASE WHEN {i} % 7 = 3 OR {i} % 5 = 0 THEN NULL ELSE (({i} * 37) % 23)::DECIMAL(18,2) END AS amount,
+             CASE WHEN {i} % 7 = 3 OR {i} % 9 = 4 THEN NULL ELSE ({i} * 7919) % 50 // 5 END AS ver,
+             CASE WHEN {i} % 7 = 3 THEN 'tombstone' END AS _err"
+        )
+    };
+    format!(
+        "SELECT {} FROM range({from}, {to}) t(i)
+         UNION ALL SELECT {} FROM range({from}, {to}) t(i) WHERE i % 11 = 0",
+        msg("i", "i * 2"),
+        msg("i", "i * 2 + 1"),
+    )
+}
+
+/// Runs an upsert view (`upsert`) over the `orders` topic epoch by epoch, sequentially or pipelined as
+/// `check_view` does, and checks its table after every epoch against the batch query over every message so far.
+pub(crate) fn check_upsert(sql: &str, upsert: &crate::plan::UpsertSpec, epochs: &[(i64, i64)], pipelined: bool) {
+    let (c, sources) = setup();
+    c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
+    let p = plan::compile_with(&c, "v", sql, &sources, Some(upsert)).unwrap();
+    let circuit = Circuit::compile(&View { id: "v", sink: SINK, late_data: None, plan: &p }).unwrap();
+    let columns = sources["orders"].columns.clone();
+    let typed = |cs: &[(String, String)]| cs.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect::<Vec<_>>().join(", ");
+    let names = columns.iter().map(|(n, _)| ident(n)).collect::<Vec<_>>().join(", ");
+    c.execute_batch(&format!(
+        "ATTACH ':memory:' AS lake; CREATE SCHEMA lake.__duckwake; CREATE SCHEMA lake.analytics;
+         CREATE TABLE {} ({}, _duckwake_epoch BIGINT);
+         CREATE TABLE {} ({});
+         CREATE TABLE memory.main.seen (_partition INTEGER, _offset BIGINT, _key VARCHAR, {}, _err VARCHAR);",
+        quote_table(SINK).unwrap(),
+        typed(&p.sink_columns),
+        state_table("v"),
+        typed(&p.state_columns),
+        typed(&columns),
+    ))
+    .unwrap();
+    let ctx = |e: usize| EpochCtx {
+        job: "v",
+        plan: &p,
+        sink: quote_table(SINK).unwrap(),
+        late_table: None,
+        sources: vec![SourceInput { name: "orders", columns: &columns, typed: staging("typed", "g0") }],
+        parity: e as u64 % 2,
+        overlay: (pipelined && e > 0).then(|| (e as u64 - 1) % 2),
+        prev_watermark: "NULL".into(),
+        watermark: None,
+        epoch: (e + 1).to_string(),
+    };
+    let run = |stmts: Vec<String>| {
+        for s in stmts {
+            c.execute_batch(&s).unwrap_or_else(|err| panic!("{err}\n{s}"));
+        }
+    };
+    let commit = |e: usize| {
+        run(circuit.commit_steps(&ctx(e)).unwrap().into_iter().map(|s| s.sql).collect());
+        c.execute_batch(&format!("INSERT INTO memory.main.seen BY NAME {}", order_messages(epochs, e))).unwrap();
+    };
+    let check = |committed: usize| {
+        c.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT {names}, _partition, _offset, _key, _err IS NOT NULL AS __del FROM memory.main.seen;
+             CREATE OR REPLACE TABLE memory.main.expected AS {}",
+            p.input_table, p.batch_sql
+        ))
+        .unwrap();
+        let cols = p.sink_columns.iter().map(|(n, _)| ident(n)).collect::<Vec<_>>().join(", ");
+        let sink = quote_table(SINK).unwrap();
+        let diff: i64 = c
+            .query_row(
+                &format!(
+                    "SELECT (SELECT count(*) FROM (SELECT {cols} FROM memory.main.expected EXCEPT ALL SELECT {cols} FROM {sink}))
+                          + (SELECT count(*) FROM (SELECT {cols} FROM {sink} EXCEPT ALL SELECT {cols} FROM memory.main.expected))"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(diff, 0, "after {committed} epochs of {sql} with {upsert:?}");
+    };
+    for e in 0..epochs.len() {
+        if pipelined && e > 0 && e % 2 == 0 {
+            commit(e - 1);
+        }
+        c.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT _partition, _offset, _key, {names}, _err FROM ({})",
+            staging("typed", "g0"),
+            order_messages(epochs, e)
+        ))
+        .unwrap();
+        run(circuit.stage_steps(&ctx(e)).unwrap().into_iter().map(|s| s.sql).collect());
+        if !pipelined {
+            commit(e);
+            check(e + 1);
+            continue;
+        }
+        if e > 0 && e % 2 == 1 {
+            commit(e - 1);
+        }
+        if e > 0 {
+            check(e);
+        }
+    }
+    if pipelined {
+        commit(epochs.len() - 1);
+        check(epochs.len());
+    }
+    let n: i64 = c.query_row(&format!("SELECT count(*) FROM {}", quote_table(SINK).unwrap()), [], |r| r.get(0)).unwrap();
+    assert!(n > 0, "the view's table is empty for {sql}");
+}

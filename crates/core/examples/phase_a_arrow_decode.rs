@@ -174,7 +174,7 @@ fn partitioned(payloads: Vec<Option<Vec<u8>>>) -> Vec<Vec<Msg>> {
     let mut parts: Vec<Vec<Msg>> = vec![Vec::new(); PARTITIONS];
     for (i, payload) in payloads.into_iter().enumerate() {
         let p = &mut parts[i % PARTITIONS];
-        p.push(Msg { partition: (i % PARTITIONS) as i32, offset: p.len() as i64, payload });
+        p.push(Msg { partition: (i % PARTITIONS) as i32, offset: p.len() as i64, payload, key: None });
     }
     parts
 }
@@ -219,12 +219,12 @@ fn hostile_corpus(n: usize, seed: u64) -> Vec<Vec<Msg>> {
 /// Today's `engine::stage` decode, statement for statement.
 fn sql_path(conn: &Connection, parts: &[Vec<Msg>]) -> Result<Duration> {
     let t = Instant::now();
-    conn.execute_batch("CREATE OR REPLACE TABLE raw (_partition INTEGER, _offset BIGINT, payload VARCHAR)")?;
+    conn.execute_batch("CREATE OR REPLACE TABLE raw (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR)")?;
     {
         let mut app = conn.appender("raw")?;
         for m in parts.iter().flatten() {
             let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-            app.append_row(params![m.partition, m.offset, payload.as_deref()])?;
+            app.append_row(params![m.partition, m.offset, payload.as_deref(), None::<String>])?;
         }
         app.flush()?;
     }
@@ -275,7 +275,7 @@ fn arrow_path(conn: &Connection, dec: &ArrowDecoder, parts: &[Vec<Msg>], paralle
     let src = source();
     let cols: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("{c} {t}")).collect();
     conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE typed_arw (_partition INTEGER, _offset BIGINT, payload VARCHAR, {}, _err VARCHAR)",
+        "CREATE OR REPLACE TABLE typed_arw (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR, {}, _err VARCHAR)",
         cols.join(", ")
     ))?;
     let mut tm = ArrowTimes { decode, ..Default::default() };
@@ -304,19 +304,19 @@ fn arrow_path(conn: &Connection, dec: &ArrowDecoder, parts: &[Vec<Msg>], paralle
     tm.append = t1.elapsed();
 
     let t2 = Instant::now();
-    conn.execute_batch("CREATE OR REPLACE TABLE fb (_partition INTEGER, _offset BIGINT, payload VARCHAR, dead BOOLEAN)")?;
+    conn.execute_batch("CREATE OR REPLACE TABLE fb (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR, dead BOOLEAN)")?;
     if tm.fallback_rows + tm.dead_rows > 0 {
         let mut app = conn.appender("fb")?;
         for (msgs, d) in &decoded {
             for (i, dead) in d.fallback.iter().map(|i| (*i, false)).chain(d.dead.iter().map(|i| (*i, true))) {
                 let m = &msgs[i];
                 let payload = m.payload.as_deref().map(String::from_utf8_lossy);
-                app.append_row(params![m.partition, m.offset, payload.as_deref(), dead])?;
+                app.append_row(params![m.partition, m.offset, payload.as_deref(), None::<String>, dead])?;
             }
         }
         app.flush()?;
         conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE fb_ok AS SELECT _partition, _offset, payload FROM fb WHERE NOT dead AND {IS_JSON_OBJECT};
+            "CREATE OR REPLACE TABLE fb_ok AS SELECT _partition, _offset, payload, _key FROM fb WHERE NOT dead AND {IS_JSON_OBJECT};
              INSERT INTO typed_arw BY NAME {decode};",
             decode = decode_sql(&src, "fb_ok")
         ))?;

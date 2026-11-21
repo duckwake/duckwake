@@ -206,7 +206,7 @@ the test scripts: stop it while they run. It lets you:
 - watch epochs, watermarks, open windows, late rows and dead letters;
 - query anything in the SQL console (`schema.table` means the lake) and follow the Activity log;
 - query a source by name (`SELECT * FROM clicks`): each query reads the newest 100,000 events of the
-  topic into a temporary table with the source's columns plus `_partition`, `_offset`, `_error` and
-  `_payload`. It's a snapshot for exploring and debugging, not a stream. `duckwake sql` does the same.
+  topic into a temporary table with the source's columns plus `_partition`, `_offset`, `_error` (why it
+  could not be decoded; `tombstone` for a message without a value), `_payload` and `_key` (the message key). It's a snapshot for exploring and debugging, not a stream. `duckwake sql` does the same.
 
 The demo creates a `clicks` source at 300 events/s, a `dim.games` table, and four views: a tumbling window with a lookup join, a hopping window, a filter, and a global aggregate with `HAVING` (an upsert sink: one row per group, replaced when it changes). The playground uses the same lake as the CLI, so `duckwake jobs` sees its views. The test scripts use their own catalog database (`duckwake_test`) and data path, and never touch the playground's lake.

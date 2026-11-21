@@ -213,6 +213,9 @@ pub struct JobDef {
     /// it grow without bound. None: no limit.
     #[serde(default, skip_serializing_if = "Limits::is_none")]
     pub limits: Limits,
+    /// A view that reads its Kafka source as upserts (`upsert_key :=`): one row per key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsert: Option<crate::plan::UpsertSpec>,
 }
 
 impl JobDef {

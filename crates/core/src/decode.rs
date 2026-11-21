@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 /// Dead-letter reason for a payload that is not a single JSON object (same text as the SQL path).
 pub const INVALID_JSON: &str = "invalid json";
 
+pub use duckwake_circuit::sql::TOMBSTONE;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
     Timestamp,
@@ -302,7 +304,7 @@ pub struct Decoded {
     pub batch: RecordBatch,
     /// Indexes of messages the SQL decode must handle.
     pub fallback: Vec<usize>,
-    /// Indexes of messages without a payload (Kafka tombstones): dead letters (`INVALID_JSON`).
+    /// Indexes of messages without a payload (Kafka tombstones), staged by the SQL path as `TOMBSTONE` rows.
     pub dead: Vec<usize>,
     /// Extra stream decodes spent isolating bad messages.
     pub bisections: usize,
@@ -328,7 +330,11 @@ impl ArrowDecoder {
         let Some(event_time) = columns.iter().position(|c| c.name == opts.event_time) else {
             bail!("event_time {:?} is not a column", opts.event_time)
         };
-        let mut out = vec![Field::new("_partition", DataType::Int32, false), Field::new("_offset", DataType::Int64, false)];
+        let mut out = vec![
+            Field::new("_partition", DataType::Int32, false),
+            Field::new("_offset", DataType::Int64, false),
+            Field::new("_key", DataType::Utf8, true),
+        ];
         out.extend(fields.iter().cloned());
         Ok(Some(ArrowDecoder {
             columns: Arc::new(columns),
@@ -437,13 +443,14 @@ impl ArrowDecoder {
     fn with_source_columns(&self, msgs: &[Msg], rows: &[usize], batch: RecordBatch) -> Result<RecordBatch> {
         let part: ArrayRef = Arc::new(Int32Array::from_iter_values(rows.iter().map(|&i| msgs[i].partition)));
         let off: ArrayRef = Arc::new(Int64Array::from_iter_values(rows.iter().map(|&i| msgs[i].offset)));
-        let mut cols = vec![part, off];
+        let key: ArrayRef = Arc::new(duckdb::arrow::array::StringArray::from_iter(rows.iter().map(|&i| msgs[i].key_text())));
+        let mut cols = vec![part, off, key];
         cols.extend(batch.columns().iter().cloned());
         Ok(RecordBatch::try_new(self.out_schema.clone(), cols)?)
     }
 }
 
-/// A decoded batch shaped like the staging table `(_partition, _offset, payload, <columns>, _err)`:
+/// A decoded batch shaped like the staging table `(_partition, _offset, payload, _key, <columns>, _err)`:
 /// fast rows keep no payload and have no error.
 pub fn staging_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     let null = duckdb::arrow::array::new_null_array(&DataType::Utf8, batch.num_rows());
@@ -460,7 +467,7 @@ pub fn staging_batch(batch: &RecordBatch) -> Result<RecordBatch> {
 /// short-circuit AND, so the CASE keeps it away from rows that are not valid JSON.
 pub const IS_JSON_OBJECT: &str = "CASE WHEN json_valid(payload) THEN json_type(payload) = 'OBJECT' ELSE false END";
 
-/// Builds the decode query for raw Kafka rows `(_partition, _offset, payload)` already known to be JSON
+/// Builds the decode query for raw Kafka rows `(_partition, _offset, payload, _key)` already known to be JSON
 /// objects. Adds the typed source columns and `_err` (NULL when the row is usable).
 pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
     let o = &src.options;
@@ -483,15 +490,65 @@ pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
         ));
     }
     format!(
-        "SELECT _partition, _offset, payload, {}, CASE {} ELSE NULL END AS _err FROM {ok_table}",
+        "SELECT _partition, _offset, payload, _key, {}, CASE {} ELSE NULL END AS _err FROM {ok_table}",
         cols.join(", "),
         checks.join(" ")
     )
 }
 
+/// The raw Kafka rows `(_partition, _offset, payload, _key)` without a value (tombstones), shaped like
+/// `decode_sql`'s rows with `_err` = `TOMBSTONE` and the columns NULL.
+pub fn tombstones_sql(src: &crate::model::SourceDef, raw_table: &str) -> String {
+    let nulls: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("NULL::{t} AS {}", ident(c))).collect();
+    format!(
+        "SELECT _partition, _offset, payload, _key, {}, {} AS _err FROM {raw_table} WHERE payload IS NULL",
+        nulls.join(", "),
+        lit(TOMBSTONE)
+    )
+}
+
+/// The raw rows that are dead letters as invalid JSON: a value that is not one JSON object. Tombstones are not
+/// among them: they are staged as `TOMBSTONE` rows.
+pub fn invalid_json_where() -> String {
+    format!("payload IS NOT NULL AND NOT ({IS_JSON_OBJECT})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tombstone (a message without a value) is staged as a typed row with its key and `_err` 'tombstone', not
+    /// as invalid JSON; a value that is not a JSON object is still a dead letter.
+    #[test]
+    fn tombstones_are_staged_with_their_keys() {
+        let options = crate::model::SourceOptions::from_json(&serde_json::json!({
+            "brokers": "x", "topic": "t", "event_time": "ts", "columns": {"ts": "TIMESTAMP", "id": "BIGINT"}
+        }))
+        .unwrap();
+        let src = crate::model::SourceDef { name: "s".into(), kind: "kafka".into(), options };
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE raw (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR);
+             INSERT INTO raw VALUES (0, 0, '{{\"ts\": \"2026-01-01 00:00:00\", \"id\": 7}}', '{{\"id\": 7}}'),
+                                    (0, 1, NULL, '7'), (0, 2, 'not json', NULL), (0, 3, '[1]', 'x');
+             CREATE TABLE ok AS SELECT * FROM raw WHERE {IS_JSON_OBJECT};
+             CREATE TABLE typed AS {} UNION ALL {};",
+            decode_sql(&src, "ok"),
+            tombstones_sql(&src, "raw")
+        ))
+        .unwrap();
+        type Row = (i64, Option<i64>, Option<String>, Option<String>);
+        let rows = |sql: &str| -> Vec<Row> {
+            let mut st = conn.prepare(sql).unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            rows("SELECT _offset, id, _key, _err FROM typed ORDER BY _offset"),
+            [(0, Some(7), Some("{\"id\": 7}".into()), None), (1, None, Some("7".into()), Some(TOMBSTONE.into()))]
+        );
+        let dead = format!("SELECT _offset, NULL::BIGINT, _key, payload FROM raw WHERE {} ORDER BY _offset", invalid_json_where());
+        assert_eq!(rows(&dead), [(2, None, None, Some("not json".into())), (3, None, Some("x".into()), Some("[1]".into()))]);
+    }
 
     #[test]
     fn fast_list_forms() {

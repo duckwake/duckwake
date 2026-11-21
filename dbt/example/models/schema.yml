@@ -24,5 +24,10 @@ models:
     data_tests: [duckwake.duckwake_verified]
   - name: account_totals
     data_tests: [duckwake.duckwake_verified]
+  - name: last_click
+    data_tests: [duckwake.duckwake_verified]
+    columns:
+      - name: user_id
+        data_tests: [unique, not_null]
   - name: top_games
     data_tests: [duckwake.duckwake_verified]

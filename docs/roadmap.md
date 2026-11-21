@@ -130,7 +130,12 @@ default.
   output does not carry the input's partition column. **Gate:** a generator reruns the last 3 days of a
   partitioned table with changed, removed and added rows; after every rerun, through crashes, the view's
   table equals its batch query over the table at the checkpoint's snapshot.
-- Avro and Protobuf with a schema registry; Kafka keys and headers
+- Change data ([CDC sources](design/cdc-sources.md)). Built 2026-11-20: upsert views over Kafka topics (C2,
+  [#41](https://github.com/duckwake/duckwake/issues/41)): `upsert_key` and `upsert_version` on
+  `create_view`; the message key, tombstones as deletes; a plain DuckLake table with one
+  row per key that other views read through the change feed (`scripts/upsert_test.sh`). Next: Debezium topics
+  (C3), then late changes to closed windows (C4).
+- Avro and Protobuf with a schema registry; Kafka headers
 - Splitting one topic's partitions across workers
 - A Windows build
 - A signed community extension (`INSTALL duckwake FROM community`). Built 2026-11-17

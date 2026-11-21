@@ -75,6 +75,7 @@ jobs:
           - { name: retract, run: scripts/retract_test.sh }
           # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
           - { name: backfill, run: scripts/backfill_test.sh }
+          - { name: upsert, run: scripts/upsert_test.sh }
           # dbt-duckwake: the example project deployed and changed with dbt (installs dbt-duckdb into a venv).
           - { name: dbt, run: scripts/dbt_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
@@ -95,6 +96,7 @@ jobs:
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
           - { name: backfill pipelined, run: scripts/backfill_test.sh, flags: true }
+          - { name: upsert pipelined, run: scripts/upsert_test.sh, flags: true }
           - { name: schema pipelined, run: scripts/schema_test.sh, flags: true }
           - { name: limits pipelined, run: scripts/limits_test.sh, flags: true }
     name: suite (${{ matrix.name }})

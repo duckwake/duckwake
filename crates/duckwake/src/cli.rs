@@ -97,6 +97,14 @@ enum Cmd {
         /// start, keeping its status and worker.
         #[arg(long)]
         replace: bool,
+        /// Read the Kafka source as upserts, one row per key: the key column(s), comma-separated. A later
+        /// message replaces its key's row and a tombstone (no value) deletes it.
+        #[arg(long)]
+        upsert_key: Option<String>,
+        /// With --upsert-key: the column whose value decides, so a message older than the key's row is
+        /// ignored; of equal versions the later message wins.
+        #[arg(long)]
+        upsert_version: Option<String>,
     },
     /// duckwake_add_source_column(source, column, type): views that read the source keep their columns.
     AddSourceColumn { source: String, column: String, r#type: String },
@@ -195,6 +203,21 @@ enum Cmd {
         /// At the end, send one far-future event per partition so every real window closes.
         #[arg(long)]
         eos: bool,
+        /// Send order updates for this many keys instead of clicks: `{ts, order_id, status, amount, ver}`, with
+        /// the order id as the message key (a JSON object, or plain text for every third message), each key
+        /// always in the same partition. For views with --upsert-key.
+        #[arg(long, default_value_t = 0)]
+        keys: u64,
+        /// With --keys: every Nth message is a tombstone (no value) that deletes its key (0 = never).
+        #[arg(long, default_value_t = 0)]
+        delete_every: u64,
+        /// With --keys: every Nth message is sent twice (0 = never).
+        #[arg(long, default_value_t = 0)]
+        repeat_every: u64,
+        /// With --keys: every Nth message carries an older `ver` than the messages before it, as a redelivery
+        /// would (0 = never).
+        #[arg(long, default_value_t = 0)]
+        stale_every: u64,
     },
     /// Differential exactly-once check of a view against a batch recomputation.
     Verify { name: String },
@@ -408,6 +431,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             max_late_rows,
             if_exists,
             replace,
+            upsert_key,
+            upsert_version,
         } => {
             if sink.is_some() {
                 eprintln!("warning: --sink is deprecated; name the view after its table: create-view analytics.<table>");
@@ -422,6 +447,8 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 max_state_rows,
                 max_late_rows,
                 if_exists: api::if_exists(if_exists.as_deref(), replace)?,
+                upsert_key,
+                upsert_version,
             };
             let (def, outcome, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
             use duckwake_core::catalog::Outcome;
@@ -474,8 +501,13 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::Serve { w, s } => {
             return serve::run(&lake_cfg, rt, &w, &s);
         }
-        Cmd::Produce { brokers, topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos } => {
-            rt.block_on(produce(&brokers, &topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos))?;
+        Cmd::Produce { brokers, topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos, keys, delete_every, repeat_every, stale_every } => {
+            if keys > 0 {
+                let o = Upserts { keys, delete_every, repeat_every, stale_every };
+                rt.block_on(produce_upserts(&brokers, &topic, partitions, rate, count, &o))?;
+            } else {
+                rt.block_on(produce(&brokers, &topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos))?;
+            }
         }
         Cmd::Explain { name } => {
             print!("{}", api::explain(&open()?, &name)?);
@@ -593,6 +625,72 @@ fn print_query(conn: &duckdb::Connection, sql: &str) -> Result<()> {
     } else {
         println!("{}", arrow::util::pretty::pretty_format_batches(&batches)?);
     }
+    Ok(())
+}
+
+/// `produce --keys`: order updates for upsert views.
+struct Upserts {
+    keys: u64,
+    delete_every: u64,
+    repeat_every: u64,
+    stale_every: u64,
+}
+
+/// Sends `count` order updates over `o.keys` orders at `rate` per second: message `i` updates a random order
+/// with version `i` (an older one every `stale_every`th), deletes it every `delete_every`th, and is sent twice
+/// every `repeat_every`th. An order always goes to the partition of its id, as Kafka's default partitioner keeps a
+/// key's messages together.
+async fn produce_upserts(brokers: &str, topic: &str, partitions: i32, rate: u64, count: u64, o: &Upserts) -> Result<()> {
+    use rand::Rng;
+    let client = kafka::plain_client(brokers).await?;
+    kafka::ensure_topic(&client, topic, partitions).await?;
+    let parts = kafka::partitions(&client, topic).await?;
+    let tick = Duration::from_millis(100);
+    let per_tick = (rate / 10).max(1);
+    let started = Instant::now();
+    let (mut sent, mut deleted) = (0u64, 0u64);
+    let mut rng = rand::rng();
+    let every = |n: u64, i: u64| n > 0 && i.is_multiple_of(n);
+    let fmt = |t: chrono::DateTime<chrono::Utc>| t.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    while count == 0 || sent < count {
+        let n = if count == 0 { per_tick } else { per_tick.min(count - sent) };
+        let mut by_part: Vec<Vec<kafka::Keyed>> = vec![Vec::new(); parts.len()];
+        for k in 0..n {
+            let i = sent + k + 1;
+            let order = rng.random_range(0..o.keys);
+            let key = if i.is_multiple_of(3) { order.to_string() } else { format!("{{\"order_id\": {order}}}") };
+            let value = if every(o.delete_every, i) {
+                deleted += 1;
+                None
+            } else {
+                let ver = if every(o.stale_every, i) { i.saturating_sub(rng.random_range(1..=1000)) } else { i };
+                Some(format!(
+                    "{{\"ts\": \"{}\", \"order_id\": {order}, \"status\": \"{}\", \"amount\": {}.{:02}, \"ver\": {ver}}}",
+                    fmt(chrono::Utc::now()),
+                    ["new", "paid", "shipped", "cancelled"][rng.random_range(0..4)],
+                    rng.random_range(0..500),
+                    rng.random_range(0..100),
+                ))
+            };
+            let msg = (Some(key.into_bytes()), value.map(String::into_bytes));
+            let p = (order as usize) % parts.len();
+            if every(o.repeat_every, i) {
+                by_part[p].push(msg.clone());
+            }
+            by_part[p].push(msg);
+        }
+        for (idx, batch) in by_part.into_iter().enumerate() {
+            for piece in batch.chunks(2000) {
+                kafka::produce_keyed(&client, topic, parts[idx], piece.to_vec()).await?;
+            }
+        }
+        sent += n;
+        let due = tick * (sent / per_tick) as u32;
+        if let Some(wait) = due.checked_sub(started.elapsed()) {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    eprintln!("produced {sent} order updates ({deleted} tombstones) over {} keys in {:.1}s", o.keys, started.elapsed().as_secs_f64());
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 # dbt-duckwake gate: the example project (dbt/example) deployed and changed with dbt while events stream in and
 # a worker runs its views. It runs from the package as published to duckwake/dbt-duckwake (scripts/mirror_dbt.sh).
 #   0. A failed duckwake_verify leaves the session usable for the next call (dbt runs every test in one).
-#   1. dbt run creates the source and five views and starts them; a second run changes nothing.
+#   1. dbt run creates the source and six views (one of them an upsert view) and starts them; a second run changes nothing.
 #   2. A changed setting alters the views in place; a changed query fails until --full-refresh, which needs the
 #      view's readers selected too (-s big_spend+), drops them and creates them again after it.
 #   3. A new view over a running one (top_games over game_totals) fills from its current rows, and the source
@@ -93,17 +93,17 @@ PY
 
 log "1. deploy, then run again"
 dbt run || { tail -30 "$OUT/dbt.log"; failed=1; }
-expect "first run" "account_totals: created big_spend: created clicks: created clicks_per_window: created game_totals: created spend_by_game: created "
-for v in account_totals big_spend clicks_per_window game_totals spend_by_game; do
+expect "first run" "account_totals: created big_spend: created clicks: created clicks_per_window: created game_totals: created last_click: created spend_by_game: created "
+for v in account_totals big_spend clicks_per_window game_totals last_click spend_by_game; do
   [[ $(status "$v") == running ]] || { echo "FAIL: $v is $(status "$v") after the first run"; failed=1; }
 done
 dbt run || failed=1
-expect "second run" "account_totals: unchanged big_spend: unchanged clicks: unchanged clicks_per_window: unchanged game_totals: unchanged spend_by_game: unchanged "
+expect "second run" "account_totals: unchanged big_spend: unchanged clicks: unchanged clicks_per_window: unchanged game_totals: unchanged last_click: unchanged spend_by_game: unchanged "
 
 log "2. a setting, then a query"
 VARS="$VARS, epoch_interval: 3s"
 dbt run || failed=1
-expect "epoch_interval 3s" "account_totals: altered big_spend: altered clicks: unchanged clicks_per_window: altered game_totals: altered spend_by_game: altered "
+expect "epoch_interval 3s" "account_totals: altered big_spend: altered clicks: unchanged clicks_per_window: altered game_totals: altered last_click: altered spend_by_game: altered "
 VARS="$VARS, big_spend_min: 95"
 if dbt run; then echo "FAIL: a changed query was applied without --full-refresh"; failed=1; fi
 expect_error "changed query" "only a replace recomputes it"
@@ -118,7 +118,7 @@ log "3. a new view over a running one, and a new source column"
             INSERT INTO lake.shop.accounts SELECT i, 'g' || (i % 5), (i % 100) FROM range(5001, 6001) t(i)" >/dev/null
 VARS="$VARS, with_top_games: true, with_country: true"
 dbt run || { tail -30 "$OUT/dbt.log"; failed=1; }
-expect "top_games and country" "account_totals: unchanged big_spend: unchanged clicks: added column clicks_per_window: unchanged game_totals: unchanged spend_by_game: unchanged top_games: created "
+expect "top_games and country" "account_totals: unchanged big_spend: unchanged clicks: added column clicks_per_window: unchanged game_totals: unchanged last_click: unchanged spend_by_game: unchanged top_games: created "
 
 log "4. the topic ends; every view catches up and dbt test passes"
 wait "$PRODUCER"; tail -1 "$OUT/producer.log"

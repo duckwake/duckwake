@@ -92,7 +92,8 @@ GROUP BY ALL
 `ref()` to a source model becomes the source's name; `ref()` to a view, or `source()` for a lake table DuckWake
 does not maintain, reads that table through its change feed. View config: `epoch_interval`, `max_rows`,
 `late_data`, `checkpoint`, `inline_row_limit`, `max_state_rows`, `max_late_rows`, `start` (`earliest`, the
-default, or `latest`), `worker` (where a new view starts; default any live worker) and `start_on_create`
+default, or `latest`), `upsert_key` (a column or a list; [upsert views](../docs/sql.md#upsert-views)),
+`upsert_version`, `worker` (where a new view starts; default any live worker) and `start_on_create`
 (default true).
 
 ## What `dbt run` does
