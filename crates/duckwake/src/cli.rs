@@ -218,6 +218,13 @@ enum Cmd {
         /// would (0 = never).
         #[arg(long, default_value_t = 0)]
         stale_every: u64,
+        /// With --keys: write each update as a Debezium change event, for sources with format 'debezium': the
+        /// first tenth as snapshot reads (`r`), then inserts (`c`) and updates (`u`); a delete is a `d` event
+        /// followed by a tombstone, and every fifth delete has no message key. Every fourth event and key is
+        /// wrapped as with `schemas.enable`; `ts` is epoch microseconds and `amount` a string, as Debezium sends
+        /// them.
+        #[arg(long)]
+        debezium: bool,
     },
     /// Differential exactly-once check of a view against a batch recomputation.
     Verify { name: String },
@@ -501,9 +508,12 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::Serve { w, s } => {
             return serve::run(&lake_cfg, rt, &w, &s);
         }
-        Cmd::Produce { brokers, topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos, keys, delete_every, repeat_every, stale_every } => {
+        Cmd::Produce {
+            brokers, topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos, keys, delete_every, repeat_every,
+            stale_every, debezium,
+        } => {
             if keys > 0 {
-                let o = Upserts { keys, delete_every, repeat_every, stale_every };
+                let o = Upserts { keys, delete_every, repeat_every, stale_every, debezium };
                 rt.block_on(produce_upserts(&brokers, &topic, partitions, rate, count, &o))?;
             } else {
                 rt.block_on(produce(&brokers, &topic, partitions, rate, count, late_every, bad_every, disorder_ms, pad_bytes, eos))?;
@@ -634,6 +644,7 @@ struct Upserts {
     delete_every: u64,
     repeat_every: u64,
     stale_every: u64,
+    debezium: bool,
 }
 
 /// Sends `count` order updates over `o.keys` orders at `rate` per second: message `i` updates a random order
@@ -649,6 +660,7 @@ async fn produce_upserts(brokers: &str, topic: &str, partitions: i32, rate: u64,
     let per_tick = (rate / 10).max(1);
     let started = Instant::now();
     let (mut sent, mut deleted) = (0u64, 0u64);
+    let mut live = std::collections::HashSet::new();
     let mut rng = rand::rng();
     let every = |n: u64, i: u64| n > 0 && i.is_multiple_of(n);
     let fmt = |t: chrono::DateTime<chrono::Utc>| t.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
@@ -658,26 +670,47 @@ async fn produce_upserts(brokers: &str, topic: &str, partitions: i32, rate: u64,
         for k in 0..n {
             let i = sent + k + 1;
             let order = rng.random_range(0..o.keys);
-            let key = if i.is_multiple_of(3) { order.to_string() } else { format!("{{\"order_id\": {order}}}") };
-            let value = if every(o.delete_every, i) {
-                deleted += 1;
-                None
+            let delete = every(o.delete_every, i);
+            deleted += u64::from(delete);
+            let ver = if every(o.stale_every, i) { i.saturating_sub(rng.random_range(1..=1000)) } else { i };
+            let status = ["new", "paid", "shipped", "cancelled"][rng.random_range(0..4)];
+            let amount = format!("{}.{:02}", rng.random_range(0..500), rng.random_range(0..100));
+            let now = chrono::Utc::now();
+            let msgs: Vec<(Option<String>, Option<String>)> = if o.debezium {
+                // `schemas.enable` wraps an event or key as {"schema": ..., "payload": ...}.
+                let wrap = |v: String, on: bool| if on { format!("{{\"schema\": {{\"type\": \"struct\"}}, \"payload\": {v}}}") } else { v };
+                let key = wrap(format!("{{\"order_id\": {order}}}"), i % 4 == 1);
+                let snapshot = count > 0 && i <= count / 10;
+                let ms = now.timestamp_millis();
+                let source = format!("{{\"connector\": \"postgresql\", \"ts_ms\": {ms}, \"snapshot\": \"{snapshot}\", \"lsn\": {i}}}");
+                if delete {
+                    live.remove(&order);
+                    let d = format!("{{\"before\": {{\"order_id\": {order}}}, \"after\": null, \"source\": {source}, \"op\": \"d\", \"ts_ms\": {ms}}}");
+                    let d = wrap(d, i % 4 == 0);
+                    if deleted % 5 == 0 { vec![(None, Some(d))] } else { vec![(Some(key.clone()), Some(d)), (Some(key), None)] }
+                } else {
+                    let op = if snapshot { "r" } else if live.insert(order) { "c" } else { "u" };
+                    let after = format!(
+                        "{{\"ts\": {}, \"order_id\": {order}, \"status\": \"{status}\", \"amount\": \"{amount}\", \"ver\": {ver}}}",
+                        now.timestamp_micros()
+                    );
+                    let e = format!("{{\"before\": null, \"after\": {after}, \"source\": {source}, \"op\": \"{op}\", \"ts_ms\": {ms}}}");
+                    vec![(Some(key), Some(wrap(e, i % 4 == 0)))]
+                }
             } else {
-                let ver = if every(o.stale_every, i) { i.saturating_sub(rng.random_range(1..=1000)) } else { i };
-                Some(format!(
-                    "{{\"ts\": \"{}\", \"order_id\": {order}, \"status\": \"{}\", \"amount\": {}.{:02}, \"ver\": {ver}}}",
-                    fmt(chrono::Utc::now()),
-                    ["new", "paid", "shipped", "cancelled"][rng.random_range(0..4)],
-                    rng.random_range(0..500),
-                    rng.random_range(0..100),
-                ))
+                let key = if i.is_multiple_of(3) { order.to_string() } else { format!("{{\"order_id\": {order}}}") };
+                let value = (!delete).then(|| {
+                    format!(
+                        "{{\"ts\": \"{}\", \"order_id\": {order}, \"status\": \"{status}\", \"amount\": {amount}, \"ver\": {ver}}}",
+                        fmt(now)
+                    )
+                });
+                vec![(Some(key), value)]
             };
-            let msg = (Some(key.into_bytes()), value.map(String::into_bytes));
             let p = (order as usize) % parts.len();
-            if every(o.repeat_every, i) {
-                by_part[p].push(msg.clone());
+            for _ in 0..if every(o.repeat_every, i) { 2 } else { 1 } {
+                by_part[p].extend(msgs.iter().map(|(k, v)| (k.clone().map(String::into_bytes), v.clone().map(String::into_bytes))));
             }
-            by_part[p].push(msg);
         }
         for (idx, batch) in by_part.into_iter().enumerate() {
             for piece in batch.chunks(2000) {
@@ -690,7 +723,8 @@ async fn produce_upserts(brokers: &str, topic: &str, partitions: i32, rate: u64,
             tokio::time::sleep(wait).await;
         }
     }
-    eprintln!("produced {sent} order updates ({deleted} tombstones) over {} keys in {:.1}s", o.keys, started.elapsed().as_secs_f64());
+    let what = if o.debezium { "Debezium events" } else { "order updates" };
+    eprintln!("produced {sent} {what} ({deleted} deletes) over {} keys in {:.1}s", o.keys, started.elapsed().as_secs_f64());
     Ok(())
 }
 

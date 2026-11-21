@@ -66,6 +66,43 @@ services:
       interval: 2s
       retries: 30
 
+  # Debezium end to end (scripts/debezium_e2e_test.sh): `docker compose --profile debezium up -d --wait`. A
+  # PostgreSQL with logical replication holding the tables Debezium reads (database shop, user shop / shop, on
+  # localhost:15432), and Kafka Connect with Debezium's PostgreSQL connector, writing to the Redpanda above. Connect
+  # uses the host network to reach Redpanda's localhost listener and PostgreSQL as localhost:15432; its REST API is
+  # on localhost:8083. Both start empty: no volume, and Connect keeps its state in Kafka topics.
+  pg-source:
+    profiles: ["debezium"]
+    image: mirror.gcr.io/library/postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+    ports: ["15432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop"]
+      interval: 2s
+      retries: 30
+
+  connect:
+    profiles: ["debezium"]
+    # Pinned, as Redpanda is; 3.6.3.Final is of 2026-11-02. quay.io has no Docker Hub pull limit.
+    image: quay.io/debezium/connect:3.6.3.Final
+    network_mode: host
+    depends_on:
+      redpanda: { condition: service_healthy }
+      pg-source: { condition: service_healthy }
+    environment:
+      BOOTSTRAP_SERVERS: localhost:19092
+      GROUP_ID: duckwake-e2e
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+
   # The server (duckwaked) with its own catalog database and data volume: `docker compose --profile server up -d`.
   # It uses the host network, so it reaches Kafka and PostgreSQL at the same addresses the sources and the CLI use
   # (localhost:19092, localhost:55432). Quack on :9494 (token below), metrics on :9464.

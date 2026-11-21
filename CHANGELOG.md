@@ -7,6 +7,17 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- Debezium sources ([#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` reads a topic of
+  Debezium change events, with or without `schemas.enable`. Its views set `upsert_key` to the table's primary
+  key: inserts, snapshot reads and updates replace a key's row from `after`, deletes remove it (keyed by the
+  message key, or by `before` when there is none), and truncates and other events are dead letters that name
+  them. Debezium's epoch numbers in `TIMESTAMP` and `DATE` columns are read as times. An event with a value
+  Debezium left out (`__debezium_unavailable_value`, a PostgreSQL table without `REPLICA IDENTITY FULL`) stops
+  the view with an error that says so. `duckwake produce --keys N --debezium` writes such a topic. Gates:
+  `FORMAT=debezium scripts/upsert_test.sh`, in order and pipelined, and `scripts/debezium_e2e_test.sh`, end to end
+  with PostgreSQL 16 and Debezium's connector 3.6.3 (`docker compose --profile debezium`).
+- A source's `event_time` is optional when its format is `debezium`; a window over a source without one is
+  refused.
 - Upsert views over Kafka topics ([#41](https://github.com/duckwake/duckwake/issues/41)):
   `duckwake_create_view(..., upsert_key := 'order_id')` (`create-view --upsert-key`) reads a topic of changes as
   one row per key. The key comes from the message key (a JSON object's field, or the whole key), else the
@@ -63,6 +74,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   at most once a slide while idle. Found by `chain_test.sh` on `main`; `chain_test.sh` now checks it every run.
 - The dead-letter query in the `DuckWakeDeadLetters` alert's docs named a column `_err`; it is `error`.
 
+- CI could fail to start the stack with "failed to bind host port for 0.0.0.0:55432 ... address already in use":
+  the published ports (55432, 19092-19095, 19900) are inside Linux's ephemeral port range, and an outgoing
+  connection on the runner could hold one when Docker bound it. CI now reserves them before starting the stack.
 - The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
   RPC port, 33145, when an outgoing connection in its container had taken that port; the container's ephemeral
   ports now start at 40000.

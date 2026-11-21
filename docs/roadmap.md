@@ -133,8 +133,10 @@ default.
 - Change data ([CDC sources](design/cdc-sources.md)). Built 2026-11-20: upsert views over Kafka topics (C2,
   [#41](https://github.com/duckwake/duckwake/issues/41)): `upsert_key` and `upsert_version` on
   `create_view`; the message key, tombstones as deletes; a plain DuckLake table with one
-  row per key that other views read through the change feed (`scripts/upsert_test.sh`). Next: Debezium topics
-  (C3), then late changes to closed windows (C4).
+  row per key that other views read through the change feed (`scripts/upsert_test.sh`). Built 2026-11-21:
+  Debezium topics (C3, [#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` sources
+  read as upsert views, `event_time` optional (`FORMAT=debezium scripts/upsert_test.sh`, and end to end with
+  PostgreSQL and Debezium's connector: `scripts/debezium_e2e_test.sh`). Next: late changes to closed windows (C4).
 - Avro and Protobuf with a schema registry; Kafka headers
 - Splitting one topic's partitions across workers
 - A Windows build

@@ -1062,6 +1062,9 @@ pub fn compile_with<S: SourceSchema>(
         None => None,
         Some((kind, time_col, size, slide)) => {
             let allowed = src.time_columns();
+            if allowed.is_empty() {
+                bail!("{} has no event_time, so no window can read it", stream.source);
+            }
             if !allowed.iter().any(|c| c == time_col) {
                 bail!("windows over {} must use {}, not {time_col:?}", stream.source, allowed.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" or "));
             }
@@ -1076,6 +1079,13 @@ pub fn compile_with<S: SourceSchema>(
             Some(WindowSpec { kind: *kind, time_col: time_col.clone(), size_us, slide_us })
         }
     };
+    if upsert.is_none() && src.changelog() {
+        bail!(
+            "{} carries Debezium change events, which a view applies by key: set upsert_key to the table's primary key \
+             (the columns of the message key)",
+            stream.source
+        );
+    }
     if let Some(u) = upsert {
         check_upsert(u, &stream.source, src)?;
         if window.is_some() {
@@ -2238,6 +2248,34 @@ mod tests {
         let w = p.window.unwrap();
         assert_eq!((w.kind, w.size_us, w.slide_us), (WindowKind::Hop, 60_000_000, 20_000_000));
         assert_eq!(p.key_columns, ["__k0", "__k1"]);
+    }
+
+    /// A Debezium topic: change events without an event time.
+    struct Changelog(Vec<(String, String)>);
+    impl SourceSchema for Changelog {
+        fn event_time(&self) -> Option<&str> {
+            None
+        }
+        fn columns(&self) -> &[(String, String)] {
+            &self.0
+        }
+        fn changelog(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_debezium_source_is_read_by_key_and_has_no_windows() {
+        let (c, _) = setup();
+        let cols = [("id", "BIGINT"), ("status", "VARCHAR")].map(|(n, t)| (n.to_string(), t.to_string())).to_vec();
+        let s = HashMap::from([("orders".to_string(), Changelog(cols))]);
+        let key = UpsertSpec { key: vec!["id".into()], version: None };
+        let e = compile(&c, "j", "SELECT id, status FROM orders", &s).unwrap_err();
+        assert!(format!("{e:#}").contains("set upsert_key to the table's primary key"), "{e:#}");
+        compile_with(&c, "j", "SELECT id, status FROM orders WHERE status <> 'void'", &s, Some(&key)).unwrap();
+        let e = compile_with(&c, "j", "SELECT window_start, count(*) FROM TUMBLE(orders, ts, INTERVAL 1 MINUTE) GROUP BY ALL", &s, Some(&key))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("orders has no event_time, so no window can read it"), "{e:#}");
     }
 
     #[test]
