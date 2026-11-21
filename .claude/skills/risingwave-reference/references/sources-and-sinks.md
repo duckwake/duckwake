@@ -89,7 +89,7 @@ A table with a primary key resolves conflicts on insert, whether from `INSERT`, 
 
 The docs found no tombstone retention. With `FORMAT UPSERT`, a NULL value deletes the key.
 
-**DuckWake (C2, PR #60):** `upsert_key` and `upsert_version` on the view:
+**DuckWake (C2, #60):** `upsert_key` and `upsert_version` on the view:
 - **Key:** from the message key (a JSON object field, or the whole key), else from the value.
 - **Version:** a message applies when its version is ≥ the row's. Equal versions go to the later message, as in
   RisingWave. NULL versions count lowest (RisingWave ignores a NULL version).
@@ -102,6 +102,19 @@ Not built:
 - composite version columns.
 
 Both are small additions to `UpsertSpec::newer`/`order`, and worth doing only on request.
+
+**DuckWake Debezium (C3, #62):** a source with `"format": "debezium"`; only the decode is new
+(`decode::debezium_sql`), the views are C2's upsert views:
+- **Envelope:** `schemas.enable`'s `{schema, payload}` unwrapped for both value and key.
+- **Ops:** `c`/`r`/`u` read `after`. `d` reads `before` and is staged as a tombstone, so a keyless delete still
+  finds its key. `t`, `m` and non-events are dead letters. `r` is a plain upsert, as in RisingWave.
+- **Encodings:** epoch numbers in `TIMESTAMP` (ms/µs/ns by size, like `guess_number_unit`) and `DATE` (days).
+  Decimals need `decimal.handling.mode=string`.
+- **TOAST:** `__debezium_unavailable_value` stops the view (`StopJob`); RisingWave rebuilds the value from the
+  table instead. That rebuild is the follow-up if users need it.
+- **No version from the envelope:** events apply in partition order; `upsert_version` on a row column if needed.
+- **Gates:** `FORMAT=debezium scripts/upsert_test.sh` and `scripts/debezium_e2e_test.sh` (PostgreSQL 16, Debezium
+  3.6.3, compose profile `debezium`).
 
 ## Shared sources
 
@@ -204,7 +217,6 @@ continuous `INSERT INTO`, left for later".
 | DuckWake item | From RisingWave |
 | --- | --- |
 | #49 Avro/Protobuf, keys and headers | option names, several registry URLs, TopicNameStrategy, `INCLUDE`-style opt-in metadata columns |
-| #42 Debezium topics (C3) | Debezium envelope handling (`r`/`c`/`u` as upserts, `d` as a delete by key, the `schema`/`payload` wrapper), `timestamptz.handling.mode`; not `ignore_key`, which breaks per-partition order. Reading `r` at the lowest version is DuckWake's own idea, not RisingWave's |
 | #44–#46 database CDC | managed slot and publication, chunked snapshot by key range, TOAST from own state, type table, lost-WAL error |
-| upsert follow-ups | composite version columns, `DO UPDATE IF NOT NULL` partial updates, only on request |
+| upsert and Debezium follow-ups | composite version columns, `DO UPDATE IF NOT NULL` partial updates, TOAST values rebuilt from the view's state; only on request |
 | several views into one table | `SINK INTO TABLE` with `ON CONFLICT`, if users ask for wide tables |

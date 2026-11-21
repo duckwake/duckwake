@@ -1,6 +1,6 @@
 # Feature map: RisingWave → DuckWake
 
-Status as of 2026-11-20 (main at `733eb37`, upsert views in PR #60). Issues are on `duckwake/duckwake` with the
+Status as of 2026-11-21 (main at `a3fce92`: upsert views #60, Debezium sources #62). Issues are on `duckwake/duckwake` with the
 `roadmap` label. When a row's status changes, update it here and in `docs/roadmap.md`.
 
 Legend:
@@ -41,6 +41,7 @@ Legend:
 | Emit on window close | built: windows always emit on close | |
 | Emit on update for windows | not planned | |
 | Watermarks (`WATERMARK FOR ... AS ...`) | built as source options `event_time`, `watermark_delay`, `idle_timeout` | |
+| Watermarks through MV on MV (a `Watermark` message in the stream) | differs: a view reads the upstream view's watermark from its checkpoint (`watermark_at`); a windowed view over lake inputs records it at least once a slide, even idle (#61) | `engine.rs` |
 | Late data | built: `late_data` table or counted and dropped | `ops/late_split.rs` |
 | Retractions into closed windows | planned C4 / #38 | `docs/design/cdc-sources.md` |
 | Windowed `min`/`max` over retracting input | planned #38 | |
@@ -62,9 +63,9 @@ Legend:
 | Kafka source, JSON | built (Arrow and SQL decode) | `kafka.rs`, `decode.rs` |
 | Avro, Protobuf, schema registry | planned #49 | |
 | `INCLUDE key/header/offset/partition/timestamp` | partly: staged `_partition`, `_offset`, `_key`; ad hoc `duckwake sql` shows them; columns in views planned #49 | |
-| `FORMAT UPSERT` table, version column | PR #60 (C2): `upsert_key`, `upsert_version` on the view | `ops/upsert.rs`, `scripts/upsert_test.sh` |
+| `FORMAT UPSERT` table, version column | built (C2, #60): `upsert_key`, `upsert_version` on the view | `ops/upsert.rs`, `scripts/upsert_test.sh` |
 | `DO UPDATE IF NOT NULL`, composite versions | not planned (on request) | |
-| `FORMAT DEBEZIUM` | planned C3 #42 | |
+| `FORMAT DEBEZIUM` | built (C3, #62): `"format": "debezium"` sources read by upsert views; `event_time` optional; TOAST placeholder stops the view (RisingWave rebuilds it from state) | `decode::debezium_sql`, `debezium_e2e_test.sh` |
 | PostgreSQL CDC (shared source, snapshot backfill) | planned D1 #44 (native, no Debezium) | `docs/design/database-cdc-sources.md` |
 | MySQL CDC | planned D3 #45 | |
 | CDC operations (state size, explain) | planned C5 #43 | |
@@ -89,17 +90,12 @@ Legend:
 
 ## Next borrowings, in roadmap order
 
-1. **#42 Debezium (C3).** Debezium's envelope over the upsert operator from C2 (key from the message key,
-   `before`/`after`/`op`). RisingWave's Debezium parser treats `r` like `c` (upsert) and `d` as a delete by key.
-   Reading the snapshot (`op = r`) at the lowest version is DuckWake's own plan (`cdc-sources.md`, after DBLog-
-   style backfill), not RisingWave's. A delete of an unknown key is ignored, as the engines compared in
-   `cdc-sources.md` do (that table dates from 2026-11-05).
-2. **#38 windows over updates and deletes.** Keep EOWC. Retractions into closed windows go to `late_data`
+1. **#38 windows over updates and deletes.** Keep EOWC. Retractions into closed windows go to `late_data`
    (C4). Windowed `min`/`max` get materialized-input state, as in RisingWave's `HashAgg`.
-3. **#31/#32 joins.** A symmetric hash join with DuckLake state per side, plus interval and window joins whose
+2. **#31/#32 joins.** A symmetric hash join with DuckLake state per side, plus interval and window joins whose
    state the watermark cleans. Refuse an unbounded join without a limit.
-4. **#35/#36 top-k and window functions.** Top-k first, with group-sorted state; then window functions in EOWC
+3. **#35/#36 top-k and window functions.** Top-k first, with group-sorted state; then window functions in EOWC
    mode.
-5. **#49 formats.** Avro and Protobuf with a registry, and opt-in `INCLUDE`-style metadata columns.
-6. **#44 PostgreSQL CDC.** Managed slot and publication, chunked snapshot by primary key, TOAST from the mirror,
+4. **#49 formats.** Avro and Protobuf with a registry, and opt-in `INCLUDE`-style metadata columns.
+5. **#44 PostgreSQL CDC.** Managed slot and publication, chunked snapshot by primary key, TOAST from the mirror,
    ADD and DROP COLUMN.

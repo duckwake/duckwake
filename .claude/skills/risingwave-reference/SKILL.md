@@ -75,8 +75,8 @@ recomputes it as a batch query to prove it exact. Scale-out is by view: leases, 
   (connector=...)` stores the rows. DuckWake's sources are like RisingWave's sources, and a DuckWake view's
   table is like a RisingWave MV that is also a plain table in the lake.
 - **Upsert and Debezium need a table in RisingWave.** An upsert stream cannot feed joins, aggregates or windows
-  directly; RisingWave materializes it first to find each update's old row. DuckWake's upsert views (C2) work
-  the same way: the view keeps the current rows, and aggregates go in a view that reads it.
+  directly; RisingWave materializes it first to find each update's old row. DuckWake's upsert views (C2) and Debezium
+  sources (C3) work the same way: the view keeps the current rows, and aggregates go in a view that reads it.
 - **RisingWave MVs cannot change their query in place.** You create a new MV, drop the old one and rename.
   Only `SINK INTO TABLE` with a version column changes logic without downtime. DuckWake's planned
   zero-downtime replace (#51) is the same build-beside-and-swap idea.
