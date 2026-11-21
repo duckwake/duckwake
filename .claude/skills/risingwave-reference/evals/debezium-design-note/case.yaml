@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: debezium-design-note
+expected_outcome: |
+  A design note that builds C3 on the C2 upsert operator, keeps the epoch transaction as the exactly-once mechanism, defines the batch query for verify, handles every Debezium op, proposes a CI gate, and compares with RisingWave with sources.

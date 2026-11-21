@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: backfill-comparison
+expected_outcome: |
+  A short, correct comparison of RisingWave's backfill strategies with DuckWake F3, noting their similarity and suggesting only small concrete improvements.

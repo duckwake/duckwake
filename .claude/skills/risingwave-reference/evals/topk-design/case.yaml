@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: topk-design
+expected_outcome: |
+  A top-k design that keeps state as a DuckLake table keyed by group and sort key, recomputes only touched groups each epoch, handles retractions inside the top k, outputs a Z-set into a keyed upsert sink, and has a batch definition for verify; RisingWave's approach is described with what is confirmed.
