@@ -1240,12 +1240,20 @@ impl Worker {
         }
         // Nothing new and no window can close: skip the commit instead of writing an empty snapshot. A view
         // with lake inputs sees its watermark move with every snapshot, its own commits' included, so for it
-        // only rows or a closing window count.
+        // only rows or a closing window count, and, for a windowed one, its watermark moving a whole slide past
+        // the one it last recorded: views windowing on its window_start or window_end read that recorded
+        // watermark, and would wait for it forever once its inputs go idle (it then has no window to close).
         // The end of a backfill is committed even without rows, and so is a lake position left behind for
         // `position_refresh`: maintenance keeps every snapshot from the oldest position on.
+        let slide_passed = |j: &JobRuntime, s: &Staged| match (&j.def.plan.window, j.watermark_us, s.watermark_us) {
+            (Some(w), Some(old), Some(new)) => new - old >= w.slide_us,
+            (Some(_), None, Some(_)) => true,
+            _ => false,
+        };
         let worth = |j: &JobRuntime, s: &Staged| {
             s.rows_in > 0
-                || (s.watermark_us != j.watermark_us && (j.def.lake_inputs.is_empty() || (j.def.plan.is_windowed() && s.closes)))
+                || (s.watermark_us != j.watermark_us
+                    && (j.def.lake_inputs.is_empty() || (j.def.plan.is_windowed() && (s.closes || slide_passed(j, s)))))
                 || s.inputs.iter().any(|i| i.backfill_done)
                 || (j.last_commit.unwrap_or(j.started).elapsed() >= cfg.position_refresh
                     && j.inputs.iter().zip(&s.inputs).any(|(i, si)| i.group().is_none() && si.offsets != i.offsets))

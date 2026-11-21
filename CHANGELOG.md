@@ -50,6 +50,11 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A windowed view over another windowed view's `window_start` or `window_end` could wait forever to close
+  a window once the upstream view's inputs went idle: the upstream view, with no window left to close, stopped
+  committing, so the watermark in its checkpoint, which the downstream view reads, stopped too. A windowed view
+  over lake inputs now also commits each time its watermark has moved a whole slide since it last recorded it,
+  at most once a slide while idle. Found by `chain_test.sh` on `main`; `chain_test.sh` now checks it every run.
 - The dead-letter query in the `DuckWakeDeadLetters` alert's docs named a column `_err`; it is `error`.
 
 - The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
