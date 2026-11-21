@@ -1242,7 +1242,8 @@ impl Worker {
         // with lake inputs sees its watermark move with every snapshot, its own commits' included, so for it
         // only rows or a closing window count, and, for a windowed one, its watermark moving a whole slide past
         // the one it last recorded: views windowing on its window_start or window_end read that recorded
-        // watermark, and would wait for it forever once its inputs go idle (it then has no window to close).
+        // watermark, and would wait for the next `position_refresh` once its inputs go idle (it then has no window
+        // to close).
         // The end of a backfill is committed even without rows, and so is a lake position left behind for
         // `position_refresh`: maintenance keeps every snapshot from the oldest position on.
         let slide_passed = |j: &JobRuntime, s: &Staged| match (&j.def.plan.window, j.watermark_us, s.watermark_us) {

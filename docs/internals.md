@@ -203,7 +203,8 @@ records the ones it took up.
      lake inputs commits only for new rows or a window that closes. A windowed one also commits when its
      watermark has moved a whole slide past the one its last checkpoint recorded: a view windowing on its
      `window_start` or `window_end` reads that recorded watermark (`watermark_at`), and without these commits
-     it waited forever once the upstream view had no window left to close. When the whole lake is idle no
+     it waited for the next `position_refresh` (5 minutes by default) once the upstream view had no window
+     left to close. When the whole lake is idle no
      snapshot comes, the watermark stands, and the last window stays open, as for an idle Kafka partition.
 11. **Lake inputs that retract (F2)** weigh each change: `insert` and `update_postimage` +1, `delete` and
    `update_preimage` -1, times `_duckwake_count` for a counted view's table. To cancel the row the view took
