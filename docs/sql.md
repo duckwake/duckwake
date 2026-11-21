@@ -11,7 +11,7 @@ something return `(view, result)` rows.
 
 | Task | Functions |
 | --- | --- |
-| [Sources](#sources) | `duckwake_create_source`, `duckwake_add_source_column`, `duckwake_sources` |
+| [Sources](#sources) | `duckwake_create_source`, `duckwake_add_source_column`, `duckwake_drop_source`, `duckwake_sources` |
 | [Views](#views) | `duckwake_create_view`, `duckwake_alter_view` |
 | [Running views](#running-views) | `duckwake_start`, `duckwake_pause`, `duckwake_stop`, `duckwake_reset`, `duckwake_drop` |
 | [Workers](#workers) | `duckwake_workers`, `duckwake_drain` |
@@ -21,7 +21,9 @@ something return `(view, result)` rows.
 
 ## Sources
 
-A source is a Kafka topic with a schema. It holds no data; it tells views how to read the topic.
+A source is a Kafka topic with a schema. It holds no data; it tells views how to read the topic. A
+[PostgreSQL source](#postgresql-sources) is different: it names tables of a database, and DuckWake keeps a
+copy of each in the lake.
 
 ```sql
 CALL duckwake_create_source('clicks', 'kafka', '{
@@ -32,8 +34,9 @@ CALL duckwake_create_source('clicks', 'kafka', '{
 
 | Function | Does |
 | --- | --- |
-| `duckwake_create_source(name, kind, options_json)` | Register a source. `kind` is `'kafka'`. |
+| `duckwake_create_source(name, kind, options_json)` | Register a source. `kind` is `'kafka'`, or `'postgres'` ([PostgreSQL sources](#postgresql-sources)). |
 | `duckwake_add_source_column(source, column, type)` | Add a column to a source while views read it. Views that already read the source keep their columns. |
+| `duckwake_drop_source(name)` | Drop a source no view reads. A PostgreSQL source goes with its mirror tables and its replication slot. |
 | `duckwake_sources()` | Every source with its options. |
 
 The options:
@@ -285,11 +288,92 @@ To try it locally, `docker compose --profile debezium up -d` adds a PostgreSQL w
 `localhost:8083`). `scripts/debezium_e2e_test.sh` registers a connector and reads its topics, and serves as a
 worked example.
 
+## PostgreSQL sources
+
+A source of kind `postgres` keeps a copy of tables of a PostgreSQL database in the lake, read from a logical
+replication slot, with no Kafka or Debezium in between:
+
+```sql
+CALL duckwake_create_source('shop', 'postgres', '{
+  "dsn": "host=db.internal dbname=shop user=duckwake", "password": "env:SHOP_PG_PASSWORD",
+  "tables": ["public.orders", "public.customers"]}');
+CALL duckwake_start('shop');
+```
+
+Each table gets a mirror table, `lake.shop.orders` and `lake.shop.customers`, with the same columns and one row
+per primary key. The source's ingest job, named like the source, first copies every table, then follows their
+changes: inserts, updates, deletes, primary key changes and `TRUNCATE`. Views read the mirror tables like any
+lake table, through their change feed ([views over lake tables](#views-over-lake-tables-and-other-views)):
+
+```sql
+CALL duckwake_create_view('analytics.orders_by_status',
+  'SELECT status, count(*) AS n, sum(amount) AS amount FROM shop.orders GROUP BY ALL');
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `dsn` | required | A libpq connection string, without the password and without `options`. |
+| `tables` | required | The tables to mirror; a name without a schema means `public`. |
+| `password` | none | `env:NAME` or `file:/path`, resolved by each process that connects; without it libpq's `PGPASSWORD` or `.pgpass` apply. |
+| `schema` | the source's name | The lake schema of the mirror tables. |
+| `slot`, `publication` | `duckwake_<name>` | Created when missing; an existing publication must publish the tables and inserts, updates, deletes and truncates. |
+| `epoch_interval` | `"2s"` | How often the job reads the slot. |
+| `max_changes` | `100000` | Most changes one epoch reads; a transaction is always read whole, so a larger one makes a larger epoch. |
+
+- **What the database needs.** `wal_level = logical`, PostgreSQL 13 or later, UTF8, and a role with the
+  `REPLICATION` attribute that can read the tables (and own them, when DuckWake creates the publication). Each
+  table needs a primary key, and `REPLICA IDENTITY` `DEFAULT` or `FULL`. Partitioned tables are refused: mirror
+  their partitions. `create_source` checks all this and creates the publication and the slot.
+- **Exactly once.** Each epoch applies whole transactions and writes the mirror rows and the slot position in one
+  DuckLake transaction; the slot is advanced only after that commit, so it is never ahead of the lake and a
+  restart resends nothing the mirrors lack. Transactions the slot sends again after a crash are skipped by their
+  position. The first epoch copies every table under one snapshot taken after the slot was created, and the
+  changes that snapshot already holds are skipped by transaction id.
+- **Large values.** An update leaves an unchanged TOASTed value out of the change; the job takes it from the
+  row's earlier version, so `REPLICA IDENTITY FULL` is not needed.
+- **Types.** Every value crosses as PostgreSQL's text form and is cast to the mirror column's type:
+
+  | PostgreSQL | Mirror |
+  | --- | --- |
+  | `smallint`, `integer`, `bigint`, `oid` | `SMALLINT`, `INTEGER`, `BIGINT`, `UINTEGER` |
+  | `real`, `double precision` | `FLOAT`, `DOUBLE` |
+  | `numeric(p,s)` with p up to 38 | `DECIMAL(p,s)` |
+  | `numeric` without precision, or wider | `DOUBLE` |
+  | `boolean`, `date`, `time`, `timestamp`, `timestamptz`, `uuid`, `bytea` | `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `UUID`, `BLOB` |
+  | `json`, `jsonb` | `JSON` |
+  | text types, and everything else (arrays, enums, `interval`, `timetz`, ranges, network types) | `VARCHAR`, holding PostgreSQL's text form |
+
+  A value that does not fit its column (a `numeric` `NaN` in a `DECIMAL`, a date before year 1) stops the job
+  with the table and the value.
+- **When the job stops** (status `failed`, the reason in the worker's log): the slot is gone, was invalidated, or
+  was advanced past the lake's position by something else, so changes are lost; or a table's columns changed
+  (schema changes are not applied yet). For the slot, `duckwake_reset('shop', 0)` empties the mirror tables, and
+  the next start takes a new snapshot; the views that read them take the deletes and the new rows through the
+  change feed. For a changed table, drop the source (and the views that read it) and create it again. Errors that
+  pass, such as the database restarting, are retried with backoff.
+- **Checking it.** `duckwake_verify('shop')` compares every mirror with its table as read now, under one
+  snapshot; while changes are in flight they show up as differences, so run it when writes have stopped.
+  `duckwake_checkpoints('shop')` shows each epoch's slot position (`source_offsets`, an LSN in bytes) and `lag`,
+  the bytes of WAL the server had flushed past it.
+- **WAL.** The database keeps every change after the slot's position, so a source that is stopped or failing
+  makes it keep WAL until its disk fills. Set `max_slot_wal_keep_size` on the server to bound that (the slot is
+  then invalidated, and the source needs a reset), and watch `duckwake_lag_events`, which for a PostgreSQL
+  source is bytes of WAL. An idle source moves its position every `--position-refresh` (5 minutes by default),
+  or sooner after 64 MB of WAL.
+- **Dropping it.** `duckwake_drop_source('shop')` is refused while views read a mirror table; stop the source
+  first. It drops the mirror tables, the slot and the publication if DuckWake created it. When the database
+  cannot be reached, the lake side is dropped anyway and the result says to drop the slot by hand.
+- **Size.** The first copy goes through memory (DuckDB spills past `--memory-limit`) and commits in one DuckLake
+  transaction; a table too large for that waits for the chunked backfill of
+  [D4](design/database-cdc-sources.md#milestones). Each epoch scans the mirror tables it deletes from, as an
+  upsert view scans its table.
+
 ## The same in the CLI
 
 | SQL function (server, extension) | CLI |
 | --- | --- |
-| `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
+| `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka\|postgres --options JSON` |
+| `duckwake_drop_source(name)` | `drop-source NAME` |
 | `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--upsert-key] [--upsert-version] [--if-exists fail\|update\|replace] [--replace]` |
 | `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |
 | `duckwake_alter_view(view, ...)` | `alter-view NAME [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows]` |

@@ -55,7 +55,8 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "kafka")]
         kind: String,
-        /// JSON: brokers, topic, event_time, columns, watermark_delay, idle_timeout, start
+        /// JSON. kafka: brokers, topic, event_time, columns, watermark_delay, idle_timeout, start. postgres: dsn,
+        /// tables, password, schema, slot, publication, epoch_interval, max_changes
         #[arg(long)]
         options: String,
     },
@@ -148,6 +149,8 @@ enum Cmd {
         #[arg(long)]
         keep_table: bool,
     },
+    /// duckwake_drop_source(name): a postgres source goes with its ingest job, mirror tables and slot.
+    DropSource { name: String },
     /// duckwake_jobs(): status, epoch, watermark, freshness, lag.
     Jobs,
     /// duckwake_workers(): every worker that ran on this lake, its state, views and last heartbeat.
@@ -327,7 +330,8 @@ pub struct WorkerArgs {
     #[arg(long, env = "DUCKWAKE_LEAN_COMMIT")]
     pub lean_commit: bool,
     /// A view over lake tables with nothing to write commits its position alone once it is this far behind
-    /// in time, so that idle views do not keep maintenance from expiring snapshots.
+    /// in time, so that idle views do not keep maintenance from expiring snapshots; an idle PostgreSQL source
+    /// does the same, so its slot lets the database's WAL go.
     #[arg(long, default_value = "5m", env = "DUCKWAKE_POSITION_REFRESH")]
     pub position_refresh: String,
 }
@@ -479,6 +483,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::Stop { name } => println!("{}", api::stop(&open()?, &name)?),
         Cmd::Reset { name, to_epoch } => println!("{}", api::reset(&open()?, &name, to_epoch)?),
         Cmd::Drop { name, keep_table } => println!("{}", api::drop(&open()?, &name, keep_table)?),
+        Cmd::DropSource { name } => println!("{}", api::drop_source(&open()?, &name)?),
         Cmd::Jobs => {
             let conn = open()?;
             match catalog::jobs_sql(&conn)? {
@@ -525,6 +530,13 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::Verify { name } => {
             let conn = open()?;
             let name = catalog::resolve_view(&conn, &name)?;
+            if let Some((ok, msg)) = api::verify_ingest(&conn, &name)? {
+                println!("{msg}");
+                if !ok {
+                    bail!("VERIFY FAILED for {name}");
+                }
+                return Ok(());
+            }
             let r = verify::verify(&conn, rt.handle(), &name)?;
             println!("{r:#?}");
             if !r.ok() {

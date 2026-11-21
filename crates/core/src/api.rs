@@ -62,6 +62,19 @@ pub fn if_exists(named: Option<&str>, replace: bool) -> Result<catalog::IfExists
 
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -> Result<String> {
     let opts: serde_json::Value = serde_json::from_str(options).map_err(|e| anyhow::anyhow!("options must be JSON: {e}"))?;
+    if kind == crate::pgsource::KIND {
+        let o = crate::pgsource::create(conn, name, &opts)?;
+        let mirrors: Vec<String> = o.tables.iter().map(|t| format!("{} -> {}", t.source_name(), t.mirror)).collect();
+        return Ok(format!(
+            "source {name}: {} (slot {}, publication {}); start {name} to take the snapshot and follow the changes",
+            mirrors.join(", "),
+            o.slot,
+            o.publication
+        ));
+    }
+    if kind != "kafka" {
+        anyhow::bail!("kind {kind:?}: expected 'kafka' or 'postgres'");
+    }
     let def = catalog::create_source(conn, name, kind, &opts)?;
     Ok(format!("source {} -> topic {} ({} columns)", def.name, def.options.topic, def.options.columns.len()))
 }
@@ -204,6 +217,11 @@ pub fn stop(conn: &Connection, name: &str) -> Result<String> {
 /// Rewinds a paused or stopped view to a checkpoint; starting it again replays from that checkpoint's offsets.
 pub fn reset(conn: &Connection, name: &str, to_epoch: i64) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
+    if catalog::ingest_source(conn, &job)?.is_some() {
+        let opts = catalog::load_postgres_source(conn, &job)?;
+        catalog::reset_postgres_source(conn, &job, &opts, to_epoch)?;
+        return Ok(format!("{job}: reset; its mirror tables are empty, and starting it takes a new snapshot"));
+    }
     let recomputed = catalog::reset(conn, &job, to_epoch)?;
     let also = if recomputed.is_empty() {
         String::new()
@@ -218,6 +236,25 @@ pub fn drop(conn: &Connection, name: &str, keep_table: bool) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
     catalog::drop_view(conn, &job, keep_table)?;
     Ok(format!("{job}: dropped{}", if keep_table { " (table kept)" } else { "" }))
+}
+
+/// `verify` of a PostgreSQL source's ingest job: its mirror tables against the source tables now. None for a view.
+pub fn verify_ingest(conn: &Connection, job: &str) -> Result<Option<(bool, String)>> {
+    if catalog::ingest_source(conn, job)?.is_none() {
+        return Ok(None);
+    }
+    let opts = catalog::load_postgres_source(conn, job)?;
+    crate::pgsource::verify(conn, job, &opts).map(Some)
+}
+
+/// Drops a source. A PostgreSQL source goes with its ingest job, mirror tables and replication slot.
+pub fn drop_source(conn: &Connection, name: &str) -> Result<String> {
+    if catalog::source_kind(conn, name)?.as_deref() == Some(crate::pgsource::KIND) {
+        let opts = catalog::load_postgres_source(conn, name)?;
+        return crate::pgsource::drop(conn, name, &opts);
+    }
+    catalog::drop_source(conn, name)?;
+    Ok(format!("source {name}: dropped"))
 }
 
 /// The query behind `duckwake_checkpoints(view)`: the newest `limit` checkpoints.

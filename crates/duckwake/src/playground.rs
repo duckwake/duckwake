@@ -391,7 +391,12 @@ async fn state(State(app): State<Shared>) -> ApiResult {
             let cols: Vec<String> = serde_json::from_value(r["columns"].clone())?;
             for row in r["rows"].as_array().unwrap() {
                 let mut v: serde_json::Map<String, Value> = cols.iter().cloned().zip(row.as_array().unwrap().iter().cloned()).collect();
-                let (def, _) = catalog::load_job(conn, v["job_id"].as_str().unwrap())?;
+                let id = v["job_id"].as_str().unwrap().to_string();
+                // A PostgreSQL source's ingest job is listed under its source, not as a view.
+                if catalog::ingest_source(conn, &id)?.is_some() {
+                    continue;
+                }
+                let (def, _) = catalog::load_job(conn, &id)?;
                 v.insert("sql".into(), json!(def.sql));
                 v.insert("sink".into(), json!(def.sink));
                 v.insert("late_data".into(), json!(def.late_data));
@@ -480,7 +485,7 @@ async fn create_source(State(app): State<Shared>, Json(r): Json<CreateSourceReq>
 
 async fn drop_source(State(app): State<Shared>, Path(name): Path<String>) -> ApiResult {
     with_conn(&app, move |app, conn| {
-        catalog::drop_source(conn, &name)?;
+        duckwake_core::api::drop_source(conn, &name)?;
         if let Some(g) = app.gens.lock().unwrap().remove(&name) {
             g.task.abort();
         }

@@ -196,7 +196,10 @@ pub fn readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &serde_json::Value) -> Result<SourceDef> {
     crate::lake::check_name("source", name)?;
     if kind != "kafka" {
-        bail!("only kind 'kafka' is supported (HTTP push and S3 polling come later)");
+        bail!("kind {kind:?}: create_source takes 'kafka' here; 'postgres' sources go through pgsource::create");
+    }
+    if source_kind(conn, name)?.is_some() {
+        bail!("source {name:?} already exists");
     }
     let options = SourceOptions::from_json(options)?;
     if load_sources(conn)?.contains_key(name) {
@@ -258,7 +261,7 @@ fn jobs_reading(conn: &Connection, source: &str) -> Result<Vec<(String, JobDef)>
     let mut out = Vec::new();
     for row in rows {
         let (job, def) = row?;
-        let def: JobDef = serde_json::from_str(&def)?;
+        let Some(def) = view_def(&def)? else { continue };
         if def.plan.sources().iter().any(|s| s == source) && !def.lake_inputs.iter().any(|l| l.name == source) {
             out.push((job, def));
         }
@@ -267,7 +270,8 @@ fn jobs_reading(conn: &Connection, source: &str) -> Result<Vec<(String, JobDef)>
 }
 
 pub fn load_sources(conn: &Connection) -> Result<HashMap<String, SourceDef>> {
-    let mut stmt = conn.prepare(&format!("SELECT name, kind, options::VARCHAR FROM {CTL}.sources"))?;
+    // PostgreSQL sources are not read in FROM: their mirror tables are (`pgsource`).
+    let mut stmt = conn.prepare(&format!("SELECT name, kind, options::VARCHAR FROM {CTL}.sources WHERE kind <> {}", lit(crate::pgsource::KIND)))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
     let mut out = HashMap::new();
     for row in rows {
@@ -301,7 +305,7 @@ pub fn resolve_view(conn: &Connection, name: &str) -> Result<String> {
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (job, def) = row?;
-        let def: JobDef = serde_json::from_str(&def)?;
+        let Some(def) = view_def(&def)? else { continue };
         let (_, s, t) = crate::lake::qualified_table(&def.sink)?;
         if s == schema && t == table {
             return Ok(job);
@@ -869,7 +873,146 @@ pub fn load_job(conn: &Connection, job: &str) -> Result<(JobDef, JobStatus)> {
             Ok((r.get(0)?, r.get(1)?))
         })
         .map_err(|_| anyhow!("no such view {job:?}"))?;
-    Ok((serde_json::from_str(&def)?, JobStatus::parse(&status)?))
+    let def = view_def(&def)?.ok_or_else(|| {
+        anyhow!("{job} is the ingest job of PostgreSQL source {job}, not a view: start, stop, pause and reset it, or drop-source it")
+    })?;
+    Ok((def, JobStatus::parse(&status)?))
+}
+
+/// The ingest job of a PostgreSQL source stores `{"ingest": <source>}` as its definition, not a view's.
+pub fn ingest_definition(source: &str) -> String {
+    serde_json::json!({ "ingest": source }).to_string()
+}
+
+/// A stored definition as a view's; None for an ingest job's.
+fn view_def(def: &str) -> Result<Option<JobDef>> {
+    let v: serde_json::Value = serde_json::from_str(def)?;
+    if v.get("ingest").is_some() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(v)?))
+}
+
+/// The source a job ingests, when it is a PostgreSQL source's ingest job.
+pub fn ingest_source(conn: &Connection, job: &str) -> Result<Option<String>> {
+    let def = crate::lake::query_opt_string(
+        conn,
+        &format!("SELECT (SELECT definition->>'ingest' FROM {CTL}.jobs WHERE job_id = {} LIMIT 1)", lit(job)),
+    )?;
+    Ok(def)
+}
+
+pub fn source_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
+    crate::lake::query_opt_string(conn, &format!("SELECT (SELECT kind FROM {CTL}.sources WHERE name = {} LIMIT 1)", lit(name)))
+}
+
+pub fn load_postgres_source(conn: &Connection, name: &str) -> Result<crate::pgsource::PgOptions> {
+    let opts = crate::lake::query_opt_string(
+        conn,
+        &format!("SELECT (SELECT options::VARCHAR FROM {CTL}.sources WHERE name = {} AND kind = {} LIMIT 1)", lit(name), lit(crate::pgsource::KIND)),
+    )?
+    .ok_or_else(|| anyhow!("no postgres source {name:?}"))?;
+    Ok(serde_json::from_str(&opts)?)
+}
+
+/// Registers a PostgreSQL source in one transaction: its mirror tables, the source and its ingest job, created
+/// stopped like a view.
+pub fn create_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions) -> Result<()> {
+    conn.execute_batch("BEGIN")?;
+    let res = (|| -> Result<()> {
+        conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&opts.schema)))?;
+        for t in &opts.tables {
+            let cols: Vec<String> = t.columns.iter().map(|c| format!("{} {}", ident(&c.name), c.duck_type)).collect();
+            conn.execute_batch(&format!("CREATE TABLE {} ({})", quote_table(&t.mirror)?, cols.join(", ")))?;
+        }
+        conn.execute(
+            &format!("INSERT INTO {CTL}.sources VALUES (?, ?, ?, now())"),
+            [name, crate::pgsource::KIND, &serde_json::to_string(opts)?],
+        )?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE {lt} (owner_worker VARCHAR, lease_epoch BIGINT, last_epoch BIGINT);
+             INSERT INTO {lt} VALUES (NULL, 0, 0);",
+            lt = lease_table(name)
+        ))?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {CTL}.jobs (job_id, definition, version, status, created_at, updated_at)
+                 VALUES (?, ?, 1, 'created', now(), now())"
+            ),
+            [name, &ingest_definition(name)],
+        )?;
+        Ok(())
+    })();
+    finish(conn, res)
+}
+
+/// Removes a PostgreSQL source, its ingest job and its mirror tables in one transaction.
+pub fn drop_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions) -> Result<()> {
+    retry_conflicts(|| {
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            for t in ["jobs", "checkpoints", "dead_letter"] {
+                conn.execute(&format!("DELETE FROM {CTL}.{t} WHERE job_id = ?"), [name])?;
+            }
+            conn.execute(&format!("DELETE FROM {CTL}.sources WHERE name = ?"), [name])?;
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", lease_table(name)))?;
+            for t in &opts.tables {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_table(&t.mirror)?))?;
+            }
+            Ok(())
+        })();
+        finish(conn, res)
+    })
+}
+
+/// Starts a stopped PostgreSQL source over: its checkpoints and its mirror tables' rows go, in one transaction,
+/// and its next start takes a new snapshot. The views that read the mirrors take the deletes and then the new
+/// rows through the change feed.
+pub fn reset_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions, to_epoch: i64) -> Result<()> {
+    if job_status(conn, name)? == Some(JobStatus::Running) {
+        bail!("pause or stop {name:?} before reset");
+    }
+    if to_epoch != 0 {
+        bail!("a postgres source resets to epoch 0 only: its mirror tables start over from a new snapshot");
+    }
+    retry_conflicts(|| {
+        conn.execute_batch("BEGIN")?;
+        let res = (|| -> Result<()> {
+            conn.execute(&format!("DELETE FROM {CTL}.checkpoints WHERE job_id = ?"), [name])?;
+            for t in &opts.tables {
+                conn.execute_batch(&format!("DELETE FROM {}", quote_table(&t.mirror)?))?;
+            }
+            Ok(())
+        })();
+        finish(conn, res)
+    })
+}
+
+/// The views that read any of `tables` (`lake.schema.table`): through the change feed, or as lookups.
+pub fn views_reading_tables(conn: &Connection, tables: &[String]) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs ORDER BY job_id"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let norm = |t: &str| crate::lake::qualified_table(t).map(|(c, s, t)| format!("{c}.{s}.{t}")).unwrap_or_else(|_| t.to_string());
+    let wanted: Vec<String> = tables.iter().map(|t| norm(t)).collect();
+    let mut out = Vec::new();
+    for row in rows {
+        let (job, def) = row?;
+        let Some(def) = view_def(&def)? else { continue };
+        let reads = def.lake_inputs.iter().map(|l| norm(&l.table)).chain(def.plan.query.lookups.iter().chain(def.plan.union.iter().flat_map(|b| b.query.lookups.iter())).map(|l| norm(l)));
+        if reads.into_iter().any(|t| wanted.contains(&t)) {
+            out.push(job);
+        }
+    }
+    Ok(out)
+}
+
+pub fn lake_table_exists(conn: &Connection, schema: &str, table: &str) -> Result<bool> {
+    table_exists(conn, schema, table)
+}
+
+/// DuckLake inlining for a table this module did not create as a view's sink (a mirror table).
+pub fn set_table_inlining(conn: &Connection, schema: &str, table: &str, rows: usize) -> Result<()> {
+    set_inlining(conn, schema, table, rows)
 }
 
 /// A running view and where it runs.
@@ -1352,13 +1495,16 @@ fn drop_view_once(conn: &Connection, job: &str, def: &JobDef, keep_table: bool) 
     finish(conn, res)
 }
 
-/// Removes a source no view reads from.
+/// Removes a source no view reads from. A PostgreSQL source goes through `pgsource::drop` (`api::drop_source`).
 pub fn drop_source(conn: &Connection, name: &str) -> Result<()> {
+    if source_kind(conn, name)?.as_deref() == Some(crate::pgsource::KIND) {
+        bail!("{name:?} is a postgres source: drop it with drop-source (duckwake_drop_source), which also drops its slot");
+    }
     let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs"))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (job, def) = row?;
-        let def: JobDef = serde_json::from_str(&def)?;
+        let Some(def) = view_def(&def)? else { continue };
         if def.plan.sources().iter().any(|s| s == name) {
             bail!("view {job:?} reads from {name:?}; drop it first");
         }

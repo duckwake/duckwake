@@ -341,7 +341,7 @@ struct CommitTiming {
 ///   `DUCKWAKE_CRASH_PROB` (default 1.0), to hit every step of the epoch.
 /// - `DUCKWAKE_PAUSE_AT=<point>`: sleep `DUCKWAKE_PAUSE_SECS` there once, after skipping the first `DUCKWAKE_PAUSE_SKIP`
 ///   hits, like a long GC pause; with the commit transaction open this turns the worker into a zombie.
-fn crash_point(point: &str) {
+pub(crate) fn crash_point(point: &str) {
     static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let skip: u64 = std::env::var("DUCKWAKE_PAUSE_SKIP").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     if std::env::var("DUCKWAKE_PAUSE_AT").is_ok_and(|p| p == point) && HITS.fetch_add(1, Ordering::Relaxed) == skip {
@@ -492,6 +492,7 @@ fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Resul
         conns,
         committer,
         jobs: BTreeMap::new(),
+        ingests: BTreeMap::new(),
         groups: BTreeMap::new(),
         next_group: 0,
         rounds: 0,
@@ -538,6 +539,8 @@ struct Worker {
     conns: Vec<Connection>,
     committer: Committer,
     jobs: BTreeMap<String, JobRuntime>,
+    /// PostgreSQL sources' ingest jobs, each on its own thread (`ingest`).
+    ingests: BTreeMap<String, crate::ingest::Handle>,
     groups: BTreeMap<u64, Group>,
     next_group: u64,
     /// Epochs handed to the commit so far; the one staged next stages into table set `(rounds + 1) % 2`.
@@ -567,6 +570,15 @@ fn heartbeat_every(lease_timeout: Option<Duration>) -> Duration {
     lease_timeout.map_or(Duration::from_secs(5), |t| (t / 5).clamp(Duration::from_millis(500), Duration::from_secs(5)))
 }
 
+impl Drop for Worker {
+    /// A worker that fails is built again; its ingest threads end with it (their leases are fenced anyway).
+    fn drop(&mut self) {
+        for h in self.ingests.values() {
+            h.stop();
+        }
+    }
+}
+
 impl Worker {
     fn run(&mut self, shutdown: &AtomicBool) -> Result<()> {
         let mut last_refresh = Instant::now() - self.cfg.refresh_every;
@@ -582,7 +594,7 @@ impl Worker {
                 let cooldown = self.cfg.rebalance.map_or(Duration::ZERO, |r| r.cooldown);
                 let cooling: Vec<String> =
                     self.jobs.iter().filter(|(_, j)| j.started.elapsed() < cooldown).map(|(id, _)| id.clone()).collect();
-                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len(), &costs, &cooling)?;
+                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len() + self.ingests.len(), &costs, &cooling)?;
                 self.liveness.beat();
                 self.last_heartbeat = Instant::now();
             }
@@ -591,6 +603,7 @@ impl Worker {
                 self.check_limits()?;
                 last_refresh = Instant::now();
             }
+            self.check_ingests()?;
             if self.jobs.is_empty() {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
@@ -635,11 +648,40 @@ impl Worker {
                 maint.run_due(&self.conns[0], &self.jobs.keys().cloned().collect::<Vec<_>>());
             }
         }
-        // Let the epoch in flight land.
+        // Let the epoch in flight land, and the ingest jobs finish theirs.
         if let Some(c) = self.committer.finish()? {
             self.apply(c);
         }
+        for (_, h) in std::mem::take(&mut self.ingests) {
+            h.join();
+        }
         Ok(())
+    }
+
+    /// Marks failed the ingest jobs whose source broke a rule the mirror relies on, and lets go of those whose
+    /// thread ended (its lease moved: the next refresh sees it).
+    fn check_ingests(&mut self) -> Result<()> {
+        let failed: Vec<(String, String)> = self.ingests.iter().filter_map(|(id, h)| h.failure().map(|why| (id.clone(), why))).collect();
+        for (id, why) in failed {
+            self.fail_job(&id, &why)?;
+        }
+        self.ingests.retain(|_, h| !h.finished());
+        Ok(())
+    }
+
+    /// Starts a PostgreSQL source's ingest job on its own thread and connection. False when it is not ours.
+    fn start_ingest(&mut self, id: &str) -> Result<bool> {
+        let conn = &self.conns[0];
+        let opts = catalog::load_postgres_source(conn, id)?;
+        let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
+        let settings = crate::ingest::Settings {
+            worker: self.cfg.worker_id.clone(),
+            position_refresh: self.cfg.position_refresh,
+            metrics: self.cfg.metrics.clone(),
+        };
+        let h = crate::ingest::Handle::spawn(crate::lake::connect_again(conn)?, settings, id.to_string(), lease, opts);
+        self.ingests.insert(id.to_string(), h);
+        Ok(true)
     }
 
     /// The snapshots each view with lake inputs holds, from its position to the lake's newest: for the views
@@ -737,7 +779,7 @@ impl Worker {
     /// lease has moved on (reset, replaced, stopped or taken over while this epoch staged), is only let go: the
     /// error belongs to the run that was fenced, and a dropped view has nothing to mark.
     fn fail_job(&mut self, id: &str, why: &str) -> Result<()> {
-        let held = self.jobs.get(id).map(|j| j.lease);
+        let held = self.jobs.get(id).map(|j| j.lease).or(self.ingests.get(id).map(|h| h.lease));
         let failed = catalog::fail_if_held(&self.conns[0], id, &self.cfg.worker_id, held)?;
         if failed {
             warn!(job = %id, error = %why, "view stopped: marking it failed");
@@ -769,13 +811,19 @@ impl Worker {
             .filter(|j| j.owner.as_deref() == Some(self.cfg.worker_id.as_str()))
             .map(|j| (j.id, j.lease))
             .collect();
-        let released: Vec<String> =
-            self.jobs.iter().filter(|(id, j)| mine.get(*id) != Some(&j.lease)).map(|(id, _)| id.clone()).collect();
+        let released: Vec<String> = self
+            .jobs
+            .iter()
+            .map(|(id, j)| (id, j.lease))
+            .chain(self.ingests.iter().map(|(id, h)| (id, h.lease)))
+            .filter(|(id, lease)| mine.get(*id) != Some(lease))
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in released {
             info!(job = %id, "job released (paused, stopped or reassigned)");
             self.remove_job(&id);
         }
-        let new: Vec<String> = mine.keys().filter(|id| !self.jobs.contains_key(*id)).cloned().collect();
+        let new: Vec<String> = mine.keys().filter(|id| !self.jobs.contains_key(*id) && !self.ingests.contains_key(*id)).cloned().collect();
         // A job coming back reads its checkpoint, so its previous run's last commit must have landed first.
         if new.iter().any(|id| self.committer.includes(id)) {
             if let Some(c) = self.committer.finish()? {
@@ -784,7 +832,11 @@ impl Worker {
         }
         self.waiting.retain(|id| mine.contains_key(id));
         for id in new {
-            match self.start_job(&id) {
+            let started = match catalog::ingest_source(&self.conns[0], &id)? {
+                Some(_) => self.start_ingest(&id),
+                None => self.start_job(&id),
+            };
+            match started {
                 Ok(_) => {
                     if self.waiting.remove(&id) {
                         info!(job = %id, "topic is there now; job started");
@@ -1055,6 +1107,14 @@ impl Worker {
     }
 
     fn remove_job(&mut self, id: &str) {
+        if let Some(h) = self.ingests.remove(id) {
+            // Its thread finishes the epoch in hand, which the moved lease fences, and ends.
+            h.stop();
+            if let Some(m) = &self.cfg.metrics {
+                m.forget(id);
+            }
+            return;
+        }
         let Some(j) = self.jobs.remove(id) else { return };
         if let Some(m) = &self.cfg.metrics {
             m.forget(id);
