@@ -11,6 +11,13 @@
 # engine's: one row per order, the best of its messages after its last tombstone.
 # Then a reset rewinds the versioned view a few epochs; it and its reader replay to the same tables.
 # WORKER_FLAGS="--pipeline ..." runs it pipelined.
+#
+# FORMAT=debezium runs the same over Debezium change events (C3): the source has format 'debezium' and no
+# event_time, the producer writes snapshot reads, inserts, updates and deletes (a `d` event, then a tombstone;
+# some without a message key), every fourth event and key wrapped as with schemas.enable, and the timestamps
+# as epoch microseconds. At the end one event carries Debezium's placeholder for a value it left out, and the
+# views reading it must stop with an error that says how to fix the table.
+FORMAT=${FORMAT:-json}
 TOPIC=${TOPIC:-orders}
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-2s}; KEYS=${KEYS:-3000}
@@ -55,9 +62,15 @@ expected() {
 LATEST=$(expected "o DESC")
 VERSIONED=$(expected "ver DESC NULLS LAST, o DESC")
 
+case $FORMAT in
+  json) FORMAT_OPTIONS='"event_time":"ts",'; PRODUCE_FLAGS=() ;;
+  debezium) FORMAT_OPTIONS='"format":"debezium",'; PRODUCE_FLAGS=(--debezium) ;;
+  *) echo "FORMAT must be json or debezium"; exit 1 ;;
+esac
+
 log "reset lake and topic"; reset_env
-log "create the source and the views"
-"$BIN" create-source orders --options "{$KAFKA,\"topic\":\"$TOPIC\",\"event_time\":\"ts\",
+log "create the source ($FORMAT) and the views"
+"$BIN" create-source orders --options "{$KAFKA,\"topic\":\"$TOPIC\",$FORMAT_OPTIONS
   \"watermark_delay\":\"5 seconds\",\"idle_timeout\":\"30 seconds\",\"decode\":\"${DECODE:-auto}\",
   \"columns\":{\"ts\":\"TIMESTAMP\",\"order_id\":\"BIGINT\",\"status\":\"VARCHAR\",\"amount\":\"DECIMAL(18,2)\",\"ver\":\"BIGINT\"}}"
 create() { "$BIN" create-view "analytics.$1" --epoch-interval "$EPOCH" "${@:2}" | sed -n 1p; }
@@ -82,10 +95,15 @@ refused() {
 refused "aggregates and DISTINCT go in another view" --upsert-key order_id --sql "SELECT status, count(*) AS n FROM orders GROUP BY status"
 refused "select the upsert_key column" --upsert-key order_id --sql "SELECT status, amount FROM orders"
 refused "upsert_version needs upsert_key" --upsert-version ver --sql "SELECT order_id, status FROM orders"
+if [[ $FORMAT == debezium ]]; then
+  refused "set upsert_key to the table's primary key" --sql "SELECT order_id, status FROM orders"
+  refused "orders has no event_time, so no window can read it" --upsert-key order_id \
+    --sql "SELECT window_start, count(*) AS n FROM TUMBLE(orders, ts, INTERVAL 1 MINUTE) GROUP BY ALL"
+fi
 
 log "produce $((RATE * DURATION)) order updates over $KEYS orders at $RATE/s (every 13th a tombstone, every 17th twice, every 7th stale)"
 "$BIN" produce --topic "$TOPIC" --partitions "$PARTITIONS" --rate "$RATE" --count $((RATE * DURATION)) \
-  --keys "$KEYS" --delete-every 13 --repeat-every 17 --stale-every 7 >"$OUT/producer.log" 2>&1 &
+  --keys "$KEYS" --delete-every 13 --repeat-every 17 --stale-every 7 "${PRODUCE_FLAGS[@]}" >"$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 
 for i in $(seq 1 "$KILLS"); do
@@ -161,4 +179,21 @@ kill -TERM "$pid"; wait "$pid" || true
 verify_views || failed=1
 check_topic
 
-[[ $failed == 0 ]] && echo "UPSERT TEST PASSED" || { echo "UPSERT TEST FAILED"; exit 1; }
+if [[ $FORMAT == debezium ]]; then
+  log "an event with a value Debezium left out stops the views that read it"
+  # A TOASTed column PostgreSQL did not send (REPLICA IDENTITY DEFAULT): the row cannot be rebuilt.
+  echo '{"before": null, "after": {"ts": 1763712345123456, "order_id": 1, "status": "__debezium_unavailable_value", "amount": "1.00", "ver": 999999999}, "op": "u"}' |
+    docker compose exec -T redpanda rpk topic produce "$TOPIC" -k '{"order_id": 1}' >/dev/null
+  "$BIN" run $WORKER_FLAGS --worker w1 >>"$OUT/worker.log" 2>&1 &
+  pid=$!
+  status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
+  for _ in $(seq 1 30); do [[ $(status orders_latest) == failed ]] && break; sleep 1; done
+  for v in "${UPSERTS[@]}"; do
+    [[ $(status "$v") == failed ]] && echo "$v: failed, as it must" || { echo "$v is $(status "$v"), not failed"; failed=1; }
+  done
+  grep -q "Set REPLICA IDENTITY FULL on the table" "$OUT/worker.log" && grep -m1 -o "source orders: the Debezium event.*left out" "$OUT/worker.log" ||
+    { echo "the error does not say what to fix"; failed=1; }
+  kill -TERM "$pid"; wait "$pid" || true
+fi
+
+[[ $failed == 0 ]] && echo "UPSERT TEST PASSED ($FORMAT)" || { echo "UPSERT TEST FAILED ($FORMAT)"; exit 1; }

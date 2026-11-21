@@ -197,6 +197,8 @@ struct SourceStaged {
     rows_dead: i64,
     /// Of `rows_dead`, the tombstones: an upsert view reads them as deletes, not dead letters.
     rows_tombstones: i64,
+    /// Debezium events carrying `decode::UNAVAILABLE`: how many, and the first one's partition and offset.
+    unavailable: Option<(i64, i32, i64)>,
     stage_ms: u128,
 }
 
@@ -1448,13 +1450,32 @@ fn stage_source(
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    let et = ident(&source.options.event_time);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT _partition, epoch_us(max({et})) FROM {typed} WHERE _err IS NULL GROUP BY ALL"
-    ))?;
-    let part_max = stmt
-        .query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<duckdb::Result<Vec<_>>>()?;
+    let unavailable = if source.options.is_debezium() {
+        let (n, p, o): (i64, Option<i32>, Option<i64>) = conn.query_row(
+            &format!(
+                "SELECT count(*), arg_min(_partition, (_partition, _offset)), arg_min(_offset, (_partition, _offset))
+                   FROM {dead} WHERE _err = {}",
+                lit(crate::decode::UNAVAILABLE_ERR)
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        (n > 0).then(|| (n, p.unwrap_or(0), o.unwrap_or(0)))
+    } else {
+        None
+    };
+    // Without an event time (a Debezium source may have none) no partition has a newest event time, and the
+    // source has no watermark: its views have no windows to close.
+    let part_max = match &source.options.event_time {
+        Some(et) => conn
+            .prepare(&format!(
+                "SELECT _partition, epoch_us(max({})) FROM {typed} WHERE _err IS NULL GROUP BY ALL",
+                ident(et)
+            ))?
+            .query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<duckdb::Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
     let active: BTreeSet<i32> = chunks.iter().map(|c| c.partition).collect();
     Ok(SourceStaged {
         typed,
@@ -1467,6 +1488,7 @@ fn stage_source(
         bisections: chunks.iter().map(|c| c.bisections).sum(),
         rows_dead,
         rows_tombstones,
+        unavailable,
         stage_ms: t.elapsed().as_millis(),
     })
 }
@@ -1508,6 +1530,7 @@ fn stage_lake(
         bisections: 0,
         rows_dead: 0,
         rows_tombstones: 0,
+        unavailable: None,
         stage_ms: t.elapsed().as_millis(),
     };
     if to <= from {
@@ -1711,6 +1734,7 @@ fn stage_backfill(
         bisections: 0,
         rows_dead: 0,
         rows_tombstones: 0,
+        unavailable: None,
         stage_ms: t.elapsed().as_millis(),
     })
 }
@@ -1731,6 +1755,22 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
     let t = Instant::now();
     let def = j.def.clone();
     let plan = &def.plan;
+
+    // A Debezium event with a value Debezium left out cannot be applied: the view stops rather than keep a row
+    // that is not the table's.
+    for (input, src) in j.inputs.iter().zip(kafka) {
+        if let Some((n, p, o)) = src.and_then(|s| s.unavailable) {
+            return Err(StopJob(format!(
+                "source {}: the Debezium event at partition {p}, offset {o} ({n} in this epoch) has a column Debezium \
+                 left out ({}: an unchanged TOASTed value of a PostgreSQL table without REPLICA IDENTITY FULL), so \
+                 its row cannot be rebuilt. Set REPLICA IDENTITY FULL on the table, take a new Debezium snapshot of \
+                 it, and replace the view",
+                input.name,
+                crate::decode::UNAVAILABLE
+            ))
+            .into());
+        }
+    }
 
     // Lake inputs, read to one snapshot S for all of them: a transaction that changed two of their tables
     // upstream is seen whole or not at all.

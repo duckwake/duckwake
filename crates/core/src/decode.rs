@@ -29,6 +29,13 @@ pub const INVALID_JSON: &str = "invalid json";
 
 pub use duckwake_circuit::sql::TOMBSTONE;
 
+/// What Debezium writes for a column it did not read: an unchanged TOASTed value of a PostgreSQL table without
+/// `REPLICA IDENTITY FULL`. Binary columns get it base64-encoded, arrays as their one element.
+pub const UNAVAILABLE: &str = "__debezium_unavailable_value";
+const UNAVAILABLE_BASE64: &str = "X19kZWJleml1bV91bmF2YWlsYWJsZV92YWx1ZQ==";
+/// `_err` of a Debezium event that carries `UNAVAILABLE`: its row cannot be rebuilt, and the view stops.
+pub const UNAVAILABLE_ERR: &str = "unavailable value";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
     Timestamp,
@@ -327,9 +334,9 @@ impl ArrowDecoder {
             columns.push(Column { name: name.clone(), kind });
             fields.push(Field::new(name, dt, true));
         }
-        let Some(event_time) = columns.iter().position(|c| c.name == opts.event_time) else {
-            bail!("event_time {:?} is not a column", opts.event_time)
-        };
+        // Debezium's envelope nests the row, and a source without an event time has nothing to check here.
+        let Some(et) = opts.event_time.as_deref().filter(|_| !opts.is_debezium()) else { return Ok(None) };
+        let Some(event_time) = columns.iter().position(|c| c.name == et) else { bail!("event_time {et:?} is not a column") };
         let mut out = vec![
             Field::new("_partition", DataType::Int32, false),
             Field::new("_offset", DataType::Int64, false),
@@ -470,6 +477,9 @@ pub const IS_JSON_OBJECT: &str = "CASE WHEN json_valid(payload) THEN json_type(p
 /// Builds the decode query for raw Kafka rows `(_partition, _offset, payload, _key)` already known to be JSON
 /// objects. Adds the typed source columns and `_err` (NULL when the row is usable).
 pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
+    if src.options.is_debezium() {
+        return debezium_sql(src, ok_table);
+    }
     let o = &src.options;
     let field = |c: &str| format!("json_extract_string(payload, {})", lit(&format!("$.\"{c}\"")));
     let cols: Vec<String> = o
@@ -477,11 +487,10 @@ pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
         .iter()
         .map(|(c, t)| format!("TRY_CAST({} AS {t}) AS {}", field(c), ident(c)))
         .collect();
-    let mut checks = vec![format!(
-        "WHEN TRY_CAST({} AS TIMESTAMP) IS NULL THEN 'missing or invalid event time {}'",
-        field(&o.event_time),
-        o.event_time
-    )];
+    let mut checks = Vec::new();
+    if let Some(et) = &o.event_time {
+        checks.push(format!("WHEN TRY_CAST({} AS TIMESTAMP) IS NULL THEN 'missing or invalid event time {et}'", field(et)));
+    }
     for (c, t) in &o.columns {
         checks.push(format!(
             "WHEN {f} IS NOT NULL AND TRY_CAST({f} AS {t}) IS NULL THEN {}",
@@ -496,12 +505,95 @@ pub fn decode_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
     )
 }
 
+/// The message key of a raw row as the source's views read it: `_key`, or for Debezium its payload.
+pub fn key_sql(src: &crate::model::SourceDef) -> &'static str {
+    if src.options.is_debezium() { debezium_key() } else { "_key" }
+}
+
+/// A message key as the upsert reads it: Debezium's key with `schemas.enable` is `{"schema": ..., "payload":
+/// {"id": 1}}`, and the key is its payload. `json_type` raises on text that is not JSON, hence the nested CASE.
+fn debezium_key() -> &'static str {
+    "CASE WHEN json_valid(_key) THEN CASE WHEN json_type(_key) = 'OBJECT' AND json_exists(_key, '$.schema') \
+       AND json_type(_key, '$.payload') = 'OBJECT' THEN json_extract(_key, '$.payload')::VARCHAR ELSE _key END \
+     ELSE _key END"
+}
+
+/// A Debezium field `f` (text) as DuckDB type `t`. Debezium sends `timestamp` columns as numbers
+/// (`Timestamp` ms, `MicroTimestamp` µs, `NanoTimestamp` ns by `time.precision.mode`) and `date` ones as days
+/// since 1970-01-01; a number is read in the unit its size fits, as RisingWave does: right for 1973 to 5138.
+/// Text (`ZonedTimestamp`, or `decimal.handling.mode=string`) casts as usual.
+fn debezium_cast(f: &str, t: &str) -> String {
+    let n = format!("TRY_CAST({f} AS BIGINT)");
+    let upper = t.trim().to_ascii_uppercase();
+    if upper == "TIMESTAMP" || upper == "DATETIME" {
+        format!(
+            "CASE WHEN regexp_full_match({f}, '-?[0-9]+') THEN make_timestamp(CASE WHEN abs({n}) < 100000000000000 \
+             THEN {n} * 1000 WHEN abs({n}) < 100000000000000000 THEN {n} ELSE {n} // 1000 END) ELSE TRY_CAST({f} AS {t}) END"
+        )
+    } else if upper == "DATE" {
+        format!("CASE WHEN regexp_full_match({f}, '-?[0-9]+') THEN DATE '1970-01-01' + {n}::INTEGER ELSE TRY_CAST({f} AS {t}) END")
+    } else {
+        format!("TRY_CAST({f} AS {t})")
+    }
+}
+
+/// The decode of Debezium change events. The envelope (`schema`/`payload` when `schemas.enable` is on) holds
+/// `op` and the row: `c` (insert), `r` (snapshot read) and `u` (update) carry it in `after` and are upserts;
+/// `d` (delete) carries the old row in `before`, staged as a `TOMBSTONE` with it so a delete without a message
+/// key still finds its key. `before` is never the row to retract: the view's own state is. Anything else (`t`
+/// truncate, `m` message, a value that is not a change event) is a dead letter that names it, and an event
+/// carrying `UNAVAILABLE` is staged as `UNAVAILABLE_ERR`, which stops its views.
+fn debezium_sql(src: &crate::model::SourceDef, ok_table: &str) -> String {
+    let o = &src.options;
+    let field = |c: &str| format!("json_extract_string(__row, {})", lit(&format!("$.\"{c}\"")));
+    let cols: Vec<String> =
+        o.columns.iter().map(|(c, t)| format!("{} AS {}", debezium_cast(&field(c), t), ident(c))).collect();
+    let unavailable: Vec<String> = o
+        .columns
+        .iter()
+        .map(|(c, _)| format!("contains({f}, {}) OR {f} = {}", lit(UNAVAILABLE), lit(UNAVAILABLE_BASE64), f = field(c)))
+        .collect();
+    let mut checks = vec![
+        "WHEN __op IS NULL THEN 'not a Debezium change event: no op'".to_string(),
+        "WHEN __op NOT IN ('c', 'r', 'u', 'd') THEN 'Debezium operation ' || __op || ' is not applied'".to_string(),
+        format!("WHEN __op = 'd' THEN {}", lit(TOMBSTONE)),
+        "WHEN __row IS NULL OR json_type(__row) <> 'OBJECT' THEN 'Debezium event without an after row'".to_string(),
+        format!("WHEN {} THEN {}", unavailable.join(" OR "), lit(UNAVAILABLE_ERR)),
+    ];
+    if let Some(et) = &o.event_time {
+        checks.push(format!(
+            "WHEN {} IS NULL THEN 'missing or invalid event time {et}'",
+            debezium_cast(&field(et), "TIMESTAMP")
+        ));
+    }
+    for (c, t) in &o.columns {
+        checks.push(format!(
+            "WHEN {f} IS NOT NULL AND {} IS NULL THEN {}",
+            debezium_cast(&field(c), t),
+            lit(&format!("type conflict: {c} is not {t}")),
+            f = field(c)
+        ));
+    }
+    let envelope = "CASE WHEN json_exists(payload, '$.schema') AND json_type(payload, '$.payload') = 'OBJECT' \
+                    THEN json_extract(payload, '$.payload') ELSE payload::JSON END";
+    format!(
+        "SELECT _partition, _offset, payload, _key, {}, CASE {} ELSE NULL END AS _err FROM (
+           SELECT *, CASE WHEN __op = 'd' THEN json_extract(__e, '$.before') ELSE json_extract(__e, '$.after') END AS __row
+           FROM (SELECT *, json_extract_string(__e, '$.op') AS __op FROM (
+             SELECT _partition, _offset, payload, {} AS _key, {envelope} AS __e FROM {ok_table})))",
+        cols.join(", "),
+        checks.join(" "),
+        debezium_key()
+    )
+}
+
 /// The raw Kafka rows `(_partition, _offset, payload, _key)` without a value (tombstones), shaped like
 /// `decode_sql`'s rows with `_err` = `TOMBSTONE` and the columns NULL.
 pub fn tombstones_sql(src: &crate::model::SourceDef, raw_table: &str) -> String {
     let nulls: Vec<String> = src.options.columns.iter().map(|(c, t)| format!("NULL::{t} AS {}", ident(c))).collect();
+    let key = key_sql(src);
     format!(
-        "SELECT _partition, _offset, payload, _key, {}, {} AS _err FROM {raw_table} WHERE payload IS NULL",
+        "SELECT _partition, _offset, payload, {key} AS _key, {}, {} AS _err FROM {raw_table} WHERE payload IS NULL",
         nulls.join(", "),
         lit(TOMBSTONE)
     )
@@ -548,6 +640,76 @@ mod tests {
         );
         let dead = format!("SELECT _offset, NULL::BIGINT, _key, payload FROM raw WHERE {} ORDER BY _offset", invalid_json_where());
         assert_eq!(rows(&dead), [(2, None, None, Some("not json".into())), (3, None, Some("x".into()), Some("[1]".into()))]);
+    }
+
+    /// Debezium change events as the connector writes them, with and without `schemas.enable`: inserts, updates
+    /// and snapshot reads are rows of `after`; a delete is a tombstone with `before`'s columns, so a delete
+    /// without a message key still has its key; other operations, values that are not change events and
+    /// events with a value Debezium left out are dead letters that say why. Numbers in timestamp and date
+    /// columns are Debezium's epoch encodings.
+    #[test]
+    fn debezium_events_decode() {
+        let options = crate::model::SourceOptions::from_json(&serde_json::json!({
+            "brokers": "x", "topic": "t", "format": "debezium",
+            "columns": {"id": "BIGINT", "status": "VARCHAR", "amount": "DECIMAL(10,2)", "created": "TIMESTAMP", "day": "DATE"}
+        }))
+        .unwrap();
+        let src = crate::model::SourceDef { name: "orders".into(), kind: "kafka".into(), options };
+        let after = r#"{"id": 1, "status": "new", "amount": "19.90", "created": 1763712345123456, "day": 20413}"#;
+        let msgs: Vec<(Option<String>, Option<&str>)> = vec![
+            // with schemas.enable: the envelope and the key are each a schema and a payload
+            (
+                Some(format!(r#"{{"schema": {{"type": "struct"}}, "payload": {{"before": null, "after": {after}, "source": {{"ts_ms": 1763712345123}}, "op": "c", "ts_ms": 1763712345200}}}}"#)),
+                Some(r#"{"schema": {"type": "struct"}, "payload": {"id": 1}}"#),
+            ),
+            (Some(r#"{"before": null, "after": {"id": 1, "status": "paid", "amount": "19.90", "created": 1763712345123, "day": "2025-11-21"}, "op": "u"}"#.into()), Some(r#"{"id": 1}"#)),
+            (Some(r#"{"before": null, "after": {"id": 2, "status": "new", "created": 1763712345123456789}, "op": "r"}"#.into()), Some(r#"{"id": 2}"#)),
+            (Some(r#"{"before": {"id": 1, "status": "paid"}, "after": null, "op": "d"}"#.into()), Some(r#"{"id": 1}"#)),
+            (Some(r#"{"before": {"id": 2}, "after": null, "op": "d"}"#.into()), None),
+            (Some(r#"{"before": null, "after": null, "op": "t"}"#.into()), None),
+            (Some(r#"{"before": null, "after": {"id": 3, "status": "__debezium_unavailable_value"}, "op": "u"}"#.into()), Some(r#"{"id": 3}"#)),
+            (Some(r#"{"id": 4, "status": "new"}"#.into()), Some(r#"{"id": 4}"#)),
+            (None, Some(r#"{"schema": {"type": "struct"}, "payload": {"id": 1}}"#)),
+            (Some(r#"{"after": {"id": 5, "amount": "abc"}, "op": "c"}"#.into()), Some(r#"{"id": 5}"#)),
+        ];
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE raw (_partition INTEGER, _offset BIGINT, payload VARCHAR, _key VARCHAR)").unwrap();
+        for (i, (v, k)) in msgs.iter().enumerate() {
+            conn.execute("INSERT INTO raw VALUES (0, ?, ?, ?)", duckdb::params![i as i64, v, k]).unwrap();
+        }
+        conn.execute_batch(&format!(
+            "CREATE TABLE ok AS SELECT * FROM raw WHERE {IS_JSON_OBJECT};
+             CREATE TABLE typed AS {} UNION ALL {};",
+            decode_sql(&src, "ok"),
+            tombstones_sql(&src, "raw")
+        ))
+        .unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT _offset, _key, id, status, amount::VARCHAR, created::VARCHAR, day::VARCHAR, _err FROM typed ORDER BY _offset",
+            )
+            .unwrap();
+        type Row = (i64, Option<String>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let s = |x: &str| Some(x.to_string());
+        let ts = s("2025-11-21 08:05:45.123456");
+        let expected: Vec<Row> = vec![
+            (0, s(r#"{"id":1}"#), Some(1), s("new"), s("19.90"), ts.clone(), s("2025-11-21"), None),
+            (1, s(r#"{"id": 1}"#), Some(1), s("paid"), s("19.90"), s("2025-11-21 08:05:45.123"), s("2025-11-21"), None),
+            (2, s(r#"{"id": 2}"#), Some(2), s("new"), None, ts.clone(), None, None),
+            (3, s(r#"{"id": 1}"#), Some(1), s("paid"), None, None, None, s(TOMBSTONE)),
+            (4, None, Some(2), None, None, None, None, s(TOMBSTONE)),
+            (5, None, None, None, None, None, None, s("Debezium operation t is not applied")),
+            (6, s(r#"{"id": 3}"#), Some(3), s(UNAVAILABLE), None, None, None, s(UNAVAILABLE_ERR)),
+            (7, s(r#"{"id": 4}"#), None, None, None, None, None, s("not a Debezium change event: no op")),
+            (8, s(r#"{"id":1}"#), None, None, None, None, None, s(TOMBSTONE)),
+            (9, s(r#"{"id": 5}"#), Some(5), None, None, None, None, s("type conflict: amount is not DECIMAL(10,2)")),
+        ];
+        assert_eq!(rows, expected);
     }
 
     #[test]

@@ -3,8 +3,8 @@
   add the columns the model gained (duckwake_add_source_column) and fail on any other change, which needs a
   source under a new name: views that read a source keep the options they were made with.
 
-  Config: brokers, topic, event_time, columns (a mapping of name to DuckDB type, in order), and optionally
-  format, watermark_delay, idle_timeout, start, decode, security_protocol, sasl_mechanism, sasl_username,
+  Config: brokers, topic, event_time (not needed with format='debezium'), columns (a mapping of name to DuckDB
+  type, in order), and optionally format, watermark_delay, idle_timeout, start, decode, security_protocol, sasl_mechanism, sasl_username,
   sasl_password ('env:NAME' or 'file:/path', never the password itself), ssl_ca_location,
   ssl_certificate_location, ssl_key_location.
 #}

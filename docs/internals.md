@@ -84,6 +84,18 @@ changed keys' state rows. The batch query the view must equal, used by `verify` 
 `UpsertSpec::batch_sql` over every message. Tombstones are staged as typed rows with `_err` 'tombstone' and the message key in `_key`; the
 `Source` of an upsert view takes them with `__del`, and the commit leaves them out of its dead letters.
 
+**Debezium sources (C3).** A source with `"format": "debezium"` changes only the decode
+(`decode::debezium_sql`); the `Upsert` operator is C2's. The envelope is unwrapped from `schemas.enable`'s
+`{schema, payload}`, and so is the key (`decode::key_sql`, also used for Kafka tombstones and by `duckwake sql`).
+`c`, `r` and `u` events decode `after`; a `d` event decodes `before` and is staged as a tombstone, so a delete
+without a message key still finds its key through C2's fallback to the value's key columns. Other operations
+are dead letters. Numbers in `TIMESTAMP` and `DATE` columns are Debezium's epoch encodings
+(`decode::debezium_cast`). An event carrying `__debezium_unavailable_value` is staged with `_err` 'unavailable
+value'; `stage_source` counts them and `stage_view` stops every view of the source with `StopJob`, since the
+row cannot be rebuilt. Such a source may have no event time: it then has no per-partition maxima, no watermark
+and no freshness, and the compiler refuses windows over it (`SourceSchema::event_time` is `None`) and views
+without `upsert_key` (`SourceSchema::changelog`).
+
 A window is still emitted once, when it closes; a retraction into a closed window is a late row. The
 harness's `changes` source deletes and updates rows of the previous epoch and cancels rows within an epoch,
 and every view kind over it matches the batch query over the net rows after every epoch.

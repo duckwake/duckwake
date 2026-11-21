@@ -42,7 +42,8 @@ The options:
 | --- | --- | --- |
 | `brokers`, `topic` | required | Where to read. |
 | `columns` | required | The columns and their DuckDB types, decoded from each JSON message. |
-| `event_time` | required | The column holding each event's time; windows and the watermark use it. |
+| `format` | `"json"` | `json`: each message is one row. `debezium`: Debezium change events, read by key ([Debezium sources](#debezium-sources)). |
+| `event_time` | required for `json` | The column holding each event's time; windows and the watermark use it. A `debezium` source may leave it out. |
 | `watermark_delay` | `"30 seconds"` | How late an event may arrive before its window closes without it. |
 | `idle_timeout` | `"60 seconds"` | A partition with no events for this long no longer holds the watermark back. |
 | `start` | `"earliest"` | Where a new view starts in the topic: `earliest` or `latest`. |
@@ -243,6 +244,41 @@ tombstone (a message with a key and no value) deletes it.
 
 `verify` recomputes the table from the topic with the same rules. `duckwake sql` shows each message's `_key`
 next to `_partition` and `_offset` when it queries the source.
+
+## Debezium sources
+
+A topic a Debezium connector writes (one table's changes) is a source with `"format": "debezium"`, and its
+views are upsert views keyed by the table's primary key:
+
+```sql
+CALL duckwake_create_source('orders', 'kafka', '{
+  "brokers": "localhost:19092", "topic": "pg.public.orders", "format": "debezium",
+  "columns": {"order_id": "BIGINT", "status": "VARCHAR", "amount": "DECIMAL(18,2)", "updated_at": "TIMESTAMP"}}');
+CALL duckwake_create_view('analytics.orders', 'SELECT * FROM orders', upsert_key := 'order_id');
+```
+
+- **Events.** The columns are read from the event's `after` row. Inserts (`c`), snapshot reads (`r`) and
+  updates (`u`) replace their key's row, and a delete (`d`) removes it, as do the tombstones Debezium sends after
+  deletes. The key comes from the message key, or for a delete without one from its `before` row. `before` is
+  never used as the row to take back: the view's own state holds the current row. Other events (`t` truncate,
+  `m` messages, a value that is not a change event) are dead letters whose error names them.
+- **Both JSON forms.** Events and keys with `schemas.enable` (`{"schema": ..., "payload": ...}`) and without it.
+- **Values.** Debezium sends `timestamp` columns as epoch numbers (`time.precision.mode`: milliseconds,
+  microseconds or nanoseconds) and `date` columns as days since 1970-01-01; a `TIMESTAMP` or `DATE` column reads
+  both those and text. A number is read in the unit its size fits, which is right for times from 1973 to 5138.
+  Set `decimal.handling.mode` to `string` (or `double`) on the connector: its default sends decimals as
+  base64 bytes, which are type conflicts here.
+- **No event time needed.** An upsert view has no windows, so the source may leave out `event_time`; such a
+  source has no watermark, and a window over it is refused. To aggregate, read the view's table from another
+  view through the change feed.
+- **Values Debezium leaves out.** For a PostgreSQL table without `REPLICA IDENTITY FULL`, Debezium sends
+  `__debezium_unavailable_value` in place of a large (TOASTed) column an update did not change. The view
+  cannot rebuild such a row, so it stops with an error naming the event. Set `REPLICA IDENTITY FULL` on the
+  table, take a new Debezium snapshot of it, and replace the view.
+- **Order.** As for any upsert view, a key's events must stay in one partition, which Debezium's keyed
+  messages do. A connector restart may send some events again; they are applied again in order, so a row can
+  briefly show an older version and then catch up. `upsert_version` on a column that grows with each change
+  (an `updated_at`, a version) keeps older events from applying at all.
 
 ## The same in the CLI
 

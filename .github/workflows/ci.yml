@@ -76,6 +76,8 @@ jobs:
           # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
           - { name: backfill, run: scripts/backfill_test.sh }
           - { name: upsert, run: scripts/upsert_test.sh }
+          # C3: the same over Debezium change events, and an event with a value Debezium left out.
+          - { name: debezium, run: FORMAT=debezium scripts/upsert_test.sh }
           # dbt-duckwake: the example project deployed and changed with dbt (installs dbt-duckdb into a venv).
           - { name: dbt, run: scripts/dbt_test.sh }
           - { name: retention, run: scripts/retention_test.sh }
@@ -97,6 +99,7 @@ jobs:
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
           - { name: backfill pipelined, run: scripts/backfill_test.sh, flags: true }
           - { name: upsert pipelined, run: scripts/upsert_test.sh, flags: true }
+          - { name: debezium pipelined, run: FORMAT=debezium scripts/upsert_test.sh, flags: true }
           - { name: schema pipelined, run: scripts/schema_test.sh, flags: true }
           - { name: limits pipelined, run: scripts/limits_test.sh, flags: true }
     name: suite (${{ matrix.name }})
@@ -118,6 +121,10 @@ jobs:
           curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/duckdb/duckdb" --version
+      # The stack publishes host ports inside Linux's ephemeral range (32768-60999). Reserve them, or an outgoing
+      # connection on the runner (pulling the images) can hold one when Docker binds it: "failed to bind host port
+      # for 0.0.0.0:55432 ... address already in use" (CI, 2026-11-21).
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=19092-19095,19900,55432
       - run: docker compose up -d --wait
       - run: ${{ matrix.run }}
       - if: failure()
