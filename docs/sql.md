@@ -280,6 +280,11 @@ CALL duckwake_create_view('analytics.orders', 'SELECT * FROM orders', upsert_key
   briefly show an older version and then catch up. `upsert_version` on a column that grows with each change
   (an `updated_at`, a version) keeps older events from applying at all.
 
+To try it locally, `docker compose --profile debezium up -d` adds a PostgreSQL with logical replication
+(`localhost:15432`, user and database `shop`) and Kafka Connect with Debezium's PostgreSQL connector (REST API on
+`localhost:8083`). `scripts/debezium_e2e_test.sh` registers a connector and reads its topics, and serves as a
+worked example.
+
 ## The same in the CLI
 
 | SQL function (server, extension) | CLI |

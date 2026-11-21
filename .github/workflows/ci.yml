@@ -78,6 +78,8 @@ jobs:
           - { name: upsert, run: scripts/upsert_test.sh }
           # C3: the same over Debezium change events, and an event with a value Debezium left out.
           - { name: debezium, run: FORMAT=debezium scripts/upsert_test.sh }
+          # C3 end to end: PostgreSQL, Debezium's connector in Kafka Connect, and DuckWake (compose profile debezium).
+          - { name: debezium e2e, run: scripts/debezium_e2e_test.sh }
           # dbt-duckwake: the example project deployed and changed with dbt (installs dbt-duckdb into a venv).
           - { name: dbt, run: scripts/dbt_test.sh }
           - { name: retention, run: scripts/retention_test.sh }

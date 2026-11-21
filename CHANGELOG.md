@@ -13,8 +13,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   message key, or by `before` when there is none), and truncates and other events are dead letters that name
   them. Debezium's epoch numbers in `TIMESTAMP` and `DATE` columns are read as times. An event with a value
   Debezium left out (`__debezium_unavailable_value`, a PostgreSQL table without `REPLICA IDENTITY FULL`) stops
-  the view with an error that says so. `duckwake produce --keys N --debezium` writes such a topic. Gate:
-  `FORMAT=debezium scripts/upsert_test.sh`, in order and pipelined.
+  the view with an error that says so. `duckwake produce --keys N --debezium` writes such a topic. Gates:
+  `FORMAT=debezium scripts/upsert_test.sh`, in order and pipelined, and `scripts/debezium_e2e_test.sh`, end to end
+  with PostgreSQL 16 and Debezium's connector 3.6.3 (`docker compose --profile debezium`).
 - A source's `event_time` is optional when its format is `debezium`; a window over a source without one is
   refused.
 - Upsert views over Kafka topics ([#41](https://github.com/duckwake/duckwake/issues/41)):
