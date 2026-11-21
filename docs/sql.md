@@ -248,7 +248,7 @@ next to `_partition` and `_offset` when it queries the source.
 | SQL function (server, extension) | CLI |
 | --- | --- |
 | `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka --options JSON` |
-| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--upsert-key] [--upsert-version] [--tombstone-retention] [--if-exists fail\|update\|replace] [--replace]` |
+| `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--upsert-key] [--upsert-version] [--if-exists fail\|update\|replace] [--replace]` |
 | `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |
 | `duckwake_alter_view(view, ...)` | `alter-view NAME [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows]` |
 | `duckwake_start` / `duckwake_stop` / `duckwake_pause` | `start NAME [--worker W]` (default `any`) / `stop` / `pause` |
