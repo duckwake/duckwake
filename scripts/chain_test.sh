@@ -90,6 +90,28 @@ elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | sed -n 1p
 else echo "drop of chain_per_10s failed for another reason: $out"; failed=1; fi
 "$BIN" start chain_per_10s --worker w1 >/dev/null
 
+log "a window over another view's windows closes after that view's input goes idle"
+# One insert, then nothing: idle_10s closes its window and has no window left to close; idle_30s's window
+# closes only when the watermark idle_10s records passes its end, which it must keep recording while idle.
+"$BIN" sql "CREATE SCHEMA lake.idle; CREATE TABLE lake.idle.events (id INTEGER, amount DOUBLE)" >/dev/null
+"$BIN" create-view analytics.idle_10s --epoch-interval 1s --sql "SELECT window_start, window_end, count(*) AS n,
+  sum(amount) AS total FROM TUMBLE(idle.events, _commit_ts, INTERVAL 10 SECOND) GROUP BY ALL" | sed -n 1p
+"$BIN" create-view analytics.idle_30s --epoch-interval 1s --sql "SELECT window_start, sum(n) AS n, sum(total) AS total
+  FROM TUMBLE(analytics.idle_10s, window_end, INTERVAL 30 SECOND) GROUP BY ALL" | sed -n 1p
+for v in idle_10s idle_30s; do "$BIN" start "$v" --worker w1 >/dev/null; done
+"$BIN" sql "INSERT INTO lake.idle.events SELECT i, i FROM range(20) t(i)" >/dev/null
+# The 30 s window ends at most 30 s after the 10 s one; then up to a slide (10 s), a heartbeat and an epoch.
+for _ in $(seq 1 90); do
+  [[ $("$BIN" sql --csv "SELECT count(*) FROM lake.analytics.idle_30s" 2>/dev/null | tail -1) -gt 0 ]] && break
+  sleep 1
+done
+if [[ $("$BIN" sql --csv "SELECT sum(n) FROM lake.analytics.idle_30s" 2>/dev/null | tail -1) == 20 ]]; then
+  echo "idle_30s closed its window over the idle idle_10s: 20 rows"
+else
+  echo "idle_30s did not close its window within 90 s"; failed=1
+fi
+for v in idle_10s idle_30s; do "$BIN" verify "$v" 2>&1 | tail -1 | grep '^VERIFY OK' || { echo "verify $v failed"; failed=1; }; done
+
 log "an update to a lake table a windowed view reads stops that view, and only that view"
 "$BIN" sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.orders (id INTEGER, amount DOUBLE)" >/dev/null
 "$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --sql "SELECT window_start, count(*) AS n, sum(amount) AS total

@@ -45,11 +45,22 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Changed
 
+- `verify` lists up to five differing rows on each side when a view's output does not match, not only their counts.
 - A Kafka message without a value (a tombstone) is a dead letter with the error `tombstone` instead of
   `invalid json`, in the views that do not read its source as upserts.
 
 ### Fixed
 
+- `verify` failed now and then on views with `corr`, `regr_slope` or the variances (`bf_spread` in
+  `backfill_test.sh`, about one run in six): it rounded DOUBLE and FLOAT columns to 10 significant digits on both
+  sides, and two results 10⁻¹³ apart could round to different values across a rounding step. It now compares
+  them within a relative 10⁻⁹, pairing the rows that differ by their other columns, which stay exact.
+- A windowed view over another windowed view's `window_start` or `window_end` closed its window up to
+  `--position-refresh` (5 minutes by default) late once the upstream view's inputs went idle: the upstream view,
+  with no window left to close, stopped committing, so the watermark in its checkpoint, which the downstream
+  view reads, stood still until a position refresh committed it. A windowed view
+  over lake inputs now also commits each time its watermark has moved a whole slide since it last recorded it,
+  at most once a slide while idle. Found by `chain_test.sh` on `main`; `chain_test.sh` now checks it every run.
 - The dead-letter query in the `DuckWakeDeadLetters` alert's docs named a column `_err`; it is `error`.
 
 - The development and CI stack's Redpanda could fail to start with "Address already in use" on its internal
