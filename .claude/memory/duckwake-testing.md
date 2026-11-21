@@ -29,7 +29,6 @@ metadata:
 - CI artifacts (worker logs) download from a host the session's proxy blocks: suites print what a failure
   needs (`dbt_test.sh` prints the worker's errors). `scripts/dbt_test.sh` needs Kafka; its steps 0-3 run against
   PostgreSQL alone with the Kafka lines stripped.
-
 - The cloud session has no Docker: Kafka suites (upsert, Debezium, chain) and `debezium_e2e_test.sh` run only in
   CI. Check the PostgreSQL side of a new suite against the local server and its DuckDB queries with
   `duckwake sql` before pushing.
