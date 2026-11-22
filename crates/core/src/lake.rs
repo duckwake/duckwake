@@ -405,9 +405,77 @@ pub fn is_conflict(err: &anyhow::Error) -> bool {
     msg.contains("Transaction conflict") || msg.contains("conflict") || msg.contains("Exceeded the maximum retry count")
 }
 
+/// True when the catalog (PostgreSQL) cannot be reached right now: it refuses connections, is shutting down,
+/// starting up or in recovery, or dropped a connection mid-query. A worker waits such an outage out instead
+/// of exiting (#27). A catalog that answers and refuses, such as a wrong password or a missing database, is a
+/// configuration error, not an outage: the worker fails on it as before.
+pub fn is_catalog_unavailable(err: &anyhow::Error) -> bool {
+    // libpq's own words: they come only from a PostgreSQL connection.
+    const POSTGRES: [&str; 11] = [
+        // A worker frozen inside a catalog transaction finds it ended (`bound_idle_transactions`).
+        "terminating connection due to idle-in-transaction timeout",
+        "the database system is shutting down",
+        "the database system is starting up",
+        "the database system is in recovery mode",
+        "the database system is not yet accepting connections",
+        "server closed the connection unexpectedly",
+        "terminating connection due to administrator command",
+        "could not receive data from server",
+        "could not send data to server",
+        "no connection to the server",
+        "SSL connection has been closed unexpectedly",
+    ];
+    // Any socket's words: an outage only in an error from the catalog's connection (DuckDB's postgres
+    // extension says "Unable to connect to Postgres"), not, say, from a Kafka broker.
+    const SOCKET: [&str; 5] = ["Connection refused", "Connection reset by peer", "Connection timed out", "timeout expired", "SSL SYSCALL error"];
+    const CONFIG: [&str; 6] = [
+        "password authentication failed",
+        "no password supplied",
+        "does not exist",
+        "no pg_hba.conf entry",
+        "could not translate host name",
+        "permission denied",
+    ];
+    if crate::sources::kafka::is_brokers_unreachable(err) {
+        return false;
+    }
+    let msg = format!("{err:#}");
+    let down = POSTGRES.iter().any(|d| msg.contains(d)) || (msg.contains("Postgres") && SOCKET.iter().any(|d| msg.contains(d)));
+    down && !CONFIG.iter().any(|c| msg.contains(c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_catalog_that_cannot_be_reached_is_an_outage_and_one_that_refuses_is_not() {
+        let e = |m: &str| anyhow::anyhow!("{m}");
+        // Messages from a local run with PostgreSQL stopped under a worker (2026-11-22).
+        let shutting = "IO Error: Failed to query most recent snapshot for DuckLake: Unable to connect to Postgres at \"dbname=t \
+                        host=localhost port=55432 user=lake\": connection to server at \"localhost\" (127.0.0.1), port 55432 \
+                        failed: FATAL:  the database system is shutting down";
+        let refused = "IO Error: Failed to attach DuckLake MetaData \"__ducklake_metadata_lake\" at path + \"postgres:dbname=t\"\
+                       Unable to connect to Postgres at \"dbname=t\": connection to server at \"localhost\" (127.0.0.1), port \
+                       55432 failed: Connection refused";
+        assert!(is_catalog_unavailable(&e(shutting)));
+        assert!(is_catalog_unavailable(&e(refused)));
+        assert!(is_catalog_unavailable(&e("server closed the connection unexpectedly")));
+        assert!(is_catalog_unavailable(&e("FATAL:  terminating connection due to idle-in-transaction timeout")));
+        // Seen through the context the worker adds on its way out.
+        assert!(is_catalog_unavailable(&e(refused).context("attaching DuckLake")));
+        assert!(!is_catalog_unavailable(&e("attaching DuckLake")));
+        // Answered, and refused: configuration, not an outage.
+        assert!(!is_catalog_unavailable(&e("Unable to connect to Postgres: connection to server at \"localhost\" failed: FATAL: \
+                                            password authentication failed for user \"lake\"")));
+        assert!(!is_catalog_unavailable(&e("connection to server failed: FATAL: database \"nope\" does not exist")));
+        assert!(!is_catalog_unavailable(&e("Transaction conflict - attempting to delete from table")));
+        // A Kafka broker refusing connections is the brokers' outage, not the catalog's.
+        assert!(!is_catalog_unavailable(&anyhow::Error::new(crate::sources::kafka::BrokersUnreachable(
+            "localhost:19092 (localhost:19092: Connection refused (os error 111))".into()
+        ))));
+        assert!(!is_catalog_unavailable(&e("connecting to Kafka: Connection refused (os error 111)")));
+    }
 
     #[test]
     fn s3_secret_from_env() {

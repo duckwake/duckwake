@@ -94,20 +94,22 @@ pub fn register(conn: &Connection, worker: &str, metrics: Option<&str>) -> Resul
     add_column(conn, &table, "cooling", "VARCHAR")?;
     add_column(conn, &table, "version", "VARCHAR")?;
     add_column(conn, &table, "metrics_addr", "VARCHAR")?;
+    // The views this worker cannot start yet and what each waits for (`the topic`, `the Kafka brokers`).
+    add_column(conn, &table, "waiting", "VARCHAR")?;
     retry_conflicts(|| {
         let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {wt}"), [], |r| r.get(0))?;
         if n == 0 {
             conn.execute(
                 &format!(
-                    "INSERT INTO {wt} (worker_id, state, beat, jobs, started_at, heartbeat_at, load, costs, cooling, version, metrics_addr)
-                     VALUES (?, 'running', 1, 0, now(), now(), 0, '{{}}', '[]', ?, ?)"
+                    "INSERT INTO {wt} (worker_id, state, beat, jobs, started_at, heartbeat_at, load, costs, cooling, version, metrics_addr, waiting)
+                     VALUES (?, 'running', 1, 0, now(), now(), 0, '{{}}', '[]', ?, ?, '{{}}')"
                 ),
                 duckdb::params![worker, VERSION, metrics],
             )?;
         } else {
             conn.execute(
                 &format!(
-                    "UPDATE {wt} SET state = 'running', beat = beat + 1, jobs = 0, load = 0, costs = '{{}}', cooling = '[]',
+                    "UPDATE {wt} SET state = 'running', beat = beat + 1, jobs = 0, load = 0, costs = '{{}}', cooling = '[]', waiting = '{{}}',
                        started_at = now(), heartbeat_at = now(), version = ?, metrics_addr = ?"
                 ),
                 duckdb::params![VERSION, metrics],
@@ -119,15 +121,22 @@ pub fn register(conn: &Connection, worker: &str, metrics: Option<&str>) -> Resul
 
 /// One heartbeat: the beat moves, with the worker's views, what each costs, and which are within their
 /// rebalance cooldown. The state is left alone, so a `drain` written by someone else is kept.
-pub fn heartbeat(conn: &Connection, worker: &str, views: usize, costs: &BTreeMap<String, f64>, cooling: &[String]) -> Result<()> {
+pub fn heartbeat(
+    conn: &Connection,
+    worker: &str,
+    views: usize,
+    costs: &BTreeMap<String, f64>,
+    cooling: &[String],
+    waiting: &BTreeMap<&str, &str>,
+) -> Result<()> {
     let wt = worker_table(worker);
     // fold, not sum: an empty f64 sum is -0.0, which prints as such.
     let load: f64 = costs.values().fold(0.0, |a, c| a + c);
-    let (costs, cooling) = (serde_json::to_string(costs)?, serde_json::to_string(cooling)?);
+    let (costs, cooling, waiting) = (serde_json::to_string(costs)?, serde_json::to_string(cooling)?, serde_json::to_string(waiting)?);
     retry_conflicts(|| {
         conn.execute(
-            &format!("UPDATE {wt} SET beat = beat + 1, jobs = ?, load = ?, costs = ?, cooling = ?, heartbeat_at = now()"),
-            duckdb::params![views as i64, load, costs, cooling],
+            &format!("UPDATE {wt} SET beat = beat + 1, jobs = ?, load = ?, costs = ?, cooling = ?, waiting = ?, heartbeat_at = now()"),
+            duckdb::params![views as i64, load, costs, cooling, waiting],
         )?;
         Ok(())
     })
@@ -137,7 +146,7 @@ pub fn heartbeat(conn: &Connection, worker: &str, views: usize, costs: &BTreeMap
 pub fn deregister(conn: &Connection, worker: &str) -> Result<()> {
     let wt = worker_table(worker);
     retry_conflicts(|| {
-        conn.execute_batch(&format!("UPDATE {wt} SET state = 'stopped', jobs = 0, load = 0, costs = '{{}}', heartbeat_at = now()"))?;
+        conn.execute_batch(&format!("UPDATE {wt} SET state = 'stopped', jobs = 0, load = 0, costs = '{{}}', waiting = '{{}}', heartbeat_at = now()"))?;
         Ok(())
     })
 }
@@ -165,6 +174,20 @@ fn worker_tables(conn: &Connection) -> Result<Vec<String>> {
     )?;
     let names = stmt.query_map([LAKE, schema, PREFIX], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
     Ok(names)
+}
+
+/// A query of `(worker_id, waiting)`, one row per worker: the views each cannot start yet, as a JSON object from
+/// view to what it waits for. Workers from before that column read NULL.
+pub fn waiting_sql(conn: &Connection) -> Result<String> {
+    let mut parts = Vec::new();
+    for t in worker_tables(conn)? {
+        let waiting = if crate::lake::has_column(conn, &t, "waiting")? { "waiting" } else { "NULL::VARCHAR" };
+        parts.push(format!("SELECT worker_id, {waiting} AS waiting FROM {CTL}.{}", ident(&t)));
+    }
+    if parts.is_empty() {
+        parts.push("SELECT NULL::VARCHAR AS worker_id, NULL::VARCHAR AS waiting WHERE false".into());
+    }
+    Ok(parts.join(" UNION ALL "))
 }
 
 /// How long a worker that stopped heartbeating stays a scrape target: long enough for `DuckWakeWorkerDown` to

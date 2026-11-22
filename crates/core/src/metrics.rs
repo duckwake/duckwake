@@ -27,6 +27,11 @@ struct State {
     handoffs: u64,
     views_failed: u64,
     out_of_memory: u64,
+    /// The catalog cannot be reached: the worker waits for it (`set_catalog_reachable`).
+    catalog_down: bool,
+    catalog_outages: u64,
+    /// Views this worker cannot start yet: their topic is missing or no broker answers.
+    views_waiting: usize,
     rows_cap: Option<usize>,
     duckdb_version: String,
     /// DuckDB's memory in use, what it has spilled to disk, and its limit, in bytes.
@@ -173,6 +178,24 @@ impl Metrics {
         st.rows_cap = Some(cap);
     }
 
+    /// The catalog stopped answering (false) or answers again (true). An outage is counted when it starts;
+    /// the worker is not up while it lasts.
+    pub fn set_catalog_reachable(&self, reachable: bool) {
+        let mut st = self.lock();
+        if !reachable && !st.catalog_down {
+            st.catalog_outages += 1;
+        }
+        st.catalog_down = !reachable;
+        if !reachable {
+            st.up = false;
+        }
+    }
+
+    /// How many views this worker cannot start yet (`duckwake_views_waiting`).
+    pub fn set_views_waiting(&self, n: usize) {
+        self.lock().views_waiting = n;
+    }
+
     /// This worker took over an orphaned view (failover).
     pub fn record_claim(&self) {
         self.lock().claims += 1;
@@ -259,10 +282,11 @@ impl Metrics {
             }
         }
         let load: f64 = st.jobs.values().filter_map(|j| j.cost).fold(0.0, |a, c| a + c);
-        let worker: [(&'static str, &'static str, &'static str, f64); 14] = [
+        let worker: [(&'static str, &'static str, &'static str, f64); 17] = [
             ("duckwake_worker_up", "gauge", "1 while the worker runs, 0 while it waits to restart after a failure.", if st.up { 1.0 } else { 0.0 }),
             ("duckwake_worker_restarts_total", "counter", "Times the worker failed and restarted from its last checkpoint.", st.restarts as f64),
             ("duckwake_views", "gauge", "Views this worker runs.", st.jobs.len() as f64),
+            ("duckwake_views_waiting", "gauge", "Views this worker should run but cannot start yet: their topic is missing or no Kafka broker answers.", st.views_waiting as f64),
             ("duckwake_epochs_total", "counter", "Epochs committed (one transaction each).", st.epochs as f64),
             ("duckwake_commit_seconds_sum", "counter", "Time spent in epoch commits.", st.commit_seconds_sum),
             ("duckwake_commit_seconds", "gauge", "Duration of the last epoch commit.", st.last_commit_seconds),
@@ -273,6 +297,8 @@ impl Metrics {
             ("duckwake_handoffs_total", "counter", "Views this worker handed to another worker (rebalance, drain, pins).", st.handoffs as f64),
             ("duckwake_views_failed_total", "counter", "Views this worker marked failed (a limit, a broken input promise, a failed start).", st.views_failed as f64),
             ("duckwake_out_of_memory_total", "counter", "Epochs that ran out of memory; each halves the rows per epoch and restarts from the checkpoints.", st.out_of_memory as f64),
+            ("duckwake_catalog_reachable", "gauge", "0 while the catalog cannot be reached and the worker waits for it, else 1.", if st.catalog_down { 0.0 } else { 1.0 }),
+            ("duckwake_catalog_outages_total", "counter", "Times the catalog stopped answering and the worker waited, then resumed from its checkpoints.", st.catalog_outages as f64),
             ("duckwake_epoch_rows_cap", "gauge", "Most rows per epoch after running out of memory (0: no cap, each view's max_rows).", st.rows_cap.unwrap_or(0) as f64),
         ];
         out.extend(worker.into_iter().map(|(name, kind, help, value)| Sample { name, kind, help, view: None, value }));
@@ -465,6 +491,17 @@ mod tests {
         assert!(text.contains("duckwake_views_failed_total{worker=\"w1\"} 1"), "{text}");
         assert!(text.contains("duckwake_out_of_memory_total{worker=\"w1\"} 1"), "{text}");
         assert!(text.contains("duckwake_epoch_rows_cap{worker=\"w1\"} 50000"), "{text}");
+        assert!(text.contains("duckwake_catalog_reachable{worker=\"w1\"} 1"), "{text}");
+        // One outage, however many times the worker sees it before the catalog is back.
+        m.set_up(true);
+        m.set_catalog_reachable(false);
+        m.set_catalog_reachable(false);
+        let down = m.render();
+        assert!(down.contains("duckwake_catalog_reachable{worker=\"w1\"} 0"), "{down}");
+        assert!(down.contains("duckwake_catalog_outages_total{worker=\"w1\"} 1"), "{down}");
+        assert!(down.contains("duckwake_worker_up{worker=\"w1\"} 0"), "{down}");
+        m.set_catalog_reachable(true);
+        assert!(m.render().contains("duckwake_catalog_reachable{worker=\"w1\"} 1"));
         assert!(text.contains("duckwake_epoch{worker=\"w1\",view=\"clicks\"} 7"), "{text}");
         assert!(text.contains("duckwake_dead_letters_total{worker=\"w1\",view=\"clicks\"} 2"), "{text}");
         assert!(text.contains("duckwake_commit_conflicts_total{worker=\"w1\"} 1"), "{text}");

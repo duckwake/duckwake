@@ -357,15 +357,33 @@ records the ones it took up.
    from the source's columns as they are: a `SELECT *` view would grow a column its table does not have and
    be refused. Each view now stores the columns of each source it read when it was created, and is compiled
    against those; adding a column records them, in the same transaction, for views made before this.
+19. **A worker exited on one failed catalog write** (#27). Any error in the worker loop ended `duckwake run`,
+   a PostgreSQL restart included (`Unable to connect to Postgres ...: FATAL: the database system is shutting
+   down` in a local drill); `duckwaked` restarted it after 5 s, counting a failure. A catalog that cannot be
+   reached (`lake::is_catalog_unavailable`: libpq's words for a server down, starting, in recovery or gone
+   mid-query, or a socket error from the catalog's connection, and not a refusal such as a wrong password) is
+   now an outage: the worker drops its instance, as after running out of memory, and waits with backoff (1 s
+   doubling to 30 s) before starting again from its checkpoints. Exactly-once needs nothing new: a commit cut off
+   by the outage either landed, and the checkpoint says so, or did not, and the epoch is redone. A view whose
+   start or staging fails on the catalog is never marked failed for it. Socket errors count only when the
+   message comes from PostgreSQL: the first version took a Kafka broker's `Connection refused` for an outage.
+20. **A view whose brokers were down at its start was marked failed** (#26). rskafka retries a connection
+   forever, a refused SASL handshake included, so the first connection is bounded (10 s), and a view whose
+   bound ran out failed, Kafka down or credentials wrong alike. The worker now first opens a TCP connection to
+   each broker (2 s each): when none accepts one, the view waits, like a view whose topic is missing, and is
+   tried again after 5 s, doubling up to 60 s, so a dead cluster costs the worker loop a refused connection
+   now and then rather than 10 s every refresh. Brokers that accept the connection and then stall the
+   handshake still fail the view. Waiting views travel in the worker's heartbeat row (`waiting`), which is how
+   `duckwake_jobs()` shows `waiting_for`.
 
 ## Simplifications and gaps
 
 - **Front-ends.** No `CREATE CONTINUOUS VIEW` / `CREATE SOURCE` DDL: DuckDB's C API (v1 and v2) has no
   parser hooks, so it needs a C++ shim. The extension is a signed community extension for Linux (amd64, arm64) and `osx_arm64`; other platforms install it unsigned from an extension repository. The server's Quack token is one shared secret; there are no users or roles.
 - **Sources.** Kafka only, JSON only, with declared columns. SASL (PLAIN, SCRAM) and TLS, with client
-  certificates; no OAUTHBEARER or Kerberos yet. A source's first connection must succeed within 10 s or the
-  view is marked failed, so a view starting while its brokers are down needs `start` again; once
-  connected, readers retry through broker restarts. A view whose topic does not exist yet waits for it, as
+  certificates; no OAUTHBEARER or Kerberos yet. A view whose brokers accept no connection when it starts waits for
+  them (5 s, doubling to 60 s, between tries); brokers that accept one and then do not finish the handshake
+  within 10 s fail the view (wrong credentials). Once connected, readers retry through broker restarts. A view whose topic does not exist yet waits for it, as
   Kafka consumers do: its worker checks every refresh (before taking the lease, so waiting commits nothing)
   and logs once. Unknown fields are dropped; there is no
   VARIANT catch-all. Offsets and definitions are stored as `JSON`, not `VARIANT`.

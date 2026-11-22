@@ -1472,15 +1472,19 @@ pub fn jobs_query(conn: &Connection) -> Result<String> {
     }
     Ok(format!(
         "WITH leases AS ({}),
+         waits AS ({}),
          last AS (SELECT * FROM {CTL}.checkpoints QUALIFY row_number() OVER (PARTITION BY job_id ORDER BY epoch DESC) = 1),
          totals AS (SELECT job_id, sum(rows_in) AS rows_in, sum(rows_out) AS rows_out, sum(rows_late) AS late, sum(rows_dead) AS dead
                     FROM {CTL}.checkpoints GROUP BY ALL)
          SELECT j.job_id, j.status, l.owner_worker AS worker, l.lease_epoch AS lease, c.epoch, c.watermark,
                 round(epoch(now()::TIMESTAMP - c.max_event_time), 1) AS freshness_s, c.lag,
-                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit, j.pinned_to
+                t.rows_in, t.rows_out, t.late, t.dead, c.committed_at::TIMESTAMP AS last_commit, j.pinned_to,
+                json_extract_string(w.waiting, '$.\"' || j.job_id || '\"') AS waiting_for
          FROM {CTL}.jobs j LEFT JOIN leases l USING (job_id) LEFT JOIN last c USING (job_id) LEFT JOIN totals t USING (job_id)
+           LEFT JOIN waits w ON w.worker_id = l.owner_worker AND j.status = 'running'
          ORDER BY j.job_id",
-        leases.join(" UNION ALL ")
+        leases.join(" UNION ALL "),
+        crate::failover::waiting_sql(conn)?
     ))
 }
 

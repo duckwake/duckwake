@@ -47,9 +47,11 @@ A source reaches its brokers in plaintext unless its options say otherwise, with
 (a PEM file of CAs; the public roots otherwise) and, for brokers that want client certificates,
 `ssl_certificate_location` and `ssl_key_location`. The password is never stored in the lake: it must be
 `env:NAME` or `file:/path`, read by each worker when it connects, so every worker that may run the view needs
-that variable or file, and so do the paths. A source whose brokers cannot be reached within 10 s when a view
-starts (a wrong password or certificate, or the wrong address) marks the view `failed`, with the reason;
-`start` it again once fixed.
+that variable or file, and so do the paths. A source none of whose brokers accepts a connection when a view starts
+(Kafka down, or the wrong address) makes the view wait: `jobs` shows `waiting_for` `the Kafka brokers`, the worker
+tries again after 5 s, then 10 s, up to every 60 s, and the view starts on its own once a broker answers. Brokers
+that answer but do not finish the handshake within 10 s (a wrong password or certificate) mark the view `failed`,
+with the reason; `start` it again once fixed.
 
 ```sh
 $B create-source clicks --options '{"brokers":"kafka-1:9094","topic":"clicks","event_time":"ts",
@@ -178,7 +180,14 @@ two or more machines. Give each `--metrics 0.0.0.0:9464`; Prometheus finds them 
 
 Every worker heartbeats into the lake, and the workers move views between themselves:
 
-- **A view's topic does not exist yet**: the view waits for it (logged once) and starts when it appears.
+- **A view's topic does not exist yet, or no Kafka broker answers**: the view waits (logged once; `jobs` shows
+  `waiting_for`, and `/metrics` `duckwake_views_waiting`) and starts on its own when the topic or a broker is there.
+- **The catalog cannot be reached** (PostgreSQL down, restarting or failing over): the worker does not exit. It
+  drops what it staged, waits for the catalog (trying after 1 s, then 2 s, up to every 30 s), then starts again
+  from its views' checkpoints, as after a restart; `duckwake_catalog_reachable` is 0 meanwhile. An epoch whose
+  commit was cut off is either in the lake or redone, never both. A worker started while the catalog is down
+  waits for it the same way, and one asked to stop meanwhile exits at once. A catalog that answers and refuses
+  (a wrong password, a missing database) is a configuration error, and the worker exits on it as before.
 - **A worker dies** (killed, frozen, its machine gone): its views move to the live workers once its heartbeat
   has not moved for `--lease-timeout` (default `30s`), and continue from their last checkpoint. Only time
   in which the watching worker's own heartbeats land counts, so a catalog stall that holds everyone up (a

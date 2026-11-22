@@ -49,7 +49,8 @@ pass against authenticated Kafka and MinIO.
 - [ ] **Soak.** 24 h+ at production rates with the four worker flags and maintenance on, against managed
       PostgreSQL and S3. Memory, catalog size and file count must stay flat.
 - [ ] **Failure drills** beyond `kill -9`: PostgreSQL down, a Kafka broker restart, S3 errors, disk full, a long
-      catalog stall.
+      catalog stall. PostgreSQL down and a broker restart pass in CI (`scripts/catalog_outage_test.sh`,
+      `scripts/broker_outage_test.sh`: workers wait them out, views verify); on the P3 box they run at soak rates.
 - [ ] **Upgrades.** A new version on a running lake: control-schema migrations, rolling restarts, pinned DuckDB
       and extension versions.
 - [ ] **Sizing.** Views per vCPU and events/s per worker on the 4 vCPU / 16 GB reference machine; recovery time

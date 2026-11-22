@@ -125,6 +125,9 @@ impl Chunk {
 
 /// A client for a source's brokers, with its TLS and SASL settings.
 pub async fn client(opts: &SourceOptions) -> Result<Client> {
+    // A broker that cannot be reached at all is an outage to wait out; one that answers and then refuses the
+    // handshake (TLS, SASL) is a configuration error, which the bounded build below reports.
+    probe(&opts.brokers).await?;
     let mut b = ClientBuilder::new(broker_list(&opts.brokers));
     let protocol = opts.security_protocol.to_ascii_lowercase();
     if protocol.ends_with("ssl") {
@@ -145,6 +148,22 @@ pub async fn client(opts: &SourceOptions) -> Result<Client> {
             CONNECT_TIMEOUT.as_secs()
         ),
     }
+}
+
+/// How long a probe waits for a TCP connection to one broker.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Succeeds once any of `brokers` accepts a TCP connection; fails with `BrokersUnreachable` when none does.
+async fn probe(brokers: &str) -> Result<()> {
+    let mut last = String::new();
+    for b in broker_list(brokers) {
+        match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&b)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => last = format!("{b}: {e}"),
+            Err(_) => last = format!("{b}: no answer within {} s", PROBE_TIMEOUT.as_secs()),
+        }
+    }
+    Err(anyhow::Error::new(BrokersUnreachable(format!("{brokers} ({last})"))))
 }
 
 /// How long a source's first connection to its brokers may take.
@@ -221,6 +240,23 @@ impl std::fmt::Display for TopicMissing {
 }
 
 impl std::error::Error for TopicMissing {}
+
+/// No broker of a source accepts a connection: a view waits for them, with backoff, rather than failing (#26).
+#[derive(Debug)]
+pub struct BrokersUnreachable(pub String);
+
+impl std::fmt::Display for BrokersUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no Kafka broker answers at {}", self.0)
+    }
+}
+
+impl std::error::Error for BrokersUnreachable {}
+
+/// Whether `e` (anywhere in its chain) is brokers that cannot be reached.
+pub fn is_brokers_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<BrokersUnreachable>().is_some())
+}
 
 /// Whether `e` (anywhere in its chain) is a missing topic.
 pub fn is_topic_missing(e: &anyhow::Error) -> bool {
@@ -551,4 +587,27 @@ pub async fn produce_keyed(c: &Client, topic: &str, partition: i32, messages: Ve
         .collect();
     pc.produce(records, rskafka::client::partition::Compression::NoCompression).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broker_that_refuses_connections_is_unreachable_and_one_that_listens_is_not() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listening = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let open = listening.local_addr().unwrap().to_string();
+            // A port bound and released again refuses connections.
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+            let e = probe(&closed).await.unwrap_err();
+            assert!(is_brokers_unreachable(&e), "{e:#}");
+            assert!(e.to_string().contains(&closed), "{e}");
+            assert!(is_brokers_unreachable(&e.context("connecting the reader")));
+            probe(&open).await.unwrap();
+            // One broker that answers is enough.
+            probe(&format!("{closed},{open}")).await.unwrap();
+        });
+    }
 }
