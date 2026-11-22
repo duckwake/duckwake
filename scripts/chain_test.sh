@@ -86,7 +86,7 @@ echo "chain_per_30s: $rows closed 30 s windows verified"
 log "dropping a view another view reads is refused"
 "$BIN" stop chain_per_10s >/dev/null
 if out=$("$BIN" drop chain_per_10s 2>&1); then echo "drop of chain_per_10s was not refused"; failed=1
-elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | sed -n 1p
+elif [[ $out == *"is read by analytics.chain_per_30s"* ]]; then echo "$out" | sed -n 1p
 else echo "drop of chain_per_10s failed for another reason: $out"; failed=1; fi
 "$BIN" start chain_per_10s --worker w1 >/dev/null
 

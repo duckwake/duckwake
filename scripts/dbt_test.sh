@@ -123,7 +123,7 @@ expect "top_games and country" "account_totals: unchanged big_spend: unchanged c
 log "4. the topic ends; every view catches up and dbt test passes"
 wait "$PRODUCER"; tail -1 "$OUT/producer.log"
 VARS="$VARS, duckwake_wait: true, duckwake_wait_s: 300" dbt run || { tail -30 "$OUT/dbt.log"; failed=1; }
-grep -oE '[a-z_]+: caught up at epoch [0-9]+' "$OUT/dbt.log" | sed 's/^/  /' || true
+grep -oE '[a-z_.]+: caught up at epoch [0-9]+' "$OUT/dbt.log" | sed 's/^/  /' || true
 dbt test || { failed=1; grep -A4 -E 'Runtime Error|Compilation Error|Failure in test' "$OUT/dbt.log" | sed 's/^/    /' || true; }
 grep -E ' (PASS|FAIL|ERROR) ' "$OUT/dbt.log" | sed -E 's/.*[0-9]+ of [0-9]+ //; s/ \.+.*\[/ [/' | sed 's/^/  /' || true
 tests=$(grep -oE 'PASS=[0-9]+ WARN=[0-9]+ ERROR=[0-9]+' "$OUT/dbt.log" | tail -1 || true); echo "dbt test: $tests"

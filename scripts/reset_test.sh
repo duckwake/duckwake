@@ -18,6 +18,6 @@ for v in "${VIEWS[@]}"; do "$BIN" reset "$v" --to-epoch "$TO"; done
 log "after reset to epoch $TO"; show
 start_views w1
 log "replay"; drain w1 "$OUT/reset.log"
-grep "job started" "$OUT/reset.log" | sed -E 's/.*(job=[a-z_]+ lease=[0-9]+ epoch=[0-9]+ offsets=.*)/\1/'
+grep "job started" "$OUT/reset.log" | sed -E 's/.*(job=[a-z_.]+ lease=[0-9]+ epoch=[0-9]+ offsets=.*)/\1/'
 log "after replay"; show
 log "verify"; verify_all
