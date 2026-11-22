@@ -105,6 +105,21 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A worker no longer exits when the catalog cannot be reached ([#27](https://github.com/duckwake/duckwake/issues/27)).
+  PostgreSQL down, restarting or failing over made `duckwake run` exit and `duckwaked` restart every 5 s,
+  counting failures. The worker now drops what it staged, waits for the catalog (1 s, doubling to 30 s, between
+  tries), and starts again from its views' checkpoints; one started during an outage waits too, and one asked to
+  stop exits at once. A catalog that answers and refuses (a wrong password, a missing database) still fails the
+  worker. New: `duckwake_catalog_reachable`, `duckwake_catalog_outages_total` and the alert
+  DuckWakeCatalogUnreachable; DuckWakeWorkerRestarting no longer fires for a worker that is only waiting. Gate:
+  `scripts/catalog_outage_test.sh` (the PostgreSQL-down drill).
+- A view whose Kafka brokers cannot be reached when it starts waits for them instead of being marked failed
+  ([#26](https://github.com/duckwake/duckwake/issues/26)), as a view whose topic is missing already did. The
+  worker probes the brokers first (a TCP connection, 2 s each) and tries again after 5 s, doubling to 60 s;
+  brokers that answer but refuse the credentials or certificate still fail the view. `duckwake_jobs()` (`duckwake
+  jobs`) has a `waiting_for` column (`the topic`, `the Kafka brokers`); `/metrics` has `duckwake_views_waiting`,
+  and the alert DuckWakeViewsWaiting fires after 5 minutes. Gate: `scripts/broker_outage_test.sh` (the
+  broker-restart drill).
 - `verify` failed now and then on views with `corr`, `regr_slope` or the variances (`bf_spread` in
   `backfill_test.sh`, about one run in six): it rounded DOUBLE and FLOAT columns to 10 significant digits on both
   sides, and two results 10⁻¹³ apart could round to different values across a rounding step. It now compares

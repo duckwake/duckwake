@@ -55,6 +55,8 @@ The series, per view (`worker` and `view` labels; `view` is the view's `schema.t
 | `duckwake_snapshots_held`, `_snapshots_held_seconds` | views with lake inputs: snapshots after the view's position, which maintenance keeps, and how old the oldest is; a view no worker runs is reported by every worker |
 | `duckwake_epoch_interval_seconds`, `duckwake_watermark_delay_setting_seconds`, `duckwake_max_state_rows` | the view's settings, for relative alerts |
 | per worker: `duckwake_worker_up`, `_worker_restarts_total`, `_views`, `_worker_load` | |
+| per worker: `duckwake_views_waiting` | views it should run but cannot start yet: their topic is missing or no Kafka broker answers |
+| per worker: `duckwake_catalog_reachable`, `_catalog_outages_total` | 0 while the catalog cannot be reached and the worker waits for it; outages waited out |
 | per worker: `duckwake_epochs_total`, `_commit_seconds_sum`, `_commit_seconds`, `_poll_stage_seconds`, `_commit_conflicts_total` | epochs and commits |
 | per worker: `duckwake_failover_claims_total`, `_handoffs_total` | views taken over, views handed away |
 | per worker: `duckwake_views_failed_total`, `_out_of_memory_total`, `_epoch_rows_cap` | failures and memory |
@@ -81,8 +83,26 @@ stopped at once, look at what they share: PostgreSQL (the catalog), Kafka, objec
 
 **critical.** A supervised worker (`duckwaked`, the extension's) failed at least 3 times in 15 minutes, or is
 waiting to restart. `FROM duckwake_worker_status()` shows the last error. A worker restarts from its
-checkpoints, so restarts lose nothing, but a crash loop makes no progress: fix the cause (catalog or Kafka
-unreachable, credentials, disk full).
+checkpoints, so restarts lose nothing, but a crash loop makes no progress: fix the cause (credentials, disk
+full, a Kafka source that keeps failing). A worker waiting for the catalog does not fire this, but
+DuckWakeCatalogUnreachable.
+
+## DuckWakeCatalogUnreachable
+
+**critical.** The worker cannot reach PostgreSQL, the DuckLake catalog, and has waited for it for a minute: no
+view on it commits, and with every worker on one catalog, nothing does. It does not exit; it resumes from its
+views' checkpoints on its own once the catalog answers, and loses nothing. Look at PostgreSQL: is it up, failing
+over, out of connections (`max_connections`; each worker holds one per staging thread, plus maintenance), or
+cut off from this machine? The worker log has each try's error (`the catalog is still unreachable`).
+
+## DuckWakeViewsWaiting
+
+**warning.** For 5 minutes a worker has had views it should run but cannot start: their topic does not exist,
+or no Kafka broker accepts a connection. `duckwake jobs` shows what each waits for (`waiting_for`). They start
+on their own once the topic is created or a broker answers; nothing is lost meanwhile, since nothing is read.
+Check the source's `brokers` and `topic` (`duckwake_sources()`), and that Kafka is up and reachable from the
+worker's machine. Brokers that answer but refuse the credentials or certificate fail the view instead
+(DuckWakeViewFailed).
 
 ## DuckWakeOutOfMemory
 
@@ -129,7 +149,8 @@ and the worker log says why (`view stopped: marking it failed`, `cannot start jo
 
 **critical.** Events are waiting and the view has not committed an epoch for 15 minutes. Is it running
 somewhere (`duckwake jobs`: worker, lease)? Is that worker up, and does its log show the view? A worker
-`waiting for the topic` cannot see the topic; a view whose worker is gone moves after the lease timeout.
+waiting for the topic or the brokers shows it in `duckwake jobs` (`waiting_for`); a view whose worker is gone
+moves after the lease timeout.
 
 ## DuckWakeViewFallingBehind
 

@@ -109,7 +109,7 @@ view runs without recomputing it. A limit of 0 removes it.
 
 | Function | Does |
 | --- | --- |
-| `duckwake_jobs()` | Every view: status, epoch, watermark, freshness, lag. |
+| `duckwake_jobs()` | Every view: status, epoch, watermark, freshness, lag, and, for a running view its worker cannot start yet, what it waits for (`waiting_for`: `the topic` or `the Kafka brokers`). |
 | `duckwake_checkpoints(view, n :=)` | The view's last `n` checkpoints (default 10). |
 | `duckwake_verify(view)` | The exactly-once check: the view's SQL run as one batch query over everything it has read, compared with its table. |
 | `duckwake_explain(view)` | The view's operator circuit, how it was made incremental, and one epoch's SQL ([internals](internals.md#views-as-dbsp-circuits)). |
