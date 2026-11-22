@@ -25,7 +25,7 @@ snapshot() { sql "SELECT id FROM ducklake_current_snapshot('lake')"; }
 # The snapshot a view has read its input up to, from its latest checkpoint (key "0"; "1" is a backfill's cursor).
 position() {
   sql "SELECT coalesce(max(o::BIGINT), 0) FROM (SELECT unnest(json_extract(source_offsets, '\$.*.\"0\"')) AS o FROM (
-         SELECT source_offsets FROM lake.__duckwake.checkpoints WHERE job_id = '$1' ORDER BY epoch DESC LIMIT 1))"
+         SELECT source_offsets FROM lake.__duckwake.checkpoints WHERE job_id IN ('$1', 'analytics.$1') ORDER BY epoch DESC LIMIT 1))"
 }
 # Whether view $1 has read its input table $2.$3 up to snapshot $4: its position is there, or no change to the
 # table lies after it (a view skips epochs with nothing to do, so its position can stay behind the lake's).
@@ -142,7 +142,7 @@ echo "acc_windows: $(sql "SELECT count(*) FROM lake.analytics.acc_windows") wind
 echo "injected aborts: $(grep -c 'crash injected' "$OUT/worker.log" || true), epochs committed: $(grep -c 'epoch committed' "$OUT/worker.log" || true)"
 verify_views || failed=1
 for v in "${VIEWS[@]}"; do
-  [[ $(sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$v'") == running ]] || { echo "$v is not running"; failed=1; }
+  [[ $(sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$v', 'analytics.$v')") == running ]] || { echo "$v is not running"; failed=1; }
 done
 
 log "change rows written after the views started, once their windows have closed"
@@ -165,8 +165,8 @@ verify_views || failed=1
 log "reset a view other views read: its readers follow it through the change feed, and its windowed reader is recomputed"
 "$BIN" stop acc_by_game >/dev/null
 # Stopping does not fence: wait for the worker to let the view go before rewinding it.
-for _ in $(seq 1 30); do grep -q 'job released.*job=acc_by_game' "$OUT/worker.log" && break; sleep 1; done
-to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'acc_by_game'") / 2 ))
+for _ in $(seq 1 30); do grep -q 'job released.*job=analytics.acc_by_game' "$OUT/worker.log" && break; sleep 1; done
+to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.acc_by_game'") / 2 ))
 out=$("$BIN" reset acc_by_game --to-epoch "$to"); echo "$out" | sed -n 1p
 # A reset rewrites rows of windows acc_game_windows has closed, which it would only take as late corrections.
 [[ $out == *"acc_game_windows read it"* ]] || { echo "the reset did not recompute acc_game_windows"; failed=1; }

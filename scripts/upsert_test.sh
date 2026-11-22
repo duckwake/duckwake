@@ -163,18 +163,18 @@ check_topic() {
 }
 log "the upsert views against the topic"; check_topic
 # The state holds each order's current row and nothing for a deleted one: as many rows as the view's table.
-state=$(sql "SELECT count(*) FROM lake.__duckwake.state_orders_versioned")
+state=$(sql "SELECT count(*) FROM lake.__duckwake.\"state_analytics.orders_versioned\"")
 echo "tombstones read: $(sql "SELECT count(*) FROM orders WHERE _error = 'tombstone'"); orders_versioned's state holds $state rows"
 [[ $state == $(sql "SELECT count(*) FROM lake.analytics.orders_versioned") ]] || { echo "the state holds more than the current rows"; failed=1; }
 [[ $(sql "SELECT count(*) FROM lake.analytics.orders_latest") -gt 0 ]] || { echo "orders_latest is empty"; failed=1; }
 echo "orders_windows: $(sql "SELECT count(*) FROM lake.analytics.orders_windows") windows, $(sql "SELECT count(*) FROM lake.analytics.orders_windows_late WHERE _duckwake_weight < 0") late corrections"
-dead=$(sql "SELECT count(*) FROM lake.__duckwake.dead_letter WHERE job_id LIKE 'orders_%'" || echo "?")
+dead=$(sql "SELECT count(*) FROM lake.__duckwake.dead_letter WHERE job_id LIKE 'analytics.orders_%'" || echo "?")
 echo "dead letters of the upsert views (tombstones are not dead letters there): $dead"
 [[ $dead == 0 ]] || failed=1
 kill -TERM "$pid"; wait "$pid" || true
 
 log "reset orders_versioned a few epochs back; it and orders_open replay"
-to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'orders_versioned'") - 3 ))
+to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.orders_versioned'") - 3 ))
 "$BIN" pause orders_versioned >/dev/null
 "$BIN" reset orders_versioned --to-epoch "$to" | sed -n 1p
 "$BIN" start orders_versioned --worker w1 >/dev/null
@@ -191,7 +191,7 @@ if [[ $FORMAT == debezium ]]; then
     docker compose exec -T redpanda rpk topic produce "$TOPIC" -k '{"order_id": 1}' >/dev/null
   "$BIN" run $WORKER_FLAGS --worker w1 >>"$OUT/worker.log" 2>&1 &
   pid=$!
-  status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
+  status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
   for _ in $(seq 1 30); do [[ $(status orders_latest) == failed ]] && break; sleep 1; done
   for v in "${UPSERTS[@]}"; do
     [[ $(status "$v") == failed ]] && echo "$v: failed, as it must" || { echo "$v is $(status "$v"), not failed"; failed=1; }

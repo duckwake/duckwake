@@ -62,7 +62,7 @@ client "SELECT worker, running, restarts, left(last_error, 90) FROM duckwake_wor
 [[ "$(client "SELECT restarts FROM duckwake_worker_status()")" -ge 1 ]] || { echo "FAIL: no restart recorded"; exit 1; }
 client "CALL duckwake_wait('big_spend')" >/dev/null
 client "SELECT job_id, status FROM duckwake_jobs()" | sed 's/^/  /'
-[[ "$(client "SELECT status FROM duckwake_jobs() WHERE job_id = 'studio_revenue'")" == failed ]] \
+[[ "$(client "SELECT status FROM duckwake_jobs() WHERE job_id = 'analytics.studio_revenue'")" == failed ]] \
   || { echo "FAIL: the join view should be marked failed"; exit 1; }
 
 log "recreate the table and start the join view again"

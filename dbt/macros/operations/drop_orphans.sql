@@ -1,10 +1,10 @@
 {#- Views DuckWake runs that no streaming_view model of this project defines (a model deleted or renamed).
     `dbt run-operation duckwake_drop_orphans` lists them; `--args '{dry_run: false}'` stops and drops them and
-    their tables, readers before the views they read. Views in `keep` (job ids) are left alone, and so is an
+    their tables, readers before the views they read. Views in `keep` (`schema.table`) are left alone, and so is an
     orphan that a view of the project still reads. -#}
 {% macro duckwake_drop_orphans(dry_run=true, keep=[]) %}
   {% set defined = [] %}
-  {% for n in duckwake._models('streaming_view') %}{% do defined.append(n.alias) %}{% endfor %}
+  {% for n in duckwake._models('streaming_view') %}{% do defined.append(n.schema ~ '.' ~ n.alias) %}{% endfor %}
   {% set left = [] %}
   {% for job in duckwake._jobs().keys() | sort if job not in defined and job not in keep %}{% do left.append(job) %}{% endfor %}
   {% set edges = duckwake._call('deps', "SELECT DISTINCT upstream_job, job_id FROM " ~ duckwake._lake()

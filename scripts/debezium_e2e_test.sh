@@ -25,7 +25,7 @@ VIEWS=(orders_mirror orders_paid orders_by_status docs_mirror)
 dc() { docker compose --profile debezium "$@"; }
 pg() { dc exec -T pg-source psql -v ON_ERROR_STOP=1 -qtA -U shop -d shop "$@"; }
 sql() { "$BIN" sql --csv "$1" 2>>"$OUT/sql.log" | tail -1; }
-status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
+status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
 
 verify_views() {
   local rc=0 v

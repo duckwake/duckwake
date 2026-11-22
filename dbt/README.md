@@ -62,7 +62,9 @@ models:
 
 Add a `generate_schema_name` macro that returns the schema as named (the example's
 [`macros/generate_schema_name.sql`](example/macros/generate_schema_name.sql)): a view is named by its lake
-table, and dbt's default would make it `main_analytics`.
+table, `schema.table`, and dbt's default would make it `main_analytics`. Models in two schemas may share a table
+name; dbt model names are unique, so give one an `alias` (the example's `staging_game_totals` is
+`staging.game_totals`, beside `analytics.game_totals`).
 
 `duckwake_setup()` connects to the catalog in the `duckwake_catalog` var or the `DUCKWAKE_CATALOG` environment, and
 the data path in `duckwake_data_path` or `DUCKWAKE_DATA_PATH`. The catalog's password comes from `PGPASSWORD`.

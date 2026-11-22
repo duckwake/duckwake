@@ -26,6 +26,6 @@ wait "$PRODUCER"; kill -TERM "$W2"; wait "$W2" || true
 
 log "w1's last commit vs. the takeover"
 "$BIN" sql "SELECT worker, min(epoch) AS first_epoch, max(epoch) AS last_epoch, count(*) AS commits
-            FROM lake.__duckwake.checkpoints WHERE job_id = 'clicks_per_window' GROUP BY ALL ORDER BY first_epoch"
+            FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.clicks_per_window' GROUP BY ALL ORDER BY first_epoch"
 log "drain on w2"; drain w2 "$OUT/w2.log"
 log "verify"; verify_all

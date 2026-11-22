@@ -27,7 +27,7 @@ trap 'for w in w1 w2 w3; do [[ -f $OUT/$w.pid ]] && kill -9 "$(pid $w)" 2>/dev/n
 # "view owner" per view; "-" when unassigned.
 owners() {
   local q="" v
-  for v in "${VIEWS[@]}"; do q+="${q:+ UNION ALL }SELECT '$v', coalesce(owner_worker, '-') FROM lake.__duckwake.lease_$v"; done
+  for v in "${VIEWS[@]}"; do q+="${q:+ UNION ALL }SELECT '$v', coalesce(owner_worker, '-') FROM lake.__duckwake.\"lease_analytics.$v\""; done
   "$BIN" sql --csv "$q" 2>/dev/null | tr ',' ' '
 }
 owner() { owners | awk -v v="$1" '$1 == v {print $2}'; }

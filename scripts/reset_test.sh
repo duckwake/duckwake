@@ -8,7 +8,7 @@ show() {
   "$BIN" sql "SELECT (SELECT count(*) FROM lake.analytics.clicks_per_window) AS window_rows,
                      (SELECT count(*) FROM lake.analytics.big_spend) AS big_spend_rows,
                      (SELECT count(*) FROM lake.analytics.game_totals) AS game_total_rows,
-                     (SELECT count(*) FROM lake.__duckwake.state_clicks_per_window) AS open_state_rows,
+                     (SELECT count(*) FROM lake.__duckwake.\"state_analytics.clicks_per_window\") AS open_state_rows,
                      (SELECT max(epoch) FROM lake.__duckwake.checkpoints) AS last_epoch"
 }
 mkdir -p "$OUT"

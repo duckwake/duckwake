@@ -19,9 +19,10 @@
   {{ return(load_result(name).table) }}
 {% endmacro %}
 
-{#- Every view DuckWake has, as a dict from job id (the table name) to status. -#}
+{#- Every view DuckWake has, as a dict from its name (`schema.table`, its job id) to status. The ingest jobs of
+    database sources, named like their sources with no schema, are left out. -#}
 {% macro _jobs() %}
-  {% set rows = duckwake._call('duckwake_jobs', 'SELECT job_id, status FROM duckwake_jobs()') %}
+  {% set rows = duckwake._call('duckwake_jobs', "SELECT job_id, status FROM duckwake_jobs() WHERE contains(job_id, '.')") %}
   {% set out = {} %}
   {% for r in rows.rows %}{% do out.update({r[0]: r[1]}) %}{% endfor %}
   {{ return(out) }}

@@ -26,7 +26,7 @@ fi
 # The password reaches DuckWake as a reference, never stored in the lake.
 export DUCKWAKE_MY_PASSWORD=dw-secret
 sql() { "$BIN" sql --csv "$1" 2>>"$OUT/sql.log" | tail -1; }
-status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
+status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
 WORKER=""
 start_worker() { "$BIN" run $WORKER_FLAGS --worker w1 --flush-every 3s --merge-every 7s >>"$OUT/worker.log" 2>&1 & WORKER=$!; }
 stop_worker() { [[ -z $WORKER ]] || { kill -TERM "$WORKER" 2>/dev/null; wait "$WORKER" 2>/dev/null || true; WORKER=""; }; }
@@ -175,7 +175,7 @@ log "drop-source"
 stop_worker
 "$BIN" stop orders_by_status >/dev/null
 if out=$("$BIN" drop-source shop 2>&1); then echo "drop-source was not refused"; failed=1
-else echo "$out" | grep -o "views orders_by_status read source shop's tables[^;]*" || { echo "$out"; failed=1; }; fi
+else echo "$out" | grep -o "views analytics.orders_by_status read source shop's tables[^;]*" || { echo "$out"; failed=1; }; fi
 "$BIN" drop orders_by_status >/dev/null
 "$BIN" drop-source shop
 mirrors=$(sql "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'shop'")

@@ -23,8 +23,8 @@ run_worker() {
 pid() { cat "$OUT/$1.pid"; }
 trap 'for w in w1 w2; do [[ -f $OUT/$w.pid ]] && kill -9 "$(pid $w)" 2>/dev/null || true; done' EXIT
 q() { "$BIN" sql --csv "$1" 2>/dev/null | sed -n 1p; }
-status() { q "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
-epoch() { q "SELECT coalesce(max(epoch), 0) FROM lake.__duckwake.checkpoints WHERE job_id = '$1'"; }
+status() { q "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
+epoch() { q "SELECT coalesce(max(epoch), 0) FROM lake.__duckwake.checkpoints WHERE job_id IN ('$1', 'analytics.$1')"; }
 columns() { q "SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'lake' AND schema_name = 'analytics' AND table_name = '$1'"; }
 # Waits up to $2 seconds for the condition $3 (evaluated afresh each second) to hold, and reports it as $1.
 check() {
@@ -40,7 +40,7 @@ expect_error() {
   if out=$("$@" 2>&1); then echo "FAIL: $what was accepted: $out"; failed=1; else echo "$what refused: $(echo "$out" | grep -m1 -i error | cut -c1-140)"; fi
 }
 all_committed() { for v in "${VIEWS[@]}"; do (( $(epoch "$v") >= $1 )) || return 1; done; }
-starts() { cat "$OUT"/w*.log | grep -c "job started job=$1 " || true; }
+starts() { cat "$OUT"/w*.log | grep -c "job started job=analytics.$1 " || true; }
 alive() {
   for w in w1 w2; do kill -0 "$(pid $w)" 2>/dev/null || { echo "FAIL: $w died"; tail -5 "$OUT/$w.log"; failed=1; }; done
   if "$BIN" jobs 2>/dev/null | grep -q ' failed '; then echo "FAIL: a view failed"; "$BIN" jobs; failed=1; fi
@@ -92,7 +92,7 @@ s0=$(starts game_totals); e0=$(epoch game_totals)
 "$BIN" alter-view game_totals --epoch-interval 3s
 check "game_totals restarted with its new settings" 20 '(( $(starts game_totals) > s0 ))'
 check "and commits on from epoch $e0" 20 '(( $(epoch game_totals) > e0 ))'
-[[ $(q "SELECT definition->>'epoch_interval' FROM lake.__duckwake.jobs WHERE job_id = 'game_totals'") == 3s ]] \
+[[ $(q "SELECT definition->>'epoch_interval' FROM lake.__duckwake.jobs WHERE job_id = 'analytics.game_totals'") == 3s ]] \
   || { echo "FAIL: game_totals' epoch interval was not changed"; failed=1; }
 alive
 
@@ -102,15 +102,15 @@ GT_SQL="SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS av
   GROUP BY ALL HAVING avg(amount) > 49.5;"
 s0=$(starts game_totals); e0=$(epoch game_totals)
 out=$("$BIN" create-view analytics.game_totals --if-exists update --epoch-interval 3s --sql "$GT_SQL" 2>&1)
-[[ $out == "unchanged view game_totals" ]] && echo "the same view, reformatted: $out" \
+[[ $out == "unchanged view analytics.game_totals" ]] && echo "the same view, reformatted: $out" \
   || { echo "FAIL: rerunning the same view said: $out"; failed=1; }
 sleep 3
 (( $(starts game_totals) == s0 )) || { echo "FAIL: an unchanged rerun restarted game_totals"; failed=1; }
 expect_error "an existing view without --if-exists" "$BIN" create-view analytics.game_totals --epoch-interval 3s --sql "$GT_SQL"
 out=$("$BIN" create-view analytics.game_totals --if-exists update --epoch-interval 2s --sql "$GT_SQL" 2>&1)
-[[ $out == "altered view game_totals: epoch_interval 2s,"* ]] && echo "$out" || { echo "FAIL: a new interval said: $out"; failed=1; }
+[[ $out == "altered view analytics.game_totals: epoch_interval 2s,"* ]] && echo "$out" || { echo "FAIL: a new interval said: $out"; failed=1; }
 check "game_totals restarted with 2 s epochs" 20 '(( $(starts game_totals) > s0 ))'
-[[ $(q "SELECT definition->>'epoch_interval' FROM lake.__duckwake.jobs WHERE job_id = 'game_totals'") == 2s ]] \
+[[ $(q "SELECT definition->>'epoch_interval' FROM lake.__duckwake.jobs WHERE job_id = 'analytics.game_totals'") == 2s ]] \
   || { echo "FAIL: game_totals' epoch interval is not 2s"; failed=1; }
 expect_error "a changed query with --if-exists update" "$BIN" create-view analytics.game_totals --if-exists update \
   --epoch-interval 2s --sql "${GT_SQL/49.5/50}"

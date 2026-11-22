@@ -40,7 +40,7 @@ log "if_exists := 'update' over SQL, as dbt reruns a model"
 GT="'SELECT game_id, count(*) AS n, sum(amount) AS revenue, avg(amount) AS avg_amount, min(amount) AS lo, max(amount) AS hi
    FROM clicks GROUP BY ALL HAVING avg(amount) > 49.5'"
 out=$(remote "CALL duckwake_create_view('analytics.game_totals', $GT, epoch_interval := '2s', if_exists := 'update')" 2>&1)
-[[ $out == *"unchanged view game_totals"* ]] && echo "rerun: unchanged" || { echo "FAIL: a rerun said: $out"; exit 1; }
+[[ $out == *"unchanged view analytics.game_totals"* ]] && echo "rerun: unchanged" || { echo "FAIL: a rerun said: $out"; exit 1; }
 if out=$(remote "CALL duckwake_create_view('analytics.game_totals', 'SELECT game_id, count(*) AS n FROM clicks GROUP BY ALL',
     epoch_interval := '2s', if_exists := 'update')" 2>&1); then
   echo "FAIL: a changed query was accepted: $out"; exit 1
@@ -85,7 +85,7 @@ log "metrics"
 curl -s "http://$METRICS/metrics" >"$OUT/metrics.txt"
 grep -E '^duckwake_(epoch|rows_in_total|freshness_seconds)\{' "$OUT/metrics.txt"
 for v in "${VIEWS[@]}"; do
-  grep -q "duckwake_epoch{worker=\"w1\",view=\"$v\"}" "$OUT/metrics.txt" || { echo "FAIL: no metrics for $v"; exit 1; }
+  grep -q "duckwake_epoch{worker=\"w1\",view=\"analytics.$v\"}" "$OUT/metrics.txt" || { echo "FAIL: no metrics for $v"; exit 1; }
 done
 
 log "verify over SQL"
