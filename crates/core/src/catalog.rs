@@ -90,8 +90,8 @@ pub fn input_columns<'a>(name: &str, sources: &'a HashMap<String, SourceDef>, la
     lakes.iter().find(|l| l.name == name).map(|l| l.columns.as_slice()).with_context(|| format!("input {name} of the view is gone"))
 }
 
-/// Resolves the names a view's FROM uses that are not Kafka sources: first to a view (by job id, or by the
-/// table it writes), then to a lake table. Names that are neither are left to DuckDB, which binds them or
+/// Resolves the names a view's FROM uses that are not Kafka sources: first to a view (by the table it writes),
+/// then to a lake table. Names that are neither are left to DuckDB, which binds them or
 /// fails. Every such table becomes a lake input of the view; the compiler decides which of them it reads as
 /// a change feed and which it joins as a lookup.
 fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMap<String, SourceDef>) -> Result<Vec<LakeInput>> {
@@ -100,7 +100,7 @@ fn resolve_lake_inputs(conn: &Connection, job: &str, sql: &str, sources: &HashMa
         if sources.contains_key(&name) {
             continue;
         }
-        let upstream = if name.contains('.') { resolve_view(conn, &name).ok() } else { job_status(conn, &name)?.map(|_| name.clone()) };
+        let upstream = view_read_by(conn, &name)?;
         if let Some(up) = upstream {
             if up == job || reads_transitively(conn, &up, job)? {
                 bail!("view {job} would read itself through {name}: cycles between views are not allowed");
@@ -272,36 +272,53 @@ pub fn load_sources(conn: &Connection) -> Result<HashMap<String, SourceDef>> {
     Ok(out)
 }
 
-/// A view is named by the DuckLake table it maintains (`analytics.clicks_per_min`, or `lake.analytics...`;
-/// a bare name means the `main` schema). Its job id is the table name, which keys the lease, state and
-/// checkpoints, so table names must be unique across schemas. `sink` is the deprecated form that named the
-/// job and the table separately. Returns (job id, `lake.schema.table`).
-pub fn view_names(name: &str, sink: Option<&str>) -> Result<(String, String)> {
-    if let Some(sink) = sink {
-        let (c, s, t) = crate::lake::qualified_table(sink)?;
-        return Ok((name.to_string(), format!("{c}.{s}.{t}")));
-    }
+/// A view is named by the DuckLake table it maintains: `analytics.clicks_per_min`, or `lake.analytics...`; a bare
+/// name means the `main` schema. Its job id is `schema.table`, which keys its lease, state and checkpoints, so
+/// two schemas can each have a view of the same table name. An ingest job's id is its source's name, which has
+/// no dot, so the two never meet. Returns (job id, `lake.schema.table`).
+pub fn view_names(name: &str) -> Result<(String, String)> {
     let (c, s, t) = if name.contains('.') { crate::lake::qualified_table(name)? } else { (LAKE.into(), "main".into(), name.into()) };
-    Ok((t.clone(), format!("{c}.{s}.{t}")))
+    crate::lake::check_name("schema", &s)?;
+    crate::lake::check_name("view", &t)?;
+    Ok((format!("{s}.{t}"), format!("{c}.{s}.{t}")))
 }
 
-/// The job id of a view given by job id or by its table name (`analytics.clicks_per_min`).
+/// Whether a job id is a view's (`schema.table`) rather than an ingest job's (a source name).
+pub fn is_view_id(job: &str) -> bool {
+    job.contains('.')
+}
+
+/// The job id of the view a command names: `schema.table` or `lake.schema.table`, or a bare table name when
+/// exactly one schema has a view of that name. A bare name no view has is a database source's ingest job.
 pub fn resolve_view(conn: &Connection, name: &str) -> Result<String> {
-    if !name.contains('.') {
-        return Ok(name.to_string());
-    }
-    let (_, schema, table) = crate::lake::qualified_table(name)?;
-    let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs ORDER BY job_id"))?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (job, def) = row?;
-        let Some(def) = view_def(&def)? else { continue };
-        let (_, s, t) = crate::lake::qualified_table(&def.sink)?;
-        if s == schema && t == table {
-            return Ok(job);
+    if name.contains('.') {
+        let (_, s, t) = crate::lake::qualified_table(name)?;
+        let job = format!("{s}.{t}");
+        if job_status(conn, &job)?.is_none() {
+            bail!("no view writes {name:?}");
         }
+        return Ok(job);
     }
-    bail!("no view writes {name:?}")
+    let mut stmt = conn.prepare(&format!("SELECT job_id FROM {CTL}.jobs WHERE ends_with(job_id, ?) ORDER BY job_id"))?;
+    let views = stmt.query_map([format!(".{name}")], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
+    match views.as_slice() {
+        [job] => Ok(job.clone()),
+        [] if job_status(conn, name)?.is_some() => Ok(name.to_string()),
+        [] => bail!("no view or database source named {name:?}"),
+        _ => bail!("{} views are named {name:?}: name one by its schema, one of {}", views.len(), views.join(", ")),
+    }
+}
+
+/// The view a name in a view's SQL reads, if it is one: names there mean what they mean to DuckDB, so a bare
+/// name is a table of the `main` schema.
+fn view_read_by(conn: &Connection, name: &str) -> Result<Option<String>> {
+    let job = if name.contains('.') {
+        let (_, s, t) = crate::lake::qualified_table(name)?;
+        format!("{s}.{t}")
+    } else {
+        format!("main.{name}")
+    };
+    Ok(job_status(conn, &job)?.map(|_| job))
 }
 
 pub struct CreateView<'a> {
@@ -375,7 +392,10 @@ impl Outcome {
 /// transaction. The job starts in status `created`; `start` assigns it to a worker. An existing view of that
 /// name is refused, updated or replaced as `if_exists` says.
 pub fn create_view(conn: &Connection, v: &CreateView) -> Result<(JobDef, Outcome)> {
-    crate::lake::check_name("view", v.job_id)?;
+    if !is_view_id(v.job_id) {
+        bail!("view id {:?}: expected schema.table (catalog::view_names)", v.job_id);
+    }
+    crate::lake::check_view_ids(conn)?;
     if v.checkpoint != "ducklake" {
         bail!("CHECKPOINT {:?}: only the ducklake backend is implemented (object storage state is phase 3)", v.checkpoint);
     }
@@ -1191,7 +1211,7 @@ pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<Vec<String>>
                 &format!(
                     "SELECT max(snapshot_id) FROM ducklake_snapshots({}) WHERE json_extract_string(commit_extra_info, {})::BIGINT = ?",
                     lit(LAKE),
-                    lit(&format!("$.jobs.{job}"))
+                    lit(&format!("$.jobs.\"{job}\""))
                 ),
                 [to_epoch],
                 |r| r.get::<_, Option<i64>>(0),
@@ -1482,6 +1502,69 @@ mod tests {
         assert_ne!(normalize_sql(r#"SELECT 1 AS "a  b""#), normalize_sql(r#"SELECT 1 AS "a b""#));
         assert_eq!(normalize_sql("SELECT 'it''s'   AS x"), "SELECT 'it''s' AS x");
         assert_eq!(normalize_sql("SELECT ';' AS x;;"), "SELECT ';' AS x");
+    }
+
+    #[test]
+    fn a_view_is_named_schema_dot_table() {
+        assert_eq!(view_names("analytics.daily").unwrap(), ("analytics.daily".into(), "lake.analytics.daily".into()));
+        assert_eq!(view_names("lake.analytics.daily").unwrap(), ("analytics.daily".into(), "lake.analytics.daily".into()));
+        assert_eq!(view_names("daily").unwrap(), ("main.daily".into(), "lake.main.daily".into()));
+        assert!(view_names("other.analytics.daily").is_err());
+        assert!(view_names("Analytics.daily").is_err());
+        assert!(view_names("analytics.Daily").is_err());
+        assert!(is_view_id("main.daily") && !is_view_id("shop"));
+    }
+
+    /// Views `analytics.daily`, `staging.daily` and `main.solo`, and the ingest job of database source `shop`.
+    fn catalog_with_names() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH ':memory:' AS {LAKE}; CREATE SCHEMA {CTL};
+             CREATE TABLE {CTL}.jobs (job_id VARCHAR, definition JSON, version INTEGER, status VARCHAR,
+               created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);
+             INSERT INTO {CTL}.jobs VALUES
+               ('analytics.daily', '{{}}', 1, 'running', now(), now()),
+               ('staging.daily', '{{}}', 1, 'running', now(), now()),
+               ('main.solo', '{{}}', 1, 'running', now(), now()),
+               ('shop', '{{\"ingest\": \"shop\"}}', 1, 'running', now(), now());"
+        ))
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_command_names_a_view_by_schema_or_by_a_table_name_only_one_schema_has() {
+        let conn = catalog_with_names();
+        assert_eq!(resolve_view(&conn, "analytics.daily").unwrap(), "analytics.daily");
+        assert_eq!(resolve_view(&conn, "lake.staging.daily").unwrap(), "staging.daily");
+        assert_eq!(resolve_view(&conn, "solo").unwrap(), "main.solo");
+        assert_eq!(resolve_view(&conn, "shop").unwrap(), "shop");
+        let e = resolve_view(&conn, "daily").unwrap_err().to_string();
+        assert!(e.contains("analytics.daily, staging.daily"), "{e}");
+        assert!(resolve_view(&conn, "other.daily").unwrap_err().to_string().contains("no view writes"));
+        assert!(resolve_view(&conn, "nope").unwrap_err().to_string().contains("no view or database source"));
+        // A table name that only ends like a view's is not that view.
+        assert!(resolve_view(&conn, "aily").is_err());
+    }
+
+    #[test]
+    fn a_name_in_a_views_sql_means_what_it_means_to_duckdb() {
+        let conn = catalog_with_names();
+        assert_eq!(view_read_by(&conn, "solo").unwrap().as_deref(), Some("main.solo"));
+        assert_eq!(view_read_by(&conn, "staging.daily").unwrap().as_deref(), Some("staging.daily"));
+        assert_eq!(view_read_by(&conn, "lake.analytics.daily").unwrap().as_deref(), Some("analytics.daily"));
+        // Bare, it is main.daily, which is no view (a lake table, if anything).
+        assert_eq!(view_read_by(&conn, "daily").unwrap(), None);
+        assert_eq!(view_read_by(&conn, "shop").unwrap(), None);
+    }
+
+    #[test]
+    fn a_lake_with_views_named_by_0_2_is_refused() {
+        let conn = catalog_with_names();
+        crate::lake::check_view_ids(&conn).unwrap();
+        conn.execute_batch(&format!("INSERT INTO {CTL}.jobs VALUES ('orders', '{{}}', 1, 'running', now(), now())")).unwrap();
+        let e = crate::lake::check_view_ids(&conn).unwrap_err().to_string();
+        assert!(e.contains("views orders were created by DuckWake 0.2"), "{e}");
     }
 
     /// A control schema with one view `v`, running, owned by `w1` at lease epoch 3.

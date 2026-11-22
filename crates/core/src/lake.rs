@@ -165,6 +165,23 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a lake whose views have ids from before DuckWake 0.3 (a bare table name; now `schema.table`). A worker
+/// will not run on it and no view can be created in it; `duckwake drop` still drops such a view.
+pub fn check_view_ids(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT job_id FROM {CTL}.jobs WHERE NOT contains(job_id, '.') AND definition->>'ingest' IS NULL ORDER BY job_id"
+    ))?;
+    let old = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
+    if !old.is_empty() {
+        bail!(
+            "views {} were created by DuckWake 0.2, which named a view by its table alone; since 0.3 a view is named \
+             schema.table. Drop each (`duckwake drop <view>`, which still works) and create it again, or use a new lake",
+            old.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Adds a column to a control table unless it has it. Several processes may bootstrap the same lake at
 /// once: one that loses the race finds the column there and goes on.
 pub fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {

@@ -10,6 +10,8 @@ use duckdb::Connection;
 use std::collections::HashMap;
 
 const SINK: &str = "lake.analytics.v";
+/// The view's job id, `schema.table` as DuckWake names it: a dot in it must survive every table name it keys.
+const JOB: &str = "analytics.v";
 
 /// A source of the tests.
 pub(crate) struct TestSource {
@@ -102,11 +104,11 @@ struct Def {
 
 impl Def {
     fn view(&self) -> View<'_> {
-        View { id: "v", sink: SINK, late_data: self.late.then_some("lake.analytics.v_late"), plan: &self.plan }
+        View { id: JOB, sink: SINK, late_data: self.late.then_some("lake.analytics.v_late"), plan: &self.plan }
     }
 }
 
 fn def_for(sql: &str, late: bool) -> Def {
     let (conn, sources) = setup();
-    Def { plan: plan::compile(&conn, "v", sql, &sources).unwrap(), late }
+    Def { plan: plan::compile(&conn, JOB, sql, &sources).unwrap(), late }
 }

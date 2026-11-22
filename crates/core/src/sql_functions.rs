@@ -362,7 +362,7 @@ impl Spec for CreateView {
             max_late_rows: a.opt_num("max_late_rows")?,
             if_exists: api::if_exists(a.opt("if_exists"), a.flag("replace"))?,
         };
-        let (def, _, msg) = api.with(|c| api::create_view(c, a.arg(0), a.arg(1), &o, None))?;
+        let (def, _, msg) = api.with(|c| api::create_view(c, a.arg(0), a.arg(1), &o))?;
         one(&def.job_id, msg)
     }
 }

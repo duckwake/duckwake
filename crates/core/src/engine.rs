@@ -442,6 +442,7 @@ fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Resul
     // whole results: without it they stream, and stay inside the memory limit.
     conn.execute_batch("SET preserve_insertion_order = false")?;
     crate::lake::bootstrap(&conn)?;
+    crate::lake::check_view_ids(&conn)?;
     catalog::set_control_inlining(&conn)?;
     failover::register(&conn, &cfg.worker_id, cfg.metrics.as_ref().and_then(|m| m.advertised()).as_deref())?;
     if let Some(m) = &cfg.metrics {

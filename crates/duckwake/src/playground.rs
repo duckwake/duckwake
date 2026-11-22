@@ -691,8 +691,6 @@ struct CreateViewReq {
     /// The table the view maintains; a bare name means the `analytics` schema here.
     name: String,
     sql: String,
-    /// Deprecated: a table named separately from the view.
-    sink: Option<String>,
     late_data: Option<String>,
     epoch_interval: Option<String>,
     start: Option<bool>,
@@ -702,7 +700,7 @@ async fn create_view(State(app): State<Shared>, Json(r): Json<CreateViewReq>) ->
     with_conn(&app, move |app, conn| {
         let name = r.name.trim();
         let name = if name.contains('.') { name.to_string() } else { format!("analytics.{name}") };
-        let (job_id, table) = catalog::view_names(&name, r.sink.as_deref().map(str::trim).filter(|s| !s.is_empty()))?;
+        let (job_id, table) = catalog::view_names(&name)?;
         let late = r.late_data.filter(|s| !s.trim().is_empty());
         let (def, _) = catalog::create_view(
             conn,
@@ -901,7 +899,6 @@ async fn demo(State(app): State<Shared>) -> ApiResult {
             Json(CreateViewReq {
                 name: name.into(),
                 sql: sql.into(),
-                sink: None,
                 late_data: late.map(String::from),
                 epoch_interval: Some("3s".into()),
                 start: Some(true),
