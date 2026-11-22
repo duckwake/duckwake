@@ -5,7 +5,7 @@
 # step of the epoch); after every crash all three views verify, each against a batch recomputation at its own
 # checkpoint (Kafka for the first, time travel for the others), and again after draining. Then the rest of the
 # gate: dropping a view that another view reads is refused, and an update to a lake table that a windowed
-# view reads (windows need insert-only input) stops that view while the chain keeps running.
+# view reads, after its window closed, is a late correction in its late-data table (C4) while the chain keeps running.
 # WORKER_FLAGS="--pipeline ..." runs it pipelined.
 source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-2s}
@@ -112,16 +112,19 @@ else
 fi
 for v in idle_10s idle_30s; do "$BIN" verify "$v" 2>&1 | tail -1 | grep '^VERIFY OK' || { echo "verify $v failed"; failed=1; }; done
 
-log "an update to a lake table a windowed view reads stops that view, and only that view"
+log "an update to a lake table a windowed view reads, after its window closed, is a late correction"
 "$BIN" sql "CREATE SCHEMA lake.shop; CREATE TABLE lake.shop.orders (id INTEGER, amount DOUBLE)" >/dev/null
-"$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --sql "SELECT window_start, count(*) AS n, sum(amount) AS total
-  FROM TUMBLE(shop.orders, _commit_ts, INTERVAL 10 SECOND) WHERE amount > 5 GROUP BY ALL" | sed -n 1p
+"$BIN" create-view analytics.orders_big --epoch-interval "$EPOCH" --late-data lake.analytics.orders_big_late \
+  --sql "SELECT window_start, count(*) AS n, sum(amount) AS total
+         FROM TUMBLE(shop.orders, _commit_ts, INTERVAL 2 SECOND) WHERE amount > 5 GROUP BY ALL" | sed -n 1p
 "$BIN" start orders_big --worker w1 >/dev/null
 "$BIN" sql "INSERT INTO lake.shop.orders SELECT i, i FROM range(20) t(i)" >/dev/null; sleep 6
 "$BIN" sql "UPDATE lake.shop.orders SET amount = 0 WHERE id = 10" >/dev/null; sleep 6
 status() { "$BIN" sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'" --csv 2>/dev/null | tail -1; }
-grep -o "view orders_big needs.*" "$OUT/worker.log" | sed -n 1p
-[[ $(status orders_big) == failed ]] && echo "orders_big: failed, as it must" || { echo "orders_big is $(status orders_big), not failed"; failed=1; }
+[[ $(status orders_big) == running ]] && echo "orders_big: still running" || { echo "orders_big is $(status orders_big), not running"; failed=1; }
+corrections=$("$BIN" sql --csv "SELECT count(*) FROM lake.analytics.orders_big_late WHERE _duckwake_weight = -1 AND id = 10" 2>/dev/null | tail -1)
+[[ $corrections == 1 ]] && echo "orders_big: the update of order 10 is a late correction" || { echo "orders_big: $corrections late corrections for order 10, not 1"; failed=1; }
+"$BIN" verify orders_big 2>&1 | tail -1 | grep '^VERIFY OK' || { echo "verify orders_big failed"; failed=1; }
 for v in "${CHAIN[@]}"; do [[ $(status "$v") == running ]] || { echo "$v is $(status "$v"), not running"; failed=1; }; done
 kill -0 "$pid" 2>/dev/null && echo "worker still running; the chain is still running" || { echo "the worker died"; failed=1; }
 kill -TERM "$pid"; wait "$pid" || true

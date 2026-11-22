@@ -87,11 +87,14 @@ fn retracting_sources_pick_their_sinks_and_refuse_what_is_not_supported_yet() {
     assert_eq!(sinks("SELECT ts FROM clicks UNION ALL SELECT ts FROM changes"), "Sink(counted rows)");
     // A window is emitted once and never retracted, so its sink stays an append sink.
     assert_eq!(sinks("SELECT window_start, count(*) AS n FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL"), "Sink(append)");
+    // Its late rows, changes to closed windows, go to the late-data table with their weights (C4).
     let late = Circuit::compile(&def_for("SELECT window_start, count(*) AS n FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL", true).view());
-    assert!(late.unwrap_err().to_string().contains("late-data table"));
+    assert!(ops(&late.unwrap()).iter().any(|o| o == "Sink(late data)"));
+    // MIN in a window over a source that can retract keeps each value's count.
     let (conn, sources) = super::setup();
     let window_min = "SELECT window_start, min(amount) AS lo FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
-    assert!(crate::plan::compile(&conn, "v", window_min, &sources).unwrap_err().to_string().contains("count per value"));
+    let p = crate::plan::compile(&conn, "v", window_min, &sources).unwrap();
+    assert!(p.merge_ops.iter().any(|(_, op)| *op == crate::plan::MergeOp::Counts), "{:?}", p.merge_ops);
 }
 
 #[test]
@@ -146,9 +149,6 @@ fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
 fn aggregates_not_supported_yet_are_refused_with_what_is() {
     let (conn, sources) = super::setup();
     let err = |sql: &str| crate::plan::compile(&conn, "v", sql, &sources).unwrap_err().to_string();
-    // A window keeps count(DISTINCT)'s values as a list, which a retraction cannot take a value out of.
-    let e = err("SELECT window_start, count(DISTINCT user_id) AS u FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
-    assert!(e.contains("count per value"), "{e}");
     let e = err("SELECT game_id, sum(DISTINCT amount) AS s FROM clicks GROUP BY ALL");
     assert!(e.contains("count(DISTINCT ...) is"), "{e}");
     // An aggregate outside the list names the ones that are supported.
@@ -159,9 +159,6 @@ fn aggregates_not_supported_yet_are_refused_with_what_is() {
     // arg_min and arg_max are refused with the reason: ties make the batch result depend on row order.
     let e = err("SELECT game_id, arg_max(user_id, amount) AS top FROM clicks GROUP BY ALL");
     assert!(e.contains("duckwake_verify could not check"), "{e}");
-    // bool_and is MIN of a BOOLEAN: in a window over a source that can retract it needs a count per value.
-    let e = err("SELECT window_start, bool_and(amount > 3) AS b FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL");
-    assert!(e.contains("count per value"), "{e}");
     // HAVING in a window may read keys and aggregates, not other columns.
     let e = err("SELECT window_start, count(*) AS n FROM TUMBLE(clicks, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING user_id = 'u1'");
     assert!(!e.is_empty());

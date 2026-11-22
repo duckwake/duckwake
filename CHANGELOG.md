@@ -32,7 +32,14 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   `scripts/pg_ingest_test.sh`, in order and pipelined.
 - `duckwake_drop_source(name)` (`drop-source NAME`); for a PostgreSQL source it also drops the mirror tables,
   the slot, and the publication DuckWake created.
-
+- Windowed views take the updates and deletes of their lake inputs ([#38](https://github.com/duckwake/duckwake/issues/38)), of a
+  table or of a view whose rows change (an upsert view's, say), where they used to read them insert-only and
+  stop. A change to a window still open revises it: `min`, `max`, `bool_and`/`bool_or`, `count(DISTINCT)`,
+  `approx_count_distinct` and the quantiles keep each value's count, so a deleted extreme gives way to the next
+  value. A change to a window already closed is a late correction: the late-data table gets it with a
+  `_duckwake_weight` of -1 (or +1), or `rows_late` counts it, and `verify` adds it back. Views created before
+  keep reading insert-only. A reset of a view empties the windowed views that read it, which backfill again, as
+  before: its rewrite of closed windows would otherwise only be late corrections. Gate: `scripts/retract_test.sh`.
 - Debezium sources ([#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` reads a topic of
   Debezium change events, with or without `schemas.enable`. Its views set `upsert_key` to the table's primary
   key: inserts, snapshot reads and updates replace a key's row from `after`, deletes remove it (keyed by the
@@ -91,7 +98,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - `verify` failed now and then on views with `corr`, `regr_slope` or the variances (`bf_spread` in
   `backfill_test.sh`, about one run in six): it rounded DOUBLE and FLOAT columns to 10 significant digits on both
   sides, and two results 10⁻¹³ apart could round to different values across a rounding step. It now compares
-  them within a relative 10⁻⁹, pairing the rows that differ by their other columns, which stay exact.
+  them within a relative 10⁻⁹, pairing the rows that differ by their other columns, which stay exact. Below 1
+  the bound is 10⁻⁹ absolutely: a `covar_samp` that is truly 0 came out as 5×10⁻¹⁵ in a window that took deletes.
 - A windowed view over another windowed view's `window_start` or `window_end` closed its window up to
   `--position-refresh` (5 minutes by default) late once the upstream view's inputs went idle: the upstream view,
   with no window left to close, stopped committing, so the watermark in its checkpoint, which the downstream
