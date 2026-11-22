@@ -19,11 +19,11 @@
 use crate::catalog::{self, lease_table, state_table, Checkpoint};
 use crate::failover;
 use crate::circuit::{Circuit, Cost, Counter, EpochCtx, SourceInput};
-use crate::kafka::{Chunk, Reader};
+use crate::sources::kafka::{Chunk, Reader};
 use crate::lake::{connect_again, ident, lit, quote_table, LakeConfig, CTL, LAKE};
 use crate::maintenance::{Maintenance, MaintenanceConfig};
 use crate::model::{parse_duration, JobDef, LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
-use crate::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
+use crate::sources::kafka::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use serde_json::json;
@@ -539,8 +539,8 @@ struct Worker {
     conns: Vec<Connection>,
     committer: Committer,
     jobs: BTreeMap<String, JobRuntime>,
-    /// Database sources' ingest jobs (PostgreSQL, MySQL), each on its own thread (`ingest`).
-    ingests: BTreeMap<String, crate::ingest::Handle>,
+    /// Database sources' ingest jobs (PostgreSQL, MySQL), each on its own thread (`sources::database`).
+    ingests: BTreeMap<String, crate::sources::database::Handle>,
     groups: BTreeMap<u64, Group>,
     next_group: u64,
     /// Epochs handed to the commit so far; the one staged next stages into table set `(rounds + 1) % 2`.
@@ -672,14 +672,14 @@ impl Worker {
     /// Starts a database source's ingest job on its own thread and connection. False when it is not ours.
     fn start_ingest(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
-        let spec = crate::ingest::Spec::load(conn, id)?;
+        let spec = crate::sources::database::Spec::load(conn, id)?;
         let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
-        let settings = crate::ingest::Settings {
+        let settings = crate::sources::database::Settings {
             worker: self.cfg.worker_id.clone(),
             position_refresh: self.cfg.position_refresh,
             metrics: self.cfg.metrics.clone(),
         };
-        let h = crate::ingest::Handle::spawn(crate::lake::connect_again(conn)?, settings, id.to_string(), lease, spec);
+        let h = crate::sources::database::Handle::spawn(crate::lake::connect_again(conn)?, settings, id.to_string(), lease, spec);
         self.ingests.insert(id.to_string(), h);
         Ok(true)
     }
@@ -846,7 +846,7 @@ impl Worker {
                     warn!(job = %id, error = %format!("{e:#}"), "lease race; retrying on next refresh");
                 }
                 // A topic created after the view started: wait for it, as Kafka consumers do.
-                Err(e) if crate::kafka::is_topic_missing(&e) => {
+                Err(e) if crate::sources::kafka::is_topic_missing(&e) => {
                     if self.waiting.insert(id.clone()) {
                         warn!(job = %id, error = %format!("{e:#}"), "waiting for the topic; retrying every refresh");
                     }
@@ -982,8 +982,8 @@ impl Worker {
         for s in names.iter().filter_map(|n| sources.get(n)) {
             let opts = s.options.clone();
             self.rt.block_on(async move {
-                let c = crate::kafka::client(&opts).await?;
-                crate::kafka::partitions(&c, &opts.topic).await
+                let c = crate::sources::kafka::client(&opts).await?;
+                crate::sources::kafka::partitions(&c, &opts.topic).await
             })?;
         }
         let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
@@ -1476,7 +1476,7 @@ fn stage_source(
     if chunks.iter().any(|c| c.fast.as_ref().is_some_and(|b| b.num_rows() > 0)) {
         let mut app = conn.appender_to_catalog_and_db(&format!("typed_{g}"), "memory", "main")?;
         for b in chunks.iter().filter_map(|c| c.fast.as_ref()).filter(|b| b.num_rows() > 0) {
-            app.append_record_batch(crate::decode::staging_batch(b)?)?;
+            app.append_record_batch(crate::sources::kafka::decode::staging_batch(b)?)?;
         }
         app.flush()?;
     }
@@ -1505,7 +1505,7 @@ fn stage_source(
         invalid = invalid_json_where(),
     ))?;
     let (rows_dead, rows_tombstones): (i64, i64) = conn.query_row(
-        &format!("SELECT count(*), count(*) FILTER (WHERE _err = {}) FROM {dead}", lit(crate::decode::TOMBSTONE)),
+        &format!("SELECT count(*), count(*) FILTER (WHERE _err = {}) FROM {dead}", lit(crate::sources::kafka::decode::TOMBSTONE)),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -1515,7 +1515,7 @@ fn stage_source(
             &format!(
                 "SELECT count(*), arg_min(_partition, (_partition, _offset)), arg_min(_offset, (_partition, _offset))
                    FROM {dead} WHERE _err = {}",
-                lit(crate::decode::UNAVAILABLE_ERR)
+                lit(crate::sources::kafka::decode::UNAVAILABLE_ERR)
             ),
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -1826,7 +1826,7 @@ fn stage_view(conn: &Connection, id: &str, j: &mut JobRuntime, kafka: &[Option<&
                  its row cannot be rebuilt. Set REPLICA IDENTITY FULL on the table, take a new Debezium snapshot of \
                  it, and replace the view",
                 input.name,
-                crate::decode::UNAVAILABLE
+                crate::sources::kafka::decode::UNAVAILABLE
             ))
             .into());
         }
@@ -2257,7 +2257,7 @@ fn commit(conn: &Connection, worker: &str, batch: &mut CommitBatch, fenced: &mut
             let offsets = serde_json::Value::Object(offsets);
             let ts = |us: Option<i64>| us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
             // An upsert view reads tombstones as deletes; every other view keeps them as dead letters.
-            let not_tombstones = if c.def.upsert.is_some() { format!(" WHERE _err <> {}", lit(crate::decode::TOMBSTONE)) } else { String::new() };
+            let not_tombstones = if c.def.upsert.is_some() { format!(" WHERE _err <> {}", lit(crate::sources::kafka::decode::TOMBSTONE)) } else { String::new() };
             if lean {
                 for (i, _) in c.inputs.iter().zip(&s.inputs).filter(|(_, si)| si.rows_dead > 0) {
                     let Some(dead) = &i.dead else { continue };

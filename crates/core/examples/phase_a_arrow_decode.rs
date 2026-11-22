@@ -13,10 +13,10 @@ use anyhow::Result;
 use duckdb::arrow::array::{new_null_array, ArrayRef, RecordBatch};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::{params, Connection};
-use duckwake_core::decode::{ArrowDecoder, Decoded};
-use duckwake_core::kafka::Msg;
+use duckwake_core::sources::kafka::decode::{ArrowDecoder, Decoded};
+use duckwake_core::sources::kafka::Msg;
 use duckwake_core::model::{SourceDef, SourceOptions};
-use duckwake_core::decode::{decode_sql, IS_JSON_OBJECT};
+use duckwake_core::sources::kafka::decode::{decode_sql, IS_JSON_OBJECT};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
@@ -391,8 +391,8 @@ fn produce_hostile(brokers: &str, topic: &str, n: usize, seed: u64) -> Result<()
     use rskafka::record::Record;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let c = duckwake_core::kafka::plain_client(brokers).await?;
-        duckwake_core::kafka::ensure_topic(&c, topic, PARTITIONS as i32).await?;
+        let c = duckwake_core::sources::kafka::plain_client(brokers).await?;
+        duckwake_core::sources::kafka::ensure_topic(&c, topic, PARTITIONS as i32).await?;
         for (p, msgs) in hostile_corpus(n, seed).into_iter().enumerate() {
             let pc = c.partition_client(topic, p as i32, UnknownTopicHandling::Retry).await?;
             for batch in msgs.chunks(500) {

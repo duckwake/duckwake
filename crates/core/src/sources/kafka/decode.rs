@@ -12,7 +12,7 @@
 //! arrow-json cannot decode alone therefore goes to the fallback rather than straight to the dead letters,
 //! and forms arrow-json accepts but yyjson may not (anywhere in the object, not only declared fields) are
 //! flagged.
-use crate::kafka::Msg;
+use crate::sources::kafka::Msg;
 use crate::lake::{ident, lit};
 use crate::model::SourceOptions;
 use anyhow::{bail, Result};

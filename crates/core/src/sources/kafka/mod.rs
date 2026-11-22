@@ -5,7 +5,12 @@
 //! Readers hand over chunks of consecutive messages. Where the source decodes in Arrow, each chunk is decoded
 //! on a blocking thread as it arrives, so the decode runs per partition and alongside the previous epoch,
 //! and the buffer holds typed columns plus only the payloads the SQL decode still needs.
-use crate::decode::ArrowDecoder;
+pub mod decode;
+
+/// The kind of a Kafka source in `__duckwake.sources`.
+pub const KIND: &str = "kafka";
+
+use decode::ArrowDecoder;
 use crate::model::SourceOptions;
 use duckdb::arrow::array::RecordBatch;
 use anyhow::{anyhow, bail, Context, Result};

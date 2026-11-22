@@ -1,16 +1,18 @@
 //! PostgreSQL sources (D1 of `docs/design/database-cdc-sources.md`): a source of kind `postgres` names tables
 //! of one database, and an ingest job of the same name keeps a mirror table of each in the lake, read from a
-//! logical replication slot (`ingest`). This module holds the definition and what is done to the database:
+//! logical replication slot (`sources::database`). This module holds the definition and what is done to the database:
 //! checks, the publication and slot, the type mapping, and reading through DuckDB's postgres extension.
 //!
 //! Every value crosses as PostgreSQL's text form, from the snapshot copy and from `pgoutput` alike, and is cast
 //! to the mirror column's DuckDB type in one place (`cast_sql`), so both paths agree.
+pub mod pgoutput;
+
 use crate::lake::{ident, lit, LAKE};
+use crate::sources::database::mirror::{cast_sql, MirrorColumn, MirrorTable};
+use crate::sources::database::{cast_error, stop, Batch, Change, Position, Read, Reader};
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
-use crate::ingest::{cast_error, stop, Batch, Change, Position, Read, Reader};
-use crate::mirror::{cast_sql, MirrorColumn, MirrorTable};
-use crate::pgoutput::{self, format_lsn, parse_lsn, Message, Snapshot};
+use pgoutput::{format_lsn, parse_lsn, Message, Snapshot};
 use serde::{Deserialize, Serialize};
 
 pub const KIND: &str = "postgres";
@@ -344,7 +346,7 @@ pub fn create(conn: &Connection, name: &str, options: &serde_json::Value) -> Res
         }
     };
 
-    let res = crate::catalog::create_ingest_source(conn, name, KIND, &serde_json::to_value(&opts)?, &opts.schema, &opts.tables);
+    let res = crate::sources::database::catalog::create(conn, name, KIND, &serde_json::to_value(&opts)?, &opts.schema, &opts.tables);
     if let Err(e) = res {
         // Leave nothing behind on the database for a source that does not exist.
         if slot_created {
@@ -398,7 +400,7 @@ pub fn drop(conn: &Connection, name: &str, opts: &PgOptions) -> Result<String> {
             opts.slot, opts.slot
         ),
     };
-    crate::catalog::drop_ingest_source(conn, name, &opts.tables)?;
+    crate::sources::database::catalog::drop(conn, name, &opts.tables)?;
     let _ = conn.execute_batch(&format!("DETACH DATABASE IF EXISTS {}", alias(name)));
     Ok(format!("source {name}: dropped with its mirror tables, slot {}{note}", opts.slot))
 }

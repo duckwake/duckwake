@@ -147,9 +147,13 @@ for _ in $(seq 1 30); do "$BIN" verify orders_by_status >"$OUT/verify_view.txt" 
 tail -1 "$OUT/verify_view.txt" | grep '^VERIFY OK' || { cat "$OUT/verify_view.txt"; failed=1; }
 
 log "a slot advanced past the lake stops the job"
-psql_src -c "INSERT INTO flags VALUES ('lost', 1)" >/dev/null
+# The worker stops first, so the lake cannot hold the insert: advancing the slot past it is then always ahead
+# of the lake. (Inserting first raced: an idle source moves the lake to the flush position, and when nothing
+# else writes WAL, as on CI's own pg-source, the slot advanced to the same LSN was not ahead.)
 stop_worker
+psql_src -c "INSERT INTO flags VALUES ('lost', 1)" >/dev/null
 psql_src -c "SELECT pg_replication_slot_advance('duckwake_shop', pg_current_wal_lsn())" >/dev/null
+(( $(slot_lsn) > $(lake_lsn) )) || { echo "the slot did not get ahead of the lake: slot $(slot_lsn), lake $(lake_lsn)"; failed=1; }
 start_worker
 if wait_status shop failed; then grep -o "has confirmed [^,]*, past the lake's position[^:]*" "$OUT/worker.log" | tail -1
 else echo "shop is $(status shop), not failed"; failed=1; fi

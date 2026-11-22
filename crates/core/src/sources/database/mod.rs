@@ -1,4 +1,4 @@
-//! The ingest job of a database source (PostgreSQL, `pgsource`; MySQL, `mysqlsource`): it keeps one mirror table
+//! The ingest job of a database source (PostgreSQL, `postgres`; MySQL, `mysql`): it keeps one mirror table
 //! per source table (`mirror`), reading the source's changes through a `Reader`. The rules, from
 //! `docs/design/database-cdc-sources.md`:
 //!
@@ -16,8 +16,12 @@
 //! The first epoch copies every table under one consistent snapshot of the source; how the reader joins that
 //! snapshot to the change stream is its own (`Reader::snapshot`).
 use crate::lake::{ident, lit, quote_table, CTL, LAKE};
-use crate::mirror::{cast_sql, MirrorTable};
-use crate::pgoutput::Value;
+pub mod catalog;
+pub mod mirror;
+pub mod mysql;
+pub mod postgres;
+
+use mirror::{cast_sql, MirrorTable};
 use anyhow::Result;
 use duckdb::Connection;
 use std::collections::HashMap;
@@ -25,6 +29,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+/// One column value of a change, as a reader hands it over.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    /// A large (TOASTed) value the change did not touch: PostgreSQL leaves it out, and its value is the one
+    /// the row had before.
+    Unchanged,
+    /// The value's text form.
+    Text(String),
+}
 
 /// The source broke a rule the mirror relies on: the job stops (status `failed`) with this message.
 #[derive(Debug)]
@@ -66,16 +81,16 @@ pub struct Settings {
 /// A database source as the worker starts its ingest job.
 #[derive(Clone)]
 pub enum Spec {
-    Postgres(crate::pgsource::PgOptions),
-    Mysql(crate::mysqlsource::MyOptions),
+    Postgres(crate::sources::database::postgres::PgOptions),
+    Mysql(crate::sources::database::mysql::MyOptions),
 }
 
 impl Spec {
     /// The source named `name`, of either kind.
     pub fn load(conn: &Connection, name: &str) -> Result<Spec> {
         match crate::catalog::source_kind(conn, name)?.as_deref() {
-            Some(crate::mysqlsource::KIND) => Ok(Spec::Mysql(crate::mysqlsource::load(conn, name)?)),
-            _ => Ok(Spec::Postgres(crate::catalog::load_postgres_source(conn, name)?)),
+            Some(crate::sources::database::mysql::KIND) => Ok(Spec::Mysql(crate::sources::database::mysql::load(conn, name)?)),
+            _ => Ok(Spec::Postgres(crate::sources::database::catalog::load_postgres(conn, name)?)),
         }
     }
 
@@ -96,8 +111,8 @@ impl Spec {
 
     fn reader(&self, conn: &Connection, job: &str) -> Result<Box<dyn Reader>> {
         Ok(match self {
-            Spec::Postgres(o) => Box::new(crate::pgsource::PgReader::open(conn, job, o)?),
-            Spec::Mysql(o) => Box::new(crate::mysqlsource::MyReader::open(job, o)?),
+            Spec::Postgres(o) => Box::new(crate::sources::database::postgres::PgReader::open(conn, job, o)?),
+            Spec::Mysql(o) => Box::new(crate::sources::database::mysql::MyReader::open(job, o)?),
         })
     }
 }
@@ -150,7 +165,7 @@ pub fn verify(conn: &Connection, name: &str) -> Result<(bool, String)> {
     let mut reader = spec.reader(conn, name)?;
     let staging = |i: usize| format!("memory.main.{}", ident(&format!("verify_{name}_{i}")));
     reader.copy(conn, &staging)?;
-    crate::mirror::compare(conn, name, spec.tables(), &staging)
+    crate::sources::database::mirror::compare(conn, name, spec.tables(), &staging)
 }
 
 /// An ingest job running on its own thread and connection, so a long snapshot never holds up the views.
@@ -691,7 +706,7 @@ pub(crate) fn cast_error(e: duckdb::Error, t: &MirrorTable) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mirror::MirrorColumn;
+    use crate::sources::database::mirror::MirrorColumn;
 
     fn table() -> Vec<MirrorTable> {
         let col = |n: &str| MirrorColumn { name: n.into(), source_type: "text".into(), oid: 25, typmod: -1, duck_type: "VARCHAR".into() };

@@ -288,8 +288,8 @@ impl Metrics {
             ("duckwake_duckdb_memory_bytes", "gauge", "Memory DuckDB holds (buffer manager), read every refresh.", duck.map(|d| d.0 as f64)),
             ("duckwake_duckdb_spill_bytes", "gauge", "What DuckDB has spilled to its temp directory.", duck.map(|d| d.1 as f64)),
             ("duckwake_duckdb_memory_limit_bytes", "gauge", "DuckDB's memory limit (--memory-limit, or 80% of RAM).", duck.map(|d| d.2 as f64)),
-            ("duckwake_kafka_read_bytes_total", "counter", "Payload and key bytes this process's readers fetched from Kafka.", Some(read(&crate::kafka::READ_BYTES))),
-            ("duckwake_kafka_read_messages_total", "counter", "Messages this process's readers fetched from Kafka.", Some(read(&crate::kafka::READ_MESSAGES))),
+            ("duckwake_kafka_read_bytes_total", "counter", "Payload and key bytes this process's readers fetched from Kafka.", Some(read(&crate::sources::kafka::READ_BYTES))),
+            ("duckwake_kafka_read_messages_total", "counter", "Messages this process's readers fetched from Kafka.", Some(read(&crate::sources::kafka::READ_MESSAGES))),
         ];
         out.extend(
             process

@@ -60,32 +60,9 @@ pub fn if_exists(named: Option<&str>, replace: bool) -> Result<catalog::IfExists
     }
 }
 
+/// Creates a source of any kind (`sources::create`).
 pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -> Result<String> {
-    let opts: serde_json::Value = serde_json::from_str(options).map_err(|e| anyhow::anyhow!("options must be JSON: {e}"))?;
-    if kind == crate::pgsource::KIND {
-        let o = crate::pgsource::create(conn, name, &opts)?;
-        let mirrors: Vec<String> = o.tables.iter().map(|t| format!("{} -> {}", t.source_name(), t.mirror)).collect();
-        return Ok(format!(
-            "source {name}: {} (slot {}, publication {}); start {name} to take the snapshot and follow the changes",
-            mirrors.join(", "),
-            o.slot,
-            o.publication
-        ));
-    }
-    if kind == crate::mysqlsource::KIND {
-        let o = crate::mysqlsource::create(conn, name, &opts)?;
-        let mirrors: Vec<String> = o.tables.iter().map(|t| format!("{} -> {}", t.source_name(), t.mirror)).collect();
-        return Ok(format!(
-            "source {name}: {} (binlog as replica {}); start {name} to take the snapshot and follow the changes",
-            mirrors.join(", "),
-            o.server_id
-        ));
-    }
-    if kind != "kafka" {
-        anyhow::bail!("kind {kind:?}: expected 'kafka', 'postgres' or 'mysql'");
-    }
-    let def = catalog::create_source(conn, name, kind, &opts)?;
-    Ok(format!("source {} -> topic {} ({} columns)", def.name, def.options.topic, def.options.columns.len()))
+    crate::sources::create(conn, name, kind, options)
 }
 
 /// Creates a continuous view: the table `name` (a bare name means the `main` schema) and its job. `sink` is the
@@ -226,9 +203,8 @@ pub fn stop(conn: &Connection, name: &str) -> Result<String> {
 /// Rewinds a paused or stopped view to a checkpoint; starting it again replays from that checkpoint's offsets.
 pub fn reset(conn: &Connection, name: &str, to_epoch: i64) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
-    if catalog::ingest_source(conn, &job)?.is_some() {
-        catalog::reset_ingest_source(conn, &job, &catalog::mirror_tables(conn, &job)?, to_epoch)?;
-        return Ok(format!("{job}: reset; its mirror tables are empty, and starting it takes a new snapshot"));
+    if let Some(done) = crate::sources::reset(conn, &job, to_epoch)? {
+        return Ok(done);
     }
     let recomputed = catalog::reset(conn, &job, to_epoch)?;
     let also = if recomputed.is_empty() {
@@ -248,22 +224,13 @@ pub fn drop(conn: &Connection, name: &str, keep_table: bool) -> Result<String> {
 
 /// `verify` of a database source's ingest job: its mirror tables against the source tables now. None for a view.
 pub fn verify_ingest(conn: &Connection, job: &str) -> Result<Option<(bool, String)>> {
-    if catalog::ingest_source(conn, job)?.is_none() {
-        return Ok(None);
-    }
-    crate::ingest::verify(conn, job).map(Some)
+    crate::sources::verify(conn, job)
 }
 
 /// Drops a source. A database source goes with its ingest job and mirror tables, and a PostgreSQL one with its
 /// replication slot.
 pub fn drop_source(conn: &Connection, name: &str) -> Result<String> {
-    match catalog::source_kind(conn, name)?.as_deref() {
-        Some(crate::pgsource::KIND) => return crate::pgsource::drop(conn, name, &catalog::load_postgres_source(conn, name)?),
-        Some(crate::mysqlsource::KIND) => return crate::mysqlsource::drop(conn, name, &crate::mysqlsource::load(conn, name)?),
-        _ => {}
-    }
-    catalog::drop_source(conn, name)?;
-    Ok(format!("source {name}: dropped"))
+    crate::sources::drop(conn, name)
 }
 
 /// The query behind `duckwake_checkpoints(view)`: the newest `limit` checkpoints.

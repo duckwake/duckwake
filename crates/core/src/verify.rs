@@ -16,9 +16,9 @@
 //! deleted since are simply not there, which is what the view's retractions must have done to its table.
 use crate::catalog::{self, state_table};
 use crate::model::{LakeInput, SourceDef, COMMIT_TS, LAKE_BACKFILL, LAKE_POSITION};
-use crate::kafka;
+use crate::sources::kafka;
 use crate::lake::{ident, lit, quote_table, CTL};
-use crate::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
+use crate::sources::kafka::decode::{decode_sql, invalid_json_where, tombstones_sql, IS_JSON_OBJECT};
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
 use tokio::runtime::Handle;
@@ -346,7 +346,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
             tombstones_sql(src, &format!("memory.main.{raw}"))
         ))?;
         // An upsert view reads tombstones as deletes; for every other view they are dead letters.
-        let tombstones_dead = if plan.upsert.is_some() { format!(" AND _err <> {}", lit(crate::decode::TOMBSTONE)) } else { String::new() };
+        let tombstones_dead = if plan.upsert.is_some() { format!(" AND _err <> {}", lit(crate::sources::kafka::decode::TOMBSTONE)) } else { String::new() };
         dead_expected.push(format!(
             "SELECT {n} AS source, _partition, _offset FROM memory.main.{raw} WHERE {invalid}
              UNION ALL SELECT {n}, _partition, _offset FROM memory.main.v_typed_{k} WHERE _err IS NOT NULL{tombstones_dead}",
@@ -403,7 +403,7 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
             "CREATE OR REPLACE TABLE {} AS SELECT {cols}, _partition, _offset, _key, _err IS NOT NULL AS __del
                FROM memory.main.v_typed_0 WHERE _err IS NULL OR _err = {}",
             plan.input_table,
-            lit(crate::decode::TOMBSTONE)
+            lit(crate::sources::kafka::decode::TOMBSTONE)
         ))?;
     } else if plan.is_global() {
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE {} AS SELECT {cols}, 1::INTEGER AS __w FROM {valid}", plan.input_table))?;
