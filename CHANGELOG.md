@@ -125,6 +125,13 @@ aggregates, and DuckWake as a DuckDB community extension.
 
 ### Fixed
 
+- A command or worker could fail with "Failed to read inlined data from DuckLake ... does not exist" when it read
+  a control table while DuckLake's flush ran (seen once in CI: `duckwake start` in `mysql_ingest_test.sh`). The
+  jobs and workers tables were created and then given more columns, which left each an inlined-data table per
+  column set; the first flush drops the older one, under readers whose snapshot still lists it. New lakes now
+  create those tables whole. The error also counts as a conflict, retried at a new snapshot (`start`, `pause`,
+  `stop` and the other commands, and a worker's commits), and a worker that still meets one starts again from
+  its checkpoints instead of exiting.
 - A worker no longer exits when the catalog cannot be reached ([#27](https://github.com/duckwake/duckwake/issues/27)).
   PostgreSQL down, restarting or failing over made `duckwake run` exit and `duckwaked` restart every 5 s,
   counting failures. The worker now drops what it staged, waits for the catalog (1 s, doubling to 30 s, between

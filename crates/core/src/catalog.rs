@@ -291,6 +291,10 @@ pub fn is_view_id(job: &str) -> bool {
 /// The job id of the view a command names: `schema.table` or `lake.schema.table`, or a bare table name when
 /// exactly one schema has a view of that name. A bare name no view has is a database source's ingest job.
 pub fn resolve_view(conn: &Connection, name: &str) -> Result<String> {
+    retry_conflicts(|| resolve_view_once(conn, name))
+}
+
+fn resolve_view_once(conn: &Connection, name: &str) -> Result<String> {
     if name.contains('.') {
         let (_, s, t) = crate::lake::qualified_table(name)?;
         let job = format!("{s}.{t}");
@@ -1115,7 +1119,7 @@ pub fn fail_if_held(conn: &Connection, job: &str, worker: &str, held: Option<i64
 
 /// `start` assigns the job (`Some(assign)`) and bumps the lease, which fences the previous owner's next commit.
 pub fn set_status(conn: &Connection, job: &str, status: JobStatus, assign: Option<Assign>) -> Result<()> {
-    job_status(conn, job)?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
+    retry_conflicts(|| job_status(conn, job))?.ok_or_else(|| anyhow!("no such view {job:?}"))?;
     if let Some(Assign::Pin(w) | Assign::Prefer(w)) = assign {
         crate::failover::check_worker_id(w)?;
     }
