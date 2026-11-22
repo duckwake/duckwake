@@ -162,8 +162,9 @@ The variances keep each group's count, sum and sum of squares, so they follow up
 does, and the two-argument statistics `f(y, x)` keep the count and the sums of y, x, y², x² and xy over the
 rows where neither is NULL. They are computed from these sums in DOUBLE, which matches DuckDB's batch result to
 about 10 significant digits while a group's mean is within about 10⁴ times its standard deviation, and
-`verify` compares DOUBLE and FLOAT columns to within a relative 10⁻⁹; beyond that the difference of two large
-sums loses digits, and `verify` reports it. Subtract a constant near the mean
+`verify` compares DOUBLE and FLOAT columns to within a relative 10⁻⁹ (and 10⁻⁹ absolutely below 1: a statistic
+that is truly 0 can come out as a residue such as 5×10⁻¹⁵ once deletes have been subtracted from its sums);
+beyond that the difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
 (`var_samp(x - 1000000)`) to keep full precision, since the variance does not change. A group whose values are
 all equal has a variance of exactly 0, as in DuckDB, so `corr` is NaN and `regr_slope` NaN over a constant x,
 with `regr_intercept` and `regr_r2` NULL then.

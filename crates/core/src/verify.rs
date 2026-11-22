@@ -76,7 +76,9 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
 pub const FLOAT_TOLERANCE: f64 = 1e-9;
 
 /// Compares the rows of `expected` and `sink` as multisets over `columns`: every column exactly, except DOUBLE
-/// and FLOAT ones, which match within `FLOAT_TOLERANCE`. Returns how many expected rows the sink lacks, how
+/// and FLOAT ones, which match within `FLOAT_TOLERANCE` of the larger value, or of 1 below it. The floor is for
+/// results that are exactly 0: a view that retracts reaches them by adding and subtracting sums, which leaves a
+/// residue (`covar_samp` of 5e-15 against 0 in `backfill_test.sh`'s `bf_quiet`, CI 2026-11-22). Returns how many expected rows the sink lacks, how
 /// many sink rows were not expected, and up to five of each.
 ///
 /// Rounding both sides to 10 digits instead, as this did before, fails whenever two values a hair apart fall on
@@ -98,7 +100,7 @@ fn compare(conn: &Connection, expected: &str, sink: &str, columns: &[(String, St
         let by = if exact.is_empty() { String::new() } else { format!("PARTITION BY {}", exact.join(", ")) };
         let order = floats.join(", ");
         let close = |c: &String| {
-            format!("(a.{c} IS NOT DISTINCT FROM b.{c} OR abs(a.{c} - b.{c}) <= {FLOAT_TOLERANCE:e} * greatest(abs(a.{c}), abs(b.{c})))")
+            format!("(a.{c} IS NOT DISTINCT FROM b.{c} OR abs(a.{c} - b.{c}) <= {FLOAT_TOLERANCE:e} * greatest(abs(a.{c}), abs(b.{c}), 1))")
         };
         let on: Vec<String> = exact
             .iter()
@@ -459,6 +461,14 @@ mod tests {
         let (m, u, rows) = run("('a', 1, 0.123456789500001), ('b', 2, -0.0016807972449711778)",
                                "('a', 1, 0.123456789499999), ('b', 2, -0.0016807972449720)");
         assert_eq!((m, u), (0, 0), "{rows:?}");
+    }
+
+    #[test]
+    fn a_residue_next_to_zero_matches() {
+        let (m, u, rows) = run("('a', 1, 0.0)", "('a', 1, 5.329070518200751e-15)");
+        assert_eq!((m, u), (0, 0), "{rows:?}");
+        let (m, u, _) = run("('a', 1, 0.0)", "('a', 1, 0.000001)");
+        assert_eq!((m, u), (1, 1), "a real difference near zero still shows");
     }
 
     #[test]

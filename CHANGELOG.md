@@ -73,7 +73,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 - `verify` failed now and then on views with `corr`, `regr_slope` or the variances (`bf_spread` in
   `backfill_test.sh`, about one run in six): it rounded DOUBLE and FLOAT columns to 10 significant digits on both
   sides, and two results 10⁻¹³ apart could round to different values across a rounding step. It now compares
-  them within a relative 10⁻⁹, pairing the rows that differ by their other columns, which stay exact.
+  them within a relative 10⁻⁹, pairing the rows that differ by their other columns, which stay exact. Below 1
+  the bound is 10⁻⁹ absolutely: a `covar_samp` that is truly 0 came out as 5×10⁻¹⁵ in a window that took deletes.
 - A windowed view over another windowed view's `window_start` or `window_end` closed its window up to
   `--position-refresh` (5 minutes by default) late once the upstream view's inputs went idle: the upstream view,
   with no window left to close, stopped committing, so the watermark in its checkpoint, which the downstream
