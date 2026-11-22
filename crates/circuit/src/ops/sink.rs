@@ -27,6 +27,10 @@ pub enum SinkKind {
 /// The column a counted sink keeps each row's multiplicity in.
 pub const COUNT_COLUMN: &str = "_duckwake_count";
 
+/// The column of a late-data table that holds each late row's weight, when the view's input can retract: +1 a
+/// row added to a window already closed, -1 a row taken out of one (a late correction).
+pub const LATE_WEIGHT: &str = "_duckwake_weight";
+
 impl Operator for Sink {
     fn name(&self) -> String {
         format!(
@@ -54,8 +58,7 @@ impl Operator for Sink {
         }
         match self.kind {
             SinkKind::Append => bail!("{} reads a stream that can retract rows, but an append sink only inserts: not supported yet", self.name()),
-            SinkKind::Late => bail!("late rows of a source that can retract need their weights in the late-data table: not supported yet (drop the late-data table)"),
-            SinkKind::Upsert | SinkKind::Counted => Ok(()),
+            SinkKind::Late | SinkKind::Upsert | SinkKind::Counted => Ok(()),
         }
     }
 
@@ -117,9 +120,11 @@ impl Operator for Sink {
             SinkKind::Late => {
                 let Some(late) = &x.late_table else { return Ok(steps) };
                 let cols = x.stream_columns().iter().map(|(c, _)| ident(c)).collect::<Vec<_>>().join(", ");
+                let (weight_col, weight) =
+                    if cx.plan.retracts() { (format!(", {LATE_WEIGHT}"), ", __w".to_string()) } else { (String::new(), String::new()) };
                 let sql = format!(
-                    "INSERT INTO {late} ({cols}, window_start, window_end, _source_partition, _source_offset, _duckwake_epoch)
-                                 SELECT {cols}, window_start, window_end, _partition, _offset, {} FROM {}",
+                    "INSERT INTO {late} ({cols}, window_start, window_end, _source_partition, _source_offset, _duckwake_epoch{weight_col})
+                                 SELECT {cols}, window_start, window_end, _partition, _offset, {}{weight} FROM {}",
                     x.epoch,
                     staging("late", &cx.set)
                 );

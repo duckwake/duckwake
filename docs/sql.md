@@ -70,7 +70,7 @@ CALL duckwake_create_view('analytics.clicks_per_min',
 | --- | --- | --- |
 | `epoch_interval` | `'10s'` | How often an epoch runs. |
 | `max_rows` | `100000` | Most events (or lake rows) one epoch reads. |
-| `late_data` | none | A table for events that arrive after their window closed (windowed views). Without it they are counted in the checkpoint (`rows_late`) and dropped. |
+| `late_data` | none | A table for events that arrive after their window closed (windowed views), and for late corrections over lake inputs that update or delete (with a `_duckwake_weight` column). Without it they are counted in the checkpoint (`rows_late`) and dropped. |
 | `max_state_rows` | none | Most rows the view's state may hold; past it the view fails alone ([limits](cli.md#limits)). |
 | `max_late_rows` | none | Most late rows one epoch may write; past it the view fails alone. |
 | `start` | `'earliest'` | Over lake tables and other views: `earliest` starts from the rows they already hold, `latest` from rows written after the view is created ([backfill](#backfill)). |
@@ -92,7 +92,7 @@ view runs without recomputing it. A limit of 0 removes it.
 | --- | --- |
 | `duckwake_start(view, worker :=)` | Start the view. On the server it runs on the server's worker; `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it. |
 | `duckwake_pause(view)` / `duckwake_stop(view)` | Stop the view. Its worker is fenced at once, so an epoch in flight does not land and `drop` or `reset` can follow straight away. `start` continues from the last checkpoint. |
-| `duckwake_reset(view, to_epoch)` | Rewind to an epoch and replay from there. Views that read this view's table with retractions follow the reset through its change feed; windowed views that read it insert-only are emptied and backfill again. A reset to an epoch whose snapshot has expired is refused. |
+| `duckwake_reset(view, to_epoch)` | Rewind to an epoch and replay from there. Views that read this view's table with retractions follow the reset through its change feed; windowed views that read it, and views that read it insert-only, are emptied and backfill again (a window already closed would take the reset only as late corrections). A reset to an epoch whose snapshot has expired is refused. |
 | `duckwake_drop(view, keep_table :=)` | Remove the view and its table (`keep_table := true` keeps the table). Dropping a view that another view reads is refused. |
 
 ## Workers
@@ -165,8 +165,9 @@ The variances keep each group's count, sum and sum of squares, so they follow up
 does, and the two-argument statistics `f(y, x)` keep the count and the sums of y, x, y², x² and xy over the
 rows where neither is NULL. They are computed from these sums in DOUBLE, which matches DuckDB's batch result to
 about 10 significant digits while a group's mean is within about 10⁴ times its standard deviation, and
-`verify` compares DOUBLE and FLOAT columns to within a relative 10⁻⁹; beyond that the difference of two large
-sums loses digits, and `verify` reports it. Subtract a constant near the mean
+`verify` compares DOUBLE and FLOAT columns to within a relative 10⁻⁹ (and 10⁻⁹ absolutely below 1: a statistic
+that is truly 0 can come out as a residue such as 5×10⁻¹⁵ once deletes have been subtracted from its sums);
+beyond that the difference of two large sums loses digits, and `verify` reports it. Subtract a constant near the mean
 (`var_samp(x - 1000000)`) to keep full precision, since the variance does not change. A group whose values are
 all equal has a variance of exactly 0, as in DuckDB, so `corr` is NaN and `regr_slope` NaN over a constant x,
 with `regr_intercept` and `regr_r2` NULL then.
@@ -187,9 +188,14 @@ SELECT game_id, sum(n) AS n FROM analytics.clicks_per_min GROUP BY game_id
 - **Updates and deletes.** A view removes the rows it no longer holds: a filter's table counts each row in
   `_duckwake_count`, and `DISTINCT` and `GROUP BY` views keep their rows up to date.
 - **Windows.** Windows over a lake input use `_commit_ts`, or a windowed view's `window_start` or `window_end`,
-  and get an exact watermark. A window is final once it closes, so a windowed view needs its lake tables
-  insert-only (an update or delete stops it) and cannot read a view whose rows change. To keep time buckets
-  current instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`.
+  and get an exact watermark. They take updates and deletes, of a table or of a view whose rows change: a
+  change to a row whose window is still open revises that window (`min`, `max`, distinct counts and quantiles
+  keep each value's count, so a deleted extreme gives way to the next value). A window is final once it closes,
+  so a change to a row of a closed window, such as the delete of an old row, is a **late correction**: it goes to
+  the `late_data` table with `_duckwake_weight` -1 (or +1 for a row added), or is counted in `rows_late` and
+  dropped, and the window's row keeps counting the old version. `verify` adds the corrections back; without a
+  late-data table it checks the view as long as no correction was dropped. To keep time buckets current
+  instead, `GROUP BY time_bucket(INTERVAL 1 HOUR, _commit_ts)`.
 
 ### Backfill
 

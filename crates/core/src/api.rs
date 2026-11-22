@@ -226,7 +226,7 @@ pub fn reset(conn: &Connection, name: &str, to_epoch: i64) -> Result<String> {
     let also = if recomputed.is_empty() {
         String::new()
     } else {
-        format!("; {} read it insert-only and recompute from its table when they next start", recomputed.join(", "))
+        format!("; {} read it insert-only or window it, and recompute from its table when they next start", recomputed.join(", "))
     };
     Ok(format!("{job}: reset to epoch {to_epoch}; start it to replay{also}"))
 }

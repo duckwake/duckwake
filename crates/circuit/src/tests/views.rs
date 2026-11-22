@@ -182,6 +182,25 @@ fn windowed_variance_booleans_and_having() {
 }
 
 #[test]
+fn windowed_value_counts_over_retractions() {
+    // min, max (and bool_and/bool_or, MIN/MAX of a BOOLEAN), count(DISTINCT), approx_count_distinct and the
+    // quantiles keep each value's count per window: a retracted extreme gives way to the next value still there.
+    let sql = "SELECT window_start, game_id, min(amount) AS lo, max(amount) AS hi, bool_and(amount > 2) AS all_big,
+                      bool_or(user_id = 'u4') AS has_u4, count(DISTINCT user_id) AS users,
+                      approx_count_distinct(user_id) AS approx_users, median(amount) AS med,
+                      quantile_disc(amount, 0.9) AS p90
+               FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
+    check_view(sql, &EPOCHS, false);
+    check_view(sql, &EPOCHS, true);
+    check_view(
+        "SELECT window_end, max(amount) AS hi, quantile_cont(amount, [0.1, 0.5]) AS qs
+         FROM HOP(changes, ts, INTERVAL 1 MINUTE, INTERVAL 20 SECOND) GROUP BY ALL HAVING min(amount) > 0",
+        &EPOCHS,
+        true,
+    );
+}
+
+#[test]
 fn windowed_variance_and_having_over_retractions() {
     let sql = "SELECT window_start, game_id, count(*) AS n, var_samp(amount) AS vs, stddev_pop(amount) AS sp
                FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL HAVING count(*) > 4";

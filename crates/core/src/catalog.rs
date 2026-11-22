@@ -59,10 +59,10 @@ pub fn compile(
     plan::compile_with(conn, job, sql, &inputs, upsert)
 }
 
-/// Compiles a new view and settles how it reads each lake input it streams. A window is final once the
-/// watermark passes it, so a later change to one of its rows could not be applied: a windowed view reads lake
-/// tables insert-only (an update or delete then stops it), and refuses a view's table whose rows change.
-/// Every other view takes updates and deletes as retractions.
+/// Compiles a new view and settles how it reads each lake input it streams: updates and deletes as
+/// retractions, from any lake table and from a view's table whose rows change. A windowed view applies a
+/// retraction to a window still open; one for a window the watermark has passed is a late correction (its
+/// late-data table, or counted and dropped), as a late row is.
 fn compile_new(
     conn: &Connection,
     job: &str,
@@ -76,19 +76,6 @@ fn compile_new(
     let plan = compile(conn, job, sql, sources, &inserts, upsert)?;
     let streams = plan.sources();
     let retracting = |l: &LakeInput| l.retracts && streams.contains(&l.name);
-    if plan.is_windowed() {
-        if let Some(l) = lakes.iter().find(|l| retracting(l) && l.view.is_some()) {
-            bail!(
-                "{} is the table of view {}, whose rows are replaced or removed as they change; windows over it are \
-                 not supported yet (a window is final once the watermark passes it). Group by a time_bucket of a \
-                 column instead: the view then keeps every bucket up to date",
-                l.name,
-                l.view.as_deref().unwrap_or_default()
-            );
-        }
-        lakes.iter_mut().for_each(|l| l.retracts = false);
-        return Ok(plan);
-    }
     if !lakes.iter().any(retracting) {
         return Ok(plan);
     }
@@ -599,6 +586,11 @@ fn create_tables(conn: &Connection, def: &JobDef, circuit: &crate::circuit::Circ
             [("window_start", "TIMESTAMP"), ("window_end", "TIMESTAMP"), ("_source_partition", "INTEGER"), ("_source_offset", "BIGINT"), ("_duckwake_epoch", "BIGINT")]
                 .map(|(c, t)| (c.to_string(), t.to_string())),
         );
+        // Over an input that updates and deletes, a late row is a change: +1 a row added to a closed window,
+        // -1 one taken out of it (a late correction), which the window's row still counts.
+        if def.plan.retracts() {
+            cols.push((crate::circuit::ops::LATE_WEIGHT.to_string(), "INTEGER".to_string()));
+        }
         if table_exists(conn, &ls, &lt)? {
             // Shared with another view, or kept from an earlier one: its rows must line up with this view's.
             let have: Vec<String> = crate::lake::describe(conn, &quote_table(late)?)?.into_iter().map(|(c, _)| c).collect();
@@ -1265,8 +1257,8 @@ fn checkpoints(conn: &Connection, job: &str, source: &str, order: &str) -> Resul
 /// The next start replays from that checkpoint's offsets.
 ///
 /// The views that read its table and take its changes (retractions) follow the reset through the change
-/// feed. Those that read a table changed by the reset insert-only, directly or through other views, cannot:
-/// they are recomputed in the same transaction (`recompute_view`) and returned.
+/// feed. Those that read a table changed by the reset insert-only, or window it, directly or through other
+/// views, are recomputed in the same transaction instead (`recompute_view`) and returned.
 pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<Vec<String>> {
     let (def, status) = load_job(conn, job)?;
     if status == JobStatus::Running {
@@ -1342,9 +1334,10 @@ fn start_over(def: &mut JobDef) {
     def.start_commit_us = None;
 }
 
-/// The views a reset of `job` changes the input of, that read that input insert-only: among `job`'s readers
-/// and their readers in turn (every one of whose tables can lose rows), each with an insert-only input from
-/// `job` or from one of those readers.
+/// The views a reset of `job` changes the input of, that read that input insert-only or window it: among
+/// `job`'s readers and their readers in turn (every one of whose tables can lose rows), each with such an input
+/// from `job` or from one of those readers. A windowed view takes retractions (C4), but a reset rewrites rows of
+/// windows it has closed, which it would only take as late corrections: recomputing it keeps it exact.
 fn insert_only_readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
     let mut changed = vec![job.to_string()];
     let mut i = 0;
@@ -1359,7 +1352,8 @@ fn insert_only_readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for r in changed.iter().skip(1) {
         let (def, _) = load_job(conn, r)?;
-        if def.lake_inputs.iter().any(|l| !l.retracts && l.view.as_ref().is_some_and(|v| changed.contains(v))) {
+        let windowed = def.plan.is_windowed();
+        if def.lake_inputs.iter().any(|l| (!l.retracts || windowed) && l.view.as_ref().is_some_and(|v| changed.contains(v))) {
             out.push(r.clone());
         }
     }

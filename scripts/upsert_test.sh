@@ -23,7 +23,9 @@ source "$(dirname "$0")/lib.sh"
 RATE=${RATE:-1000}; DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-2s}; KEYS=${KEYS:-3000}
 read -r -a POINTS <<< "${POINTS:-external poll commit_begin commit_mid before_commit after_commit maintenance staged_ahead}"
 UPSERTS=(orders_latest orders_versioned orders_paid)
-VIEWS=("${UPSERTS[@]}" orders_open orders_by_status)
+# orders_windows windows orders_versioned's table, whose rows are replaced as orders change (C4): a change to an
+# order in a window already closed is a late correction in orders_windows_late.
+VIEWS=("${UPSERTS[@]}" orders_open orders_by_status orders_windows)
 
 sql() { "$BIN" sql --csv "$1" 2>>"$OUT/sql.log" | tail -1; }
 
@@ -82,6 +84,8 @@ create orders_paid --upsert-key order_id --upsert-version ver \
 create orders_open --sql "SELECT order_id, status, amount FROM analytics.orders_versioned WHERE status <> 'cancelled'"
 create orders_by_status --sql "SELECT status, count(*) AS n, sum(amount) AS total, min(amount) AS lo, max(amount) AS hi,
   count(DISTINCT amount) AS amounts FROM analytics.orders_latest GROUP BY status"
+create orders_windows --late-data lake.analytics.orders_windows_late --sql "SELECT window_start, status, count(*) AS n,
+  sum(amount) AS total, max(amount) AS hi FROM TUMBLE(analytics.orders_versioned, _commit_ts, INTERVAL 2 SECOND) GROUP BY ALL"
 for v in "${VIEWS[@]}"; do "$BIN" start "$v" --worker w1 >/dev/null; done
 
 log "refused: an upsert view with an aggregate, a key not in its columns, a version without a key"
@@ -118,7 +122,7 @@ for i in $(seq 1 "$KILLS"); do
     kill -9 "$pid" 2>/dev/null && how="no crash in 8 s, killed" || how="aborted at $point"
     wait "$pid" 2>/dev/null || true
   fi
-  if verify_views quiet; then echo "run $i: $how; all five verify"; else echo "run $i: $how; VERIFY FAILED"; failed=1; fi
+  if verify_views quiet; then echo "run $i: $how; all ${#VIEWS[@]} verify"; else echo "run $i: $how; VERIFY FAILED"; failed=1; fi
 done
 wait "$PRODUCER"; tail -1 "$OUT/producer.log"
 
@@ -163,6 +167,7 @@ state=$(sql "SELECT count(*) FROM lake.__duckwake.state_orders_versioned")
 echo "tombstones read: $(sql "SELECT count(*) FROM orders WHERE _error = 'tombstone'"); orders_versioned's state holds $state rows"
 [[ $state == $(sql "SELECT count(*) FROM lake.analytics.orders_versioned") ]] || { echo "the state holds more than the current rows"; failed=1; }
 [[ $(sql "SELECT count(*) FROM lake.analytics.orders_latest") -gt 0 ]] || { echo "orders_latest is empty"; failed=1; }
+echo "orders_windows: $(sql "SELECT count(*) FROM lake.analytics.orders_windows") windows, $(sql "SELECT count(*) FROM lake.analytics.orders_windows_late WHERE _duckwake_weight < 0") late corrections"
 dead=$(sql "SELECT count(*) FROM lake.__duckwake.dead_letter WHERE job_id LIKE 'orders_%'" || echo "?")
 echo "dead letters of the upsert views (tombstones are not dead letters there): $dead"
 [[ $dead == 0 ]] || failed=1

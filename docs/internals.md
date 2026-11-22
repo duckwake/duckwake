@@ -255,9 +255,14 @@ records the ones it took up.
      against (`snapshot_id > S0` at P). A retraction of a version written at or before S0 is dropped: the
      view never had that row. An update of such a row adds its new version.
    - A window is final once the watermark passes it, and a lake input's watermark is exact, so the delete
-     of an old row always arrives after its window closed. A windowed view therefore reads lake tables
-     insert-only (checked every epoch; an update or delete stops it), and refuses a view's table whose rows
-     change. A view that groups by `time_bucket(...)` of a column instead keeps every bucket up to date.
+     of an old row usually arrives after its window closed (C4). A windowed view takes retractions as any
+     view does: a window still open is revised (weighted partials; `min`, `max`, the distinct counts and the
+     quantiles keep a `MAP(value, count)` partial, `MergeOp::Counts`), and a retraction for a closed window
+     is late, routed by `LateSplit` to the late-data table with its weight (`_duckwake_weight`) or counted
+     and dropped. `verify` builds the batch input from the rows at P plus the late corrections (weight −1),
+     which the closed windows still count, and refuses a view without a late-data table only once a
+     correction was dropped. Views created before C4 keep reading insert-only (`LakeInput::retracts` false)
+     and stop on an update or delete.
    - `reset` of a view restores an upsert or counted table with time travel (delete all, insert the old
      version), which its retracting readers see as ordinary deletes and inserts: they follow the reset
      through the change feed. A windowed reader of an append-only view cannot take deletes, so the reset
@@ -381,8 +386,9 @@ records the ones it took up.
 - **Lake inputs (F1, F2).** A view reads a lake table, or another view's table, through its change feed when
   no Kafka source is in its `FROM`; next to a Kafka source the table is a lookup. A view without windows
   takes the input's updates and deletes as retractions (finding 11): a stateless view's table counts each
-  row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view reads lake tables insert-only
-  (an update or delete stops it, status `failed`) and refuses a view's table whose rows change.
+  row (`_duckwake_count`), `DISTINCT` and aggregates upsert. A windowed view revises the windows still open
+  and records changes to closed ones as late corrections (C4); one created before C4 reads lake tables
+  insert-only and stops on an update or delete.
 - **Backfill and retention (F3).** A new view takes S0, the snapshot current when it is created (or, after a cascaded reset or a reset to
   epoch 0, the one current at its next start), and pages
   each input `AT (VERSION => S0)` in `rowid` order, `max_rows` per epoch; the cursor is in the checkpoint
