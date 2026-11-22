@@ -54,7 +54,10 @@ sleep 15   # the retries back off meanwhile
 kafka_up
 if secs=$(until_true '[[ $(started_after_wait 1) == '"$n"' ]]' "$BOUND"); then echo "Kafka back: all $n views started on their own in ${secs}s (bound ${BOUND}s)"
 else echo "FAIL: $(started_after_wait 1) of $n views started"; failed=1; fi
-[[ $(metric 1 duckwake_views_waiting) == 0 && $(waiting) == 0 ]] || { echo "FAIL: views still shown waiting"; failed=1; }
+# The gauge follows at once; duckwake jobs reads the heartbeat row, written every few seconds.
+[[ $(metric 1 duckwake_views_waiting) == 0 ]] || { echo "FAIL: duckwake_views_waiting is $(metric 1 duckwake_views_waiting)"; failed=1; }
+if secs=$(until_true '[[ $(waiting) == 0 ]]' 15); then echo "duckwake jobs shows none waiting after ${secs}s"
+else echo "FAIL: duckwake jobs still shows $(waiting) views waiting"; failed=1; fi
 
 log "2. Kafka restarts while the views run"
 produce --rate "$RATE" --count $((RATE * 20)) --eos >"$OUT/producer1.log" 2>&1

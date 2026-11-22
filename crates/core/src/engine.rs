@@ -960,6 +960,10 @@ impl Worker {
                 Err(e) => self.fail_job(&id, &format!("cannot start job: {e:#}"))?,
             }
         }
+        // The gauge follows at once; `duckwake_jobs` (from the heartbeat row) within a heartbeat.
+        if let Some(m) = &self.cfg.metrics {
+            m.set_views_waiting(self.waiting.len());
+        }
         Ok(())
     }
 
