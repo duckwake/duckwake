@@ -7,7 +7,8 @@
 #   1. kill -9: its heartbeat stops; the views move once the lease timeout passes.
 #   2. a frozen worker (SIGSTOP): the same, even when it froze inside its catalog commit (PostgreSQL ends
 #      that session after the lease timeout); thawed (SIGCONT), it is a zombie whose commits are fenced and
-#      it lets go of the views, or it exits.
+#      it lets go of the views, or it finds its session ended and starts again from its checkpoints. It never
+#      exits.
 #   3. a drained worker (`duckwake drain`) hands its views to the others at once; a clean stop alone is a
 #      restart, whose views wait for it (scripts/rebalance_test.sh covers that).
 # A restarted worker takes views again. After draining, every view verifies against the batch recomputation.
@@ -98,15 +99,24 @@ log "2. freeze w2 (SIGSTOP), then thaw it"
 kill -STOP "$(pid w2)"
 check_moved "frozen" w2 "$BOUND"
 sleep 4
+outages0=$(grep -c 'the catalog cannot be reached' "$OUT/w2.log" || true)
 kill -CONT "$(pid w2)"
-# Thawed, w2 lets go of its views, or, if it was frozen inside a catalog transaction, finds that PostgreSQL
-# ended that session after the lease timeout (so it could not block the other workers) and exits.
-for _ in $(seq 1 30); do grep -qE 'lease lost|job released' "$OUT/w2.log" || ! kill -0 "$(pid w2)" 2>/dev/null && break; sleep 0.5; done
-if grep -qE 'lease lost|job released' "$OUT/w2.log"; then
+# Thawed, w2 lets go of its views. If it was frozen inside a catalog transaction, PostgreSQL ended that session
+# after the lease timeout (so it could not block the other workers): w2 takes that for a catalog outage, drops
+# its instance and starts again from its checkpoints, holding none of the views the others took (#27). It must
+# not exit.
+let_go() {
+  grep -qE 'lease lost|job released' "$OUT/w2.log" \
+    || (( $(grep -c 'the catalog cannot be reached' "$OUT/w2.log" || true) > outages0 ))
+}
+for _ in $(seq 1 30); do let_go || ! kill -0 "$(pid w2)" 2>/dev/null && break; sleep 0.5; done
+if ! kill -0 "$(pid w2)" 2>/dev/null; then
+  echo "FAIL: thawed w2 exited"; grep -m1 '^Error' "$OUT/w2.log" | cut -c1-160; failed=1
+elif grep -qE 'lease lost|job released' "$OUT/w2.log"; then
   echo "thawed w2 let go: $(grep -cE 'lease lost|job released' "$OUT/w2.log") views released or fenced"
-elif ! kill -0 "$(pid w2)" 2>/dev/null; then
-  echo "thawed w2 exited: it was frozen inside a catalog transaction, which PostgreSQL ended"
-  grep -m1 '^Error' "$OUT/w2.log" | cut -c1-120
+elif let_go; then
+  echo "thawed w2 found its catalog session ended (it froze inside a transaction) and started again from its checkpoints"
+  grep 'the catalog cannot be reached' "$OUT/w2.log" | tail -1 | sed -E 's/.*error=//' | cut -c1-140 | sed 's/^/  /'
 else
   echo "FAIL: thawed w2 did not let go of its views"; failed=1
 fi

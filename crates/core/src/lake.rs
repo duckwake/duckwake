@@ -411,7 +411,9 @@ pub fn is_conflict(err: &anyhow::Error) -> bool {
 /// configuration error, not an outage: the worker fails on it as before.
 pub fn is_catalog_unavailable(err: &anyhow::Error) -> bool {
     // libpq's own words: they come only from a PostgreSQL connection.
-    const POSTGRES: [&str; 10] = [
+    const POSTGRES: [&str; 11] = [
+        // A worker frozen inside a catalog transaction finds it ended (`bound_idle_transactions`).
+        "terminating connection due to idle-in-transaction timeout",
         "the database system is shutting down",
         "the database system is starting up",
         "the database system is in recovery mode",
@@ -459,6 +461,7 @@ mod tests {
         assert!(is_catalog_unavailable(&e(shutting)));
         assert!(is_catalog_unavailable(&e(refused)));
         assert!(is_catalog_unavailable(&e("server closed the connection unexpectedly")));
+        assert!(is_catalog_unavailable(&e("FATAL:  terminating connection due to idle-in-transaction timeout")));
         // Seen through the context the worker adds on its way out.
         assert!(is_catalog_unavailable(&e(refused).context("attaching DuckLake")));
         assert!(!is_catalog_unavailable(&e("attaching DuckLake")));
