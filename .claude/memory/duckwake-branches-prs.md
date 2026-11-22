@@ -1,6 +1,6 @@
 ---
 name: duckwake-branches-prs
-description: Where the work stands in git (as of 2026-11-15) - everything merged into main of the public duckwake/duckwake; how new work is branched, checked and merged
+description: Where the work stands in git (as of 2026-11-22) - everything merged into main of the public duckwake/duckwake; how new work is branched, checked and merged
 metadata:
   type: project
 ---
@@ -35,6 +35,27 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
    community extension (duckdb/community-extensions#3654, from the fork `duckwake/community-extensions`,
    branch `duckwake`, maintainer harrydevforlife) at commit `16ec8d6`; each release moves its `ref` there.
    The fork's macOS jobs never got a runner (cancelled after 15 min queued); DuckDB's own CI runs them.
+9. 2026-11-21: PR #60 (C2, #41: upsert views, `upsert_key`/`upsert_version`), PR #61 (two intermittent CI
+   failures, both engine/test bugs already on main: a windowed view over another view's windows waited up to
+   `position_refresh` once the upstream went idle, now it records its watermark at least once a slide; and
+   `verify` rounded floats, now compares them within 1e-9) and PR #62 (C3, #42 closed: Debezium sources, gates
+   `FORMAT=debezium scripts/upsert_test.sh` and `scripts/debezium_e2e_test.sh` with PostgreSQL and Debezium 3.6.3
+   in compose profile `debezium`; CI reserves the stack's host ports). Branch `skill-risingwave-reference`
+   (the RisingWave reference skill, `.claude/skills/`) is pushed without a PR, at the user's request; it is not
+   on main yet.
+10. 2026-11-22, merged: #64 (C4, #38: windows over updates and deletes; its CI found a quadratic counts merge,
+    now a hash aggregate over the unnested entries, a reset cascade that must still recompute windowed readers,
+    DuckLake's "Exceeded the maximum retry count" that must count as a conflict, and verify's float tolerance
+    needing an absolute floor below 1), #65 (D1, #44: PostgreSQL sources) and #66 (D3, #45: MySQL sources, plus a
+    CI step dropping an unpacked DuckDB tree the rust-cache restored without its `.complete` marker: a new
+    dependency reruns libduckdb-sys's build script, whose unpack then failed). D1 and D3 read through
+    a `Reader` per database (`PgReader` over DuckDB's postgres extension and SQL logical decoding, no new driver;
+    `MyReader` over `mysql_async` 0.37 binlog by GTID). #67 (merged 2026-11-22) moved all source code, with no
+    change in behaviour, under `crates/core/src/sources/`: `mod.rs` (the one place that dispatches on a source's
+    kind: create, drop, reset, verify), `kafka/` (reader, `decode.rs`), `database/` (the ingest job and `Reader`,
+    `mirror.rs`, `catalog.rs`, `postgres/`, `mysql/` with `gtid.rs` and `values.rs`). Its CI also found a race in
+    `pg_ingest_test.sh`'s slot-ahead step (insert, then stop the worker), now stop-then-insert with an assertion.
+    Next on the roadmap: D4 (large tables, schema changes).
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository
