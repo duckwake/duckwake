@@ -1,6 +1,6 @@
 ---
 name: duckwake-branches-prs
-description: Where the work stands in git (as of 2026-11-15) - everything merged into main of the public duckwake/duckwake; how new work is branched, checked and merged
+description: Where the work stands in git (as of 2026-11-22) - everything merged into main of the public duckwake/duckwake; how new work is branched, checked and merged
 metadata:
   type: project
 ---
@@ -42,7 +42,15 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
    `FORMAT=debezium scripts/upsert_test.sh` and `scripts/debezium_e2e_test.sh` with PostgreSQL and Debezium 3.6.3
    in compose profile `debezium`; CI reserves the stack's host ports). Branch `skill-risingwave-reference`
    (the RisingWave reference skill, `.claude/skills/`) is pushed without a PR, at the user's request; it is not
-   on main yet. Next on the roadmap: C4 (#38), windows over updates and deletes.
+   on main yet.
+10. 2026-11-21/22, draft PRs waiting for the user: #64 (C4, #38: windows over updates and deletes; branch
+    `c4-window-retractions`; its CI found a quadratic counts merge, now a hash aggregate over the unnested
+    entries, a reset cascade that must still recompute windowed readers, DuckLake's "Exceeded the maximum retry
+    count" that must count as a conflict, and verify's float tolerance needing an absolute floor below 1),
+    #65 (D1, #44: PostgreSQL sources, branch `d1-postgres-ingest`, green) and #66 (D3, #45: MySQL sources,
+    branch `d3-mysql-ingest`, stacked on #65: retarget to main after #65 merges). D1 and D3 read through
+    `ingest::Reader` (`PgReader` over DuckDB's postgres extension and SQL logical decoding, no new driver;
+    `MyReader` over `mysql_async` 0.37 binlog by GTID). Next: D4 (large tables, schema changes).
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository

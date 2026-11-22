@@ -29,6 +29,12 @@ metadata:
 - CI artifacts (worker logs) download from a host the session's proxy blocks: suites print what a failure
   needs (`dbt_test.sh` prints the worker's errors). `scripts/dbt_test.sh` needs Kafka; its steps 0-3 run against
   PostgreSQL alone with the Kafka lines stripped.
+- The ingest suites need a source database. `pg_ingest_test.sh` with `PG_LOCAL=1` needs the local server started
+  with `-c wal_level=logical` added to the `-o` options. `mysql_ingest_test.sh` with `MYSQL_LOCAL=1` needs MySQL 8
+  on 127.0.0.1:13306 (`apt-get install mysql-server-8.0`, then `mysqld --initialize-insecure` into
+  `/var/lib/mysql-dw` and start it with `--port=13306 --server-id=1 --log-bin=binlog --gtid-mode=ON
+  --enforce-gtid-consistency=ON --binlog-row-metadata=FULL`). Kill workers left from an earlier run first
+  (`pkill -f target/release/duckwake`): one holding the test catalog makes `reset_lake` fail.
 - The cloud session has no Docker: Kafka suites (upsert, Debezium, chain) and `debezium_e2e_test.sh` run only in
   CI. Check the PostgreSQL side of a new suite against the local server and its DuckDB queries with
   `duckwake sql` before pushing.
