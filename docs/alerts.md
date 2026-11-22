@@ -46,7 +46,7 @@ The series, per view (`worker` and `view` labels) unless marked per worker:
 | Series | |
 | --- | --- |
 | `duckwake_freshness_seconds` | now minus the newest event time committed; grows on an idle topic too |
-| `duckwake_lag_events` | events behind the end of the topic after the last commit; for a PostgreSQL source, bytes of WAL the server had flushed past its position |
+| `duckwake_lag_events` | events behind the end of the topic after the last commit; for a PostgreSQL source, bytes of WAL the server had flushed past its position; for a MySQL source, transactions it had executed past it |
 | `duckwake_watermark_delay_seconds` | now minus the watermark |
 | `duckwake_epoch`, `duckwake_stage_seconds`, `duckwake_commit_freshness_seconds` | last epoch, its staging time, event to visible |
 | `duckwake_rows_in_total`, `_rows_out_total`, `_late_rows_total`, `_dead_letters_total` | counters |
@@ -119,6 +119,9 @@ and the worker log says why (`view stopped: marking it failed`, `cannot start jo
   start it to take a new snapshot. *the columns of ... changed*: drop the source and create it again. *does not
   fit its mirror column*: a value the type mapping cannot hold ([PostgreSQL sources](sql.md#postgresql-sources)).
   While it is failed or stopped, the database keeps WAL for its slot.
+- A MySQL source's ingest job: *the server purged binlog the mirrors had not read*: reset it (`--to-epoch 0`) and
+  start it. *... changed in MySQL*: drop the source and create it again. *a value of ... cannot be read*: see
+  [MySQL sources](sql.md#mysql-sources).
 
 ## DuckWakeViewStuck
 

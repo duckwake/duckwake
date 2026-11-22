@@ -81,7 +81,7 @@ The mirror path needs two things from other plans first: operators that handle â
 
 1. **D1. PostgreSQL ingest job.** Slot and publication handling, the six rules above, snapshot under an exported snapshot, mirror tables with versions and tombstones, and a test database with `wal_level = logical` in docker compose. Gate: while a generator inserts, updates (including key changes and large TOAST values) and deletes rows and the worker is killed repeatedly, the mirror tables equal the source tables exactly once writes stop and the job drains; the slot never runs ahead of the lake. **Built 2026-11-21** (branch `d1-postgres-ingest`), as described in [D1 as built](#d1-as-built); gate `scripts/pg_ingest_test.sh`, in order and pipelined.
 2. **D2. Views over mirror tables.** Lake tables as sources through DuckLake's change feed, with snapshot ids as positions and maintenance that keeps what the slowest view needs. Gate: every view kind over a mirror table matches the batch query over the mirror after every epoch, in the crash suite.
-3. **D3. MySQL ingest job.** Binlog by GTID, the consistent snapshot, DDL tracking. Gate: D1's gate against MySQL.
+3. **D3. MySQL ingest job.** Binlog by GTID, the consistent snapshot, DDL tracking. Gate: D1's gate against MySQL. **Built 2026-11-22** (branch `d3-mysql-ingest`), as described in [D3 as built](#d3-as-built); gate `scripts/mysql_ingest_test.sh`, in order and pipelined.
 4. **D4. Large tables and operations.** DBLog-style chunked backfill, adding tables to a running source, schema changes, lag and WAL metrics, secrets. Gate: a 100M-row table snapshots while streaming continues, and a forced restart mid-backfill resumes without a full restart.
 5. **D5 (optional).** MongoDB change streams with resume tokens, if asked for.
 
@@ -124,6 +124,41 @@ The gate (`scripts/pg_ingest_test.sh`, CI jobs `pg ingest` and `pg ingest pipeli
 lake after a crash, the mirrors equal the tables once the job catches up, one snapshot serves every restart,
 and a view over a mirror verifies. It also covers a slot advanced past the lake, `reset`, a changed table and
 `drop-source`. With the TOAST fill planted to write NULL, it fails.
+
+## D3 as built
+
+Built 2026-11-22 (`crates/core/src/mysqlsource.rs`), on the ingest job D1 built, which now reads through a
+`Reader` (`ingest.rs`): the batching of each key's last state, the staging, the commit with fencing and the
+checkpoint are shared, and each kind reads its own way (`PgReader`, `MyReader`). The mirror tables, the type
+casts and `verify`'s comparison are shared too (`mirror.rs`). It keeps the plan above, with these choices:
+
+- **The client.** `mysql_async` 0.37 (MIT or Apache-2.0) with its `binlog` feature, rustls on ring as for Kafka.
+  Each epoch opens a non-blocking `COM_BINLOG_DUMP_GTID` from the lake's GTID set and reads to the end of the
+  binlog or `max_changes` (at a transaction's end); the server skips what the set holds, so nothing is sent twice
+  and nothing is acknowledged.
+- **Versions.** The plan's own sequence numbers are not needed: an epoch applies each key's changes in binlog
+  order and writes its last state, as for PostgreSQL, and the GTID set is the position.
+- **The snapshot without locks.** No `FLUSH TABLES WITH READ LOCK`: the job reads `gtid_executed` (G1), starts a
+  `WITH CONSISTENT SNAPSHOT` transaction, reads `gtid_executed` again (G2) and copies every table in it. This rests on
+  MySQL adding a transaction's GTID to `gtid_executed` in its commit stage after the engine commit (in
+  `process_commit_stage_queue`), so the copy holds all of G1, and only transactions within G2. The
+  first epoch applies the binlog from G1 until the set holds G2, over the copy, in the same commit; full row
+  images make each row right whichever of those transactions the copy held.
+- **Values.** The snapshot reads with the binary protocol in a UTC session; the binlog carries its own encodings
+  (a `TIMESTAMP` as seconds since 1970, an `ENUM` as its index, a `SET` as a bitmask, JSON in MySQL's binary form,
+  decimals inside JSON as opaque values). Both become one text per column kind and the same cast. JSON is written
+  with its object keys sorted, since the binlog and the server's text order them differently.
+- **DDL.** The job reads `ALTER`, `DROP` and `RENAME TABLE` statements naming a mirrored table and stops;
+  `TRUNCATE` empties the mirror; the table map's column names (`binlog_row_metadata = FULL`) or count must match.
+- **Not built yet:** applying schema changes, tables with generated columns, character sets other than utf8mb4,
+  tagged GTIDs (MySQL 8.4), compressed transaction payloads, and parallel or chunked copies (D4).
+
+The gate (`scripts/mysql_ingest_test.sh`, CI jobs `mysql ingest` and `mysql ingest pipelined`, against the
+compose service `mysql-source`) runs a stored-procedure workload over three tables while the worker is killed;
+the mirrors equal the tables once the job catches up, one snapshot serves every restart, and a view over a mirror
+verifies. A reset during the workload takes a snapshot under load, whose catch-up between G1 and G2 is applied
+in its commit; purged binlog, a changed table and `drop-source` are covered too. The PostgreSQL gate's reset runs
+under load as well, and a planted bug that applies the transactions its snapshot already saw fails it.
 
 ## Risks and open questions
 

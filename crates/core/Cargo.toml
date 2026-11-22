@@ -24,6 +24,9 @@ tracing.workspace = true
 chrono.workspace = true
 rand.workspace = true
 libc = "0.2"
+# MySQL sources: the binlog by GTID, and the snapshot. rustls with ring, as for Kafka; no C zlib.
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "binlog", "default-rustls-ring"] }
+futures-util = "0.3"
 
 [features]
 default = ["bundled"]

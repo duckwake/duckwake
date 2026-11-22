@@ -8,6 +8,9 @@
 use crate::lake::{ident, lit, LAKE};
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
+use crate::ingest::{cast_error, stop, Batch, Change, Position, Read, Reader};
+use crate::mirror::{cast_sql, MirrorColumn, MirrorTable};
+use crate::pgoutput::{self, format_lsn, parse_lsn, Message, Snapshot};
 use serde::{Deserialize, Serialize};
 
 pub const KIND: &str = "postgres";
@@ -16,38 +19,6 @@ pub const KIND: &str = "postgres";
 /// UTC times, hex bytea and exact floats.
 const SESSION_OPTIONS: &str =
     "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c TimeZone=UTC -c bytea_output=hex -c extra_float_digits=1";
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PgColumn {
-    pub name: String,
-    /// `format_type` of the column, for messages.
-    pub pg_type: String,
-    pub oid: u32,
-    pub typmod: i32,
-    pub duck_type: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PgTable {
-    pub schema: String,
-    pub name: String,
-    /// The mirror table, `lake.<schema>.<name>` (unquoted: names are `[a-z][a-z0-9_]*`).
-    pub mirror: String,
-    pub columns: Vec<PgColumn>,
-    /// The primary key's columns, in key order.
-    pub key: Vec<String>,
-}
-
-impl PgTable {
-    pub fn source_name(&self) -> String {
-        format!("{}.{}", self.schema, self.name)
-    }
-
-    /// Positions of the key columns among `columns`.
-    pub fn key_positions(&self) -> Vec<usize> {
-        self.key.iter().map(|k| self.columns.iter().position(|c| &c.name == k).expect("key column")).collect()
-    }
-}
 
 /// A PostgreSQL source as stored in `__duckwake.sources` (kind `postgres`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,7 +38,7 @@ pub struct PgOptions {
     pub epoch_interval: String,
     /// Most changes one epoch reads from the slot (whole transactions: a larger one is read whole).
     pub max_changes: usize,
-    pub tables: Vec<PgTable>,
+    pub tables: Vec<MirrorTable>,
 }
 
 impl PgOptions {
@@ -162,19 +133,9 @@ pub fn duck_type(oid: u32, typmod: i32) -> String {
     }
 }
 
-/// SQL turning `v`, a column's text form as PostgreSQL writes it, into the mirror column's type.
-pub fn cast_sql(c: &PgColumn, v: &str) -> String {
-    match c.duck_type.as_str() {
-        "VARCHAR" => v.to_string(),
-        // Hex form: \x followed by two digits a byte.
-        "BLOB" => format!("unhex(substr({v}, 3))"),
-        t => format!("CAST({v} AS {t})"),
-    }
-}
-
 /// The SQL that reads a table's rows under the transaction's snapshot, each column in its output function's
 /// text form, as `pgoutput` sends it (`::text` would trim a `char(n)`'s padding).
-pub fn copy_sql(t: &PgTable) -> String {
+pub fn copy_sql(t: &MirrorTable) -> String {
     let cols: Vec<String> = t
         .columns
         .iter()
@@ -235,7 +196,7 @@ fn parse_input(name: &str, v: &serde_json::Value) -> Result<(PgOptions, Vec<(Str
 }
 
 /// Reads a table's columns, key and replica identity, and refuses what the ingest job cannot mirror.
-fn read_table(conn: &Connection, a: &str, schema: &str, table: &str, lake_schema: &str) -> Result<PgTable> {
+fn read_table(conn: &Connection, a: &str, schema: &str, table: &str, lake_schema: &str) -> Result<MirrorTable> {
     let what = format!("{schema}.{table}");
     crate::lake::check_name("mirrored table", table).with_context(|| format!("{what}: its mirror table takes its name"))?;
     let meta = rows(
@@ -282,13 +243,13 @@ fn read_table(conn: &Connection, a: &str, schema: &str, table: &str, lake_schema
         if let Some(pos) = r[4].as_deref() {
             key.push((pos.parse()?, name.clone()));
         }
-        columns.push(PgColumn { duck_type: duck_type(oid, typmod), name, pg_type: r[1].clone().unwrap_or_default(), oid, typmod });
+        columns.push(MirrorColumn { duck_type: duck_type(oid, typmod), name, source_type: r[1].clone().unwrap_or_default(), oid, typmod });
     }
     if key.is_empty() {
         bail!("{what} has no primary key; a mirror needs one to apply updates and deletes");
     }
     key.sort();
-    Ok(PgTable {
+    Ok(MirrorTable {
         schema: schema.into(),
         name: table.into(),
         mirror: format!("{LAKE}.{lake_schema}.{table}"),
@@ -383,7 +344,7 @@ pub fn create(conn: &Connection, name: &str, options: &serde_json::Value) -> Res
         }
     };
 
-    let res = crate::catalog::create_postgres_source(conn, name, &opts);
+    let res = crate::catalog::create_ingest_source(conn, name, KIND, &serde_json::to_value(&opts)?, &opts.schema, &opts.tables);
     if let Err(e) = res {
         // Leave nothing behind on the database for a source that does not exist.
         if slot_created {
@@ -437,76 +398,294 @@ pub fn drop(conn: &Connection, name: &str, opts: &PgOptions) -> Result<String> {
             opts.slot, opts.slot
         ),
     };
-    crate::catalog::drop_postgres_source(conn, name, opts)?;
+    crate::catalog::drop_ingest_source(conn, name, &opts.tables)?;
     let _ = conn.execute_batch(&format!("DETACH DATABASE IF EXISTS {}", alias(name)));
     Ok(format!("source {name}: dropped with its mirror tables, slot {}{note}", opts.slot))
 }
 
-/// Compares every mirror table with its source table as read now, under one snapshot, through the same text
-/// forms and casts as the ingest job. Exact once writes have stopped and the job has caught up; while changes
-/// are in flight they show up as differences. Returns whether they are equal, and what was found.
-pub fn verify(conn: &Connection, name: &str, opts: &PgOptions) -> Result<(bool, String)> {
-    let a = attach(conn, name, opts, true)?;
-    let staged = |i: usize| format!("memory.main.{}", ident(&format!("verify_{name}_{i}")));
-    conn.execute_batch("BEGIN")?;
-    let copied = (|| -> Result<()> {
-        for (i, t) in opts.tables.iter().enumerate() {
-            let cols: Vec<String> = t.columns.iter().map(|c| format!("{} AS {}", cast_sql(c, &ident(&c.name)), ident(&c.name))).collect();
-            conn.execute_batch(&format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT {} FROM postgres_query({}, {})",
-                staged(i),
-                cols.join(", "),
-                lit(a.trim_matches('"')),
-                lit(&copy_sql(t))
-            ))?;
-        }
-        Ok(())
-    })();
-    match copied {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
+/// An idle source commits its position once it is this far behind, so the slot lets go of the WAL.
+const POSITION_BYTES: u64 = 64 << 20;
+
+/// A PostgreSQL source's changes, read from its slot with `pg_logical_slot_peek_binary_changes`, so the database
+/// keeps every change until DuckWake has committed it:
+///
+/// - The position is the end LSN of the last transaction read, or a flush LSN the slot had nothing before.
+/// - The slot is advanced to the position only after the commit (`committed`); after a crash in between, the
+///   transactions it sends again end at or before the position and are skipped.
+/// - A slot whose confirmed position is past the lake's, gone or invalidated has lost changes: the job stops.
+/// - The snapshot is taken after the slot exists, in one REPEATABLE READ transaction whose `pg_current_snapshot()`
+///   is kept in the position: transactions it already saw are skipped by id, until every transaction running
+///   when it was taken has ended and been read.
+pub(crate) struct PgReader {
+    job: String,
+    alias: String,
+    opts: PgOptions,
+    /// Relations the slot described, as the source's tables (None: one the source does not mirror).
+    relations: std::collections::HashMap<u32, Option<usize>>,
+}
+
+/// The transaction a reader is in: whether it applies, its commit time, and its changes.
+type Txn = Option<(bool, i64, Vec<Change>)>;
+
+impl PgReader {
+    pub(crate) fn open(conn: &Connection, job: &str, opts: &PgOptions) -> Result<Self> {
+        Ok(PgReader { job: job.into(), alias: attach(conn, job, opts, true)?, opts: opts.clone(), relations: Default::default() })
+    }
+
+    fn slot_lit(&self) -> String {
+        lit(&self.opts.slot)
+    }
+
+    /// The source table a change belongs to; None for a table the source does not mirror, or a transaction
+    /// that does not apply.
+    fn table(&self, rel: u32, txn: &Txn) -> Result<Option<usize>> {
+        let r = self.relations.get(&rel).context("a change for a relation the slot did not describe")?;
+        let Some((applies, _, _)) = txn.as_ref() else { bail!("a change outside a transaction") };
+        Ok(r.filter(|_| *applies))
+    }
+
+    /// Copies every table in one REPEATABLE READ transaction (a DuckDB transaction is one PostgreSQL
+    /// transaction: every postgres_query in it reads the same snapshot) into memory, so the lake transaction
+    /// stays short. Returns the snapshot and the slot's confirmed position.
+    fn copy_with(&self, conn: &Connection, staging: &dyn Fn(usize) -> String) -> Result<(String, u64)> {
+        conn.execute_batch("BEGIN")?;
+        let copied = (|| -> Result<(String, u64)> {
+            let r = row(
+                conn,
+                &self.alias,
+                &format!(
+                    "SELECT pg_current_snapshot()::text, (SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = {})",
+                    self.slot_lit()
+                ),
+            )?;
+            let snap = r[0].clone().context("snapshot")?;
+            let lsn = r[1].as_deref().map(parse_lsn).transpose()?.unwrap_or(0);
+            for (i, t) in self.opts.tables.iter().enumerate() {
+                let cols: Vec<String> = t.columns.iter().map(|c| format!("{} AS {}", cast_sql(c, &ident(&c.name)), ident(&c.name))).collect();
+                conn.execute_batch(&format!(
+                    "CREATE OR REPLACE TABLE {} AS SELECT {} FROM postgres_query({}, {})",
+                    staging(i),
+                    cols.join(", "),
+                    lit(self.alias.trim_matches('"')),
+                    lit(&copy_sql(t))
+                ))
+                .map_err(|e| cast_error(e, t))?;
+            }
+            Ok((snap, lsn))
+        })();
+        match copied {
+            Ok(c) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(c)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
     }
-    let mut ok = true;
-    let mut parts = Vec::new();
-    for (i, t) in opts.tables.iter().enumerate() {
-        let (src, mirror) = (staged(i), crate::lake::quote_table(&t.mirror)?);
-        let keys: Vec<String> = t.key.iter().map(|k| ident(k)).collect();
-        let diff = |a: &str, b: &str| -> Result<(i64, Vec<String>)> {
-            let n: i64 = conn.query_row(&format!("SELECT count(*) FROM (SELECT * FROM {a} EXCEPT ALL SELECT * FROM {b})"), [], |r| r.get(0))?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT ({})::VARCHAR FROM (SELECT * FROM {a} EXCEPT ALL SELECT * FROM {b}) ORDER BY ALL LIMIT 3",
-                if keys.len() == 1 { keys[0].clone() } else { format!("row({})", keys.join(", ")) }
-            ))?;
-            let sample = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
-            Ok((n, sample))
+}
+
+impl Reader for PgReader {
+    fn backend(&self) -> &'static str {
+        "pgoutput"
+    }
+
+    fn describe(&self, pos: &Position) -> String {
+        format!("slot {} at LSN {}", self.opts.slot, format_lsn(pos.offset))
+    }
+
+    fn snapshot(&mut self, conn: &Connection, staging: &dyn Fn(usize) -> String, _batch: &mut Batch) -> Result<(Position, i64)> {
+        let slot = rows(conn, &self.alias, &format!("SELECT wal_status FROM pg_replication_slots WHERE slot_name = {}", self.slot_lit()))?;
+        match slot.first().map(|r| r[0].as_deref()) {
+            Some(Some("lost")) => {
+                tracing::warn!(job = %self.job, slot = %self.opts.slot, "slot was invalidated; creating it again for the snapshot");
+                execute(conn, &self.alias, &format!("SELECT pg_drop_replication_slot({})", self.slot_lit()))?;
+                create_slot(conn, &self.alias, &self.opts.slot)?;
+            }
+            Some(_) => {}
+            None => create_slot(conn, &self.alias, &self.opts.slot)?,
+        }
+        let (snap, lsn) = self.copy_with(conn, staging)?;
+        Ok((Position { offset: lsn, state: serde_json::json!({ "snapshot": snap }) }, 0))
+    }
+
+    fn copy(&mut self, conn: &Connection, staging: &dyn Fn(usize) -> String) -> Result<()> {
+        self.copy_with(conn, staging).map(|_| ())
+    }
+
+    fn read(&mut self, conn: &Connection, pos: &Position, batch: &mut Batch) -> Result<Read> {
+        let lsn = pos.offset;
+        // Before the read: the flush position (everything before it the read below decodes), and with a
+        // snapshot, the oldest transaction still running.
+        let r = row(
+            conn,
+            &self.alias,
+            &format!(
+                "SELECT pg_current_wal_flush_lsn()::text, pg_current_wal_insert_lsn()::text,
+                        pg_snapshot_xmin(pg_current_snapshot())::text, s.confirmed_flush_lsn::text, s.wal_status
+                 FROM (SELECT 1) x LEFT JOIN pg_replication_slots s ON s.slot_name = {}",
+                self.slot_lit()
+            ),
+        )?;
+        let flush = parse_lsn(r[0].as_deref().context("flush lsn")?)?;
+        let insert = parse_lsn(r[1].as_deref().context("insert lsn")?)?;
+        let xmin_now: u64 = r[2].as_deref().context("xmin")?.parse()?;
+        let reset = format!("reset it to take a new snapshot: duckwake reset {} --to-epoch 0", self.job);
+        let Some(confirmed) = r[3].as_deref() else {
+            return Err(stop(format!("replication slot {} is gone, so the changes since the last epoch are lost; {reset}", self.opts.slot)));
         };
-        let (only_src, s1) = diff(&src, &mirror)?;
-        let (only_mirror, s2) = diff(&mirror, &src)?;
-        let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM {src}"), [], |r| r.get(0))?;
-        if only_src == 0 && only_mirror == 0 {
-            parts.push(format!("{} {rows} rows", t.name));
-        } else {
-            ok = false;
-            parts.push(format!(
-                "{}: {only_src} rows only in the source (keys {}), {only_mirror} only in the mirror (keys {})",
-                t.name,
-                s1.join(", "),
-                s2.join(", ")
-            ));
+        if r[4].as_deref() == Some("lost") {
+            return Err(stop(format!(
+                "replication slot {} was invalidated (max_slot_wal_keep_size), so the changes since the last epoch are lost; {reset}",
+                self.opts.slot
+            )));
         }
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS {src}"))?;
+        let confirmed = parse_lsn(confirmed)?;
+        if confirmed > lsn {
+            return Err(stop(format!(
+                "replication slot {} has confirmed {}, past the lake's position {}: something else advanced it, and those changes are lost; {reset}",
+                self.opts.slot,
+                format_lsn(confirmed),
+                format_lsn(lsn)
+            )));
+        }
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT data FROM postgres_query({}, {})",
+            lit(self.alias.trim_matches('"')),
+            lit(&format!(
+                "SELECT data FROM pg_logical_slot_peek_binary_changes({}, NULL, {}, 'proto_version', '1', 'publication_names', {})",
+                self.slot_lit(),
+                self.opts.max_changes,
+                lit(&self.opts.publication)
+            ))
+        ))?;
+        let messages = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
+        let full = messages.len() >= self.opts.max_changes;
+        let snapshot_text = pos.state.get("snapshot").and_then(|v| v.as_str()).map(String::from);
+        let snapshot = snapshot_text.as_deref().map(Snapshot::parse).transpose()?;
+        let mut clear_after = pos.state.get("clear_after").and_then(|v| v.as_str()).map(parse_lsn).transpose()?;
+        let (mut end, mut txns, mut skipped, mut changes, mut newest_us) = (lsn, 0u64, 0u64, 0i64, None);
+        let mut txn: Txn = None;
+        for data in &messages {
+            match pgoutput::decode(data)? {
+                Message::Begin { final_lsn, commit_us, xid } => {
+                    // Applied before a crash (its commit is before the position), or already in the copy.
+                    let applies = final_lsn >= lsn && !snapshot.as_ref().is_some_and(|s| s.sees(xid));
+                    txn = Some((applies, commit_us, Vec::new()));
+                }
+                Message::Commit { end_lsn, .. } => {
+                    let (applies, commit_us, txn_changes) = txn.take().context("a Commit without its Begin")?;
+                    txns += 1;
+                    if applies {
+                        for c in txn_changes {
+                            batch.apply(c)?;
+                        }
+                        newest_us = Some(commit_us);
+                    } else {
+                        skipped += 1;
+                    }
+                    end = end.max(end_lsn);
+                }
+                Message::Relation { id, schema, name, columns, .. } => {
+                    let table = self.opts.tables.iter().position(|t| t.schema == schema && t.name == name);
+                    if let Some(i) = table {
+                        check_columns(&self.opts.tables[i], &columns)?;
+                    }
+                    self.relations.insert(id, table);
+                }
+                Message::Insert { rel, new } => {
+                    if let Some(t) = self.table(rel, &txn)? {
+                        changes += 1;
+                        txn.as_mut().unwrap().2.push(Change::Upsert { table: t, old_key: None, values: new });
+                    }
+                }
+                Message::Update { rel, old, new } => {
+                    if let Some(t) = self.table(rel, &txn)? {
+                        changes += 1;
+                        let old_key = old.map(|o| batch.key(t, &o)).transpose()?;
+                        txn.as_mut().unwrap().2.push(Change::Upsert { table: t, old_key, values: new });
+                    }
+                }
+                Message::Delete { rel, old } => {
+                    if let Some(t) = self.table(rel, &txn)? {
+                        changes += 1;
+                        let key = batch.key(t, &old)?;
+                        txn.as_mut().unwrap().2.push(Change::Delete { table: t, key });
+                    }
+                }
+                Message::Truncate { rels } => {
+                    let mut ts = Vec::new();
+                    for rel in rels {
+                        if let Some(t) = self.table(rel, &txn)? {
+                            ts.push(t);
+                        }
+                    }
+                    if let Some(x) = txn.as_mut() {
+                        x.2.push(Change::Truncate { tables: ts });
+                    }
+                }
+                Message::Other(_) => {}
+            }
+        }
+        // Nothing before the flush position was left out: the slot can move there.
+        if !full {
+            end = end.max(flush);
+        }
+        // The snapshot is needed until every transaction that was running when it was taken has ended and been
+        // read: once the oldest running one is newer than its xmax, every one ends before `insert`.
+        if let Some(s) = &snapshot {
+            if clear_after.is_none() && xmin_now >= s.xmax {
+                clear_after = Some(insert);
+            }
+        }
+        let forget = clear_after.is_some_and(|c| end >= c);
+        let state = match (forget, &snapshot_text) {
+            (false, Some(snap)) => serde_json::json!({ "snapshot": snap, "clear_after": clear_after.map(format_lsn) }),
+            (true, Some(_)) => {
+                tracing::info!(job = %self.job, "every transaction the snapshot saw has been read; forgetting it");
+                serde_json::json!({})
+            }
+            _ => serde_json::json!({}),
+        };
+        Ok(Read {
+            pos: Position { offset: end, state },
+            full,
+            txns,
+            skipped,
+            changes,
+            newest_us,
+            lag: flush.saturating_sub(end) as i64,
+            due: end.saturating_sub(lsn) >= POSITION_BYTES,
+        })
     }
-    Ok((
-        ok,
-        if ok {
-            format!("VERIFY OK: {name}: mirror tables equal their source tables ({})", parts.join(", "))
-        } else {
-            format!("VERIFY FAILED: {name}: {} (changes still in flight show up here too)", parts.join("; "))
-        },
-    ))
+
+    /// Lets the slot release what the lake now holds. A failure only delays it: the next epoch skips what
+    /// the slot sends again, and advances it then.
+    fn committed(&mut self, conn: &Connection, pos: &Position) {
+        let sql = format!("SELECT end_lsn::text FROM pg_replication_slot_advance({}, {})", self.slot_lit(), lit(&format_lsn(pos.offset)));
+        if let Err(e) = row(conn, &self.alias, &sql) {
+            tracing::warn!(job = %self.job, error = %format!("{e:#}"), "advancing the slot failed; the next epoch retries");
+        }
+    }
+}
+
+/// The columns a `Relation` message describes must be the ones the mirror was created with.
+fn check_columns(t: &MirrorTable, cols: &[pgoutput::Column]) -> Result<()> {
+    let same = cols.len() == t.columns.len() && cols.iter().zip(&t.columns).all(|(a, b)| a.name == b.name && a.type_oid == b.oid);
+    if !same {
+        let now: Vec<String> = cols.iter().map(|c| format!("{} (type {})", c.name, c.type_oid)).collect();
+        let was: Vec<String> = t.columns.iter().map(|c| format!("{} {}", c.name, c.source_type)).collect();
+        return Err(stop(format!(
+            "the columns of {} changed in PostgreSQL: now {}, the mirror has {}. Schema changes are not applied yet: \
+             drop the source and create it again",
+            t.source_name(),
+            now.join(", "),
+            was.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -522,10 +701,6 @@ mod tests {
         assert_eq!(duck_type(1184, -1), "TIMESTAMPTZ");
         assert_eq!(duck_type(1007, -1), "VARCHAR", "int4[] keeps its text form");
         assert_eq!(duck_type(1186, -1), "VARCHAR", "interval: Parquet refuses negative ones");
-        let c = |t: &str| PgColumn { name: "x".into(), pg_type: String::new(), oid: 0, typmod: -1, duck_type: t.into() };
-        assert_eq!(cast_sql(&c("VARCHAR"), "v"), "v");
-        assert_eq!(cast_sql(&c("BLOB"), "v"), "unhex(substr(v, 3))");
-        assert_eq!(cast_sql(&c("DATE"), "v"), "CAST(v AS DATE)");
     }
 
     #[test]

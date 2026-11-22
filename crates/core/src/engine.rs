@@ -539,7 +539,7 @@ struct Worker {
     conns: Vec<Connection>,
     committer: Committer,
     jobs: BTreeMap<String, JobRuntime>,
-    /// PostgreSQL sources' ingest jobs, each on its own thread (`ingest`).
+    /// Database sources' ingest jobs (PostgreSQL, MySQL), each on its own thread (`ingest`).
     ingests: BTreeMap<String, crate::ingest::Handle>,
     groups: BTreeMap<u64, Group>,
     next_group: u64,
@@ -669,17 +669,17 @@ impl Worker {
         Ok(())
     }
 
-    /// Starts a PostgreSQL source's ingest job on its own thread and connection. False when it is not ours.
+    /// Starts a database source's ingest job on its own thread and connection. False when it is not ours.
     fn start_ingest(&mut self, id: &str) -> Result<bool> {
         let conn = &self.conns[0];
-        let opts = catalog::load_postgres_source(conn, id)?;
+        let spec = crate::ingest::Spec::load(conn, id)?;
         let Some(lease) = catalog::take_lease(conn, id, &self.cfg.worker_id)? else { return Ok(false) };
         let settings = crate::ingest::Settings {
             worker: self.cfg.worker_id.clone(),
             position_refresh: self.cfg.position_refresh,
             metrics: self.cfg.metrics.clone(),
         };
-        let h = crate::ingest::Handle::spawn(crate::lake::connect_again(conn)?, settings, id.to_string(), lease, opts);
+        let h = crate::ingest::Handle::spawn(crate::lake::connect_again(conn)?, settings, id.to_string(), lease, spec);
         self.ingests.insert(id.to_string(), h);
         Ok(true)
     }

@@ -154,10 +154,15 @@ start_worker
 if wait_status shop failed; then grep -o "has confirmed [^,]*, past the lake's position[^:]*" "$OUT/worker.log" | tail -1
 else echo "shop is $(status shop), not failed"; failed=1; fi
 
-log "reset takes a new snapshot"
+log "reset takes a new snapshot, while the workload runs again"
 "$BIN" reset shop --to-epoch 0
+psql_src -c "CALL workload(12)" >"$OUT/workload2.log" 2>&1 &
+WORKLOAD=$!
+sleep 2
 "$BIN" start shop >/dev/null
+wait "$WORKLOAD" || { cat "$OUT/workload2.log"; failed=1; }
 wait_verified 120 && cat "$OUT/verify_shop.txt" || failed=1
+echo "transactions skipped as already in the lake or a snapshot: $(grep -o 'skipped=[0-9]*' "$OUT/worker.log" | awk -F= '{s+=$2} END {print s+0}')"
 [[ $(grep -c "snapshot committed" "$OUT/worker.log") == 2 ]] && echo "a second snapshot after the reset" || { echo "no second snapshot"; failed=1; }
 for _ in $(seq 1 30); do "$BIN" verify orders_by_status >"$OUT/verify_view.txt" 2>&1 && break; sleep 1; done
 tail -1 "$OUT/verify_view.txt" | grep '^VERIFY OK' || { cat "$OUT/verify_view.txt"; failed=1; }

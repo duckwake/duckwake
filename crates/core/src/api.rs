@@ -72,8 +72,17 @@ pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -
             o.publication
         ));
     }
+    if kind == crate::mysqlsource::KIND {
+        let o = crate::mysqlsource::create(conn, name, &opts)?;
+        let mirrors: Vec<String> = o.tables.iter().map(|t| format!("{} -> {}", t.source_name(), t.mirror)).collect();
+        return Ok(format!(
+            "source {name}: {} (binlog as replica {}); start {name} to take the snapshot and follow the changes",
+            mirrors.join(", "),
+            o.server_id
+        ));
+    }
     if kind != "kafka" {
-        anyhow::bail!("kind {kind:?}: expected 'kafka' or 'postgres'");
+        anyhow::bail!("kind {kind:?}: expected 'kafka', 'postgres' or 'mysql'");
     }
     let def = catalog::create_source(conn, name, kind, &opts)?;
     Ok(format!("source {} -> topic {} ({} columns)", def.name, def.options.topic, def.options.columns.len()))
@@ -218,8 +227,7 @@ pub fn stop(conn: &Connection, name: &str) -> Result<String> {
 pub fn reset(conn: &Connection, name: &str, to_epoch: i64) -> Result<String> {
     let job = catalog::resolve_view(conn, name)?;
     if catalog::ingest_source(conn, &job)?.is_some() {
-        let opts = catalog::load_postgres_source(conn, &job)?;
-        catalog::reset_postgres_source(conn, &job, &opts, to_epoch)?;
+        catalog::reset_ingest_source(conn, &job, &catalog::mirror_tables(conn, &job)?, to_epoch)?;
         return Ok(format!("{job}: reset; its mirror tables are empty, and starting it takes a new snapshot"));
     }
     let recomputed = catalog::reset(conn, &job, to_epoch)?;
@@ -238,20 +246,21 @@ pub fn drop(conn: &Connection, name: &str, keep_table: bool) -> Result<String> {
     Ok(format!("{job}: dropped{}", if keep_table { " (table kept)" } else { "" }))
 }
 
-/// `verify` of a PostgreSQL source's ingest job: its mirror tables against the source tables now. None for a view.
+/// `verify` of a database source's ingest job: its mirror tables against the source tables now. None for a view.
 pub fn verify_ingest(conn: &Connection, job: &str) -> Result<Option<(bool, String)>> {
     if catalog::ingest_source(conn, job)?.is_none() {
         return Ok(None);
     }
-    let opts = catalog::load_postgres_source(conn, job)?;
-    crate::pgsource::verify(conn, job, &opts).map(Some)
+    crate::ingest::verify(conn, job).map(Some)
 }
 
-/// Drops a source. A PostgreSQL source goes with its ingest job, mirror tables and replication slot.
+/// Drops a source. A database source goes with its ingest job and mirror tables, and a PostgreSQL one with its
+/// replication slot.
 pub fn drop_source(conn: &Connection, name: &str) -> Result<String> {
-    if catalog::source_kind(conn, name)?.as_deref() == Some(crate::pgsource::KIND) {
-        let opts = catalog::load_postgres_source(conn, name)?;
-        return crate::pgsource::drop(conn, name, &opts);
+    match catalog::source_kind(conn, name)?.as_deref() {
+        Some(crate::pgsource::KIND) => return crate::pgsource::drop(conn, name, &catalog::load_postgres_source(conn, name)?),
+        Some(crate::mysqlsource::KIND) => return crate::mysqlsource::drop(conn, name, &crate::mysqlsource::load(conn, name)?),
+        _ => {}
     }
     catalog::drop_source(conn, name)?;
     Ok(format!("source {name}: dropped"))

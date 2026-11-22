@@ -1,25 +1,24 @@
-//! The ingest job of a PostgreSQL source: it keeps one mirror table per source table, reading the source's
-//! logical replication slot through DuckDB's postgres extension (`pg_logical_slot_peek_binary_changes`, so the
-//! database keeps every change until DuckWake has committed it). The rules, from
+//! The ingest job of a database source (PostgreSQL, `pgsource`; MySQL, `mysqlsource`): it keeps one mirror table
+//! per source table (`mirror`), reading the source's changes through a `Reader`. The rules, from
 //! `docs/design/database-cdc-sources.md`:
 //!
-//! 1. Whole transactions only: the slot returns whole transactions, and an epoch applies each one or none.
-//! 2. The position is the end LSN of the last transaction applied (or a flush LSN the slot had nothing
-//!    before), written to `__duckwake.checkpoints` in the epoch's DuckLake transaction with the mirror rows.
-//! 3. The slot is advanced to that position only after the commit, so it never runs ahead of the lake; after a
-//!    crash in between, the transactions the slot sends again end at or before the position and are skipped.
-//! 4. A restart reads the position from the lake. A slot whose confirmed position is ahead of it, gone or
-//!    invalidated has lost changes: the job stops and asks for a reset, which takes a new snapshot.
+//! 1. Whole transactions only: a reader hands over whole transactions, and an epoch applies each one or none.
+//! 2. The position (a PostgreSQL LSN, a MySQL GTID set) is written to `__duckwake.checkpoints` in the epoch's
+//!    DuckLake transaction with the mirror rows.
+//! 3. Nothing is acknowledged to the source before that commit (PostgreSQL's slot is advanced after it; MySQL
+//!    keeps no state for a reader), so a crash in between costs a reread, never a loss.
+//! 4. A restart reads the position from the lake; a source that can no longer give the changes after it (a slot
+//!    gone, binlogs purged) stops the job, which a reset starts over from a new snapshot.
 //! 5. Changes of one key apply in commit order; an epoch writes each touched key's last state.
-//! 6. An update leaves unchanged large (TOAST) values out: they come from the key's previous state, in the epoch
-//!    or the mirror. A changed primary key deletes the old key. TRUNCATE empties the mirror.
+//! 6. A changed primary key deletes the old key. TRUNCATE empties the mirror. PostgreSQL leaves unchanged large
+//!    (TOAST) values out of an update: they come from the key's previous state, in the epoch or the mirror.
 //!
-//! The first epoch copies every table under one REPEATABLE READ snapshot taken after the slot was created, and
-//! records the snapshot: transactions the copy already holds are skipped when the slot sends them.
+//! The first epoch copies every table under one consistent snapshot of the source; how the reader joins that
+//! snapshot to the change stream is its own (`Reader::snapshot`).
 use crate::lake::{ident, lit, quote_table, CTL, LAKE};
-use crate::pgoutput::{self, format_lsn, parse_lsn, Message, Snapshot, Value};
-use crate::pgsource::{PgOptions, PgTable};
-use anyhow::{bail, Context, Result};
+use crate::mirror::{cast_sql, MirrorTable};
+use crate::pgoutput::Value;
+use anyhow::Result;
 use duckdb::Connection;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +50,7 @@ impl std::fmt::Display for Fenced {
 
 impl std::error::Error for Fenced {}
 
-fn stop(msg: String) -> anyhow::Error {
+pub(crate) fn stop(msg: String) -> anyhow::Error {
     anyhow::Error::new(Stop(msg))
 }
 
@@ -59,9 +58,99 @@ fn stop(msg: String) -> anyhow::Error {
 #[derive(Clone)]
 pub struct Settings {
     pub worker: String,
-    /// How long an idle source may leave its position, and the slot, behind the database's WAL.
+    /// How long an idle source may leave its position behind the source's log before committing it alone.
     pub position_refresh: Duration,
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+}
+
+/// A database source as the worker starts its ingest job.
+#[derive(Clone)]
+pub enum Spec {
+    Postgres(crate::pgsource::PgOptions),
+    Mysql(crate::mysqlsource::MyOptions),
+}
+
+impl Spec {
+    /// The source named `name`, of either kind.
+    pub fn load(conn: &Connection, name: &str) -> Result<Spec> {
+        match crate::catalog::source_kind(conn, name)?.as_deref() {
+            Some(crate::mysqlsource::KIND) => Ok(Spec::Mysql(crate::mysqlsource::load(conn, name)?)),
+            _ => Ok(Spec::Postgres(crate::catalog::load_postgres_source(conn, name)?)),
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        let s = match self {
+            Spec::Postgres(o) => &o.epoch_interval,
+            Spec::Mysql(o) => &o.epoch_interval,
+        };
+        crate::model::parse_duration(s).unwrap_or(Duration::from_secs(2))
+    }
+
+    pub fn tables(&self) -> &[MirrorTable] {
+        match self {
+            Spec::Postgres(o) => &o.tables,
+            Spec::Mysql(o) => &o.tables,
+        }
+    }
+
+    fn reader(&self, conn: &Connection, job: &str) -> Result<Box<dyn Reader>> {
+        Ok(match self {
+            Spec::Postgres(o) => Box::new(crate::pgsource::PgReader::open(conn, job, o)?),
+            Spec::Mysql(o) => Box::new(crate::mysqlsource::MyReader::open(job, o)?),
+        })
+    }
+}
+
+/// Where a source's changes stand: `offset` goes into the checkpoint's offsets (it only grows: an LSN, a count
+/// of transactions), `state` into its `state_ref` (what else the reader needs to go on).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Position {
+    pub offset: u64,
+    pub state: serde_json::Value,
+}
+
+/// What one read of a source's changes found.
+pub(crate) struct Read {
+    /// The position after the transactions read (or further, where the source says nothing before it changed).
+    pub pos: Position,
+    /// The read stopped at `max_changes`: more is waiting.
+    pub full: bool,
+    pub txns: u64,
+    /// Of `txns`, those already in the lake or the snapshot.
+    pub skipped: u64,
+    pub changes: i64,
+    pub newest_us: Option<i64>,
+    /// How far the source is ahead of `pos` (bytes of WAL, transactions of binlog).
+    pub lag: i64,
+    /// The reader wants `pos` committed even with nothing to write (the source keeps its log until then).
+    pub due: bool,
+}
+
+/// A database source's changes, as the ingest job reads them.
+pub(crate) trait Reader {
+    /// `checkpoints.state_backend` of this source's checkpoints.
+    fn backend(&self) -> &'static str;
+    fn describe(&self, pos: &Position) -> String;
+    /// The first epoch: copies every table, under one consistent snapshot, into `staging(i)` (memory tables
+    /// cast like the mirrors), and puts into `batch` what must be applied over the copy in the same commit.
+    /// Returns the position the stream goes on from, and how many changes `batch` took.
+    fn snapshot(&mut self, conn: &Connection, staging: &dyn Fn(usize) -> String, batch: &mut Batch) -> Result<(Position, i64)>;
+    /// The tables copied as they are now, under one snapshot, into `staging(i)`: for `verify`.
+    fn copy(&mut self, conn: &Connection, staging: &dyn Fn(usize) -> String) -> Result<()>;
+    /// The whole transactions after `pos`, into `batch`.
+    fn read(&mut self, conn: &Connection, pos: &Position, batch: &mut Batch) -> Result<Read>;
+    /// After the commit of `pos`: what the source may now let go of.
+    fn committed(&mut self, conn: &Connection, pos: &Position);
+}
+
+/// Compares the mirrors of source `name` with its tables now (`duckwake verify`).
+pub fn verify(conn: &Connection, name: &str) -> Result<(bool, String)> {
+    let spec = Spec::load(conn, name)?;
+    let mut reader = spec.reader(conn, name)?;
+    let staging = |i: usize| format!("memory.main.{}", ident(&format!("verify_{name}_{i}")));
+    reader.copy(conn, &staging)?;
+    crate::mirror::compare(conn, name, spec.tables(), &staging)
 }
 
 /// An ingest job running on its own thread and connection, so a long snapshot never holds up the views.
@@ -73,13 +162,13 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn spawn(conn: Connection, settings: Settings, job: String, lease: i64, opts: PgOptions) -> Handle {
+    pub fn spawn(conn: Connection, settings: Settings, job: String, lease: i64, spec: Spec) -> Handle {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, failed) = mpsc::channel();
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name(format!("ingest-{job}"))
-            .spawn(move || run(conn, settings, job, lease, opts, flag, tx))
+            .spawn(move || run(conn, settings, job, lease, spec, flag, tx))
             .expect("spawning an ingest thread");
         Handle { lease, stop, thread: Some(thread), failed }
     }
@@ -106,8 +195,8 @@ impl Handle {
     }
 }
 
-fn run(conn: Connection, s: Settings, job: String, lease: i64, opts: PgOptions, stop_flag: Arc<AtomicBool>, failed: mpsc::Sender<String>) {
-    let interval = opts.interval().unwrap_or(Duration::from_secs(2));
+fn run(conn: Connection, s: Settings, job: String, lease: i64, spec: Spec, stop_flag: Arc<AtomicBool>, failed: mpsc::Sender<String>) {
+    let interval = spec.interval();
     let mut ingest: Option<Ingest> = None;
     let mut backoff = Duration::from_secs(1);
     let wait = |d: Duration| {
@@ -120,14 +209,14 @@ fn run(conn: Connection, s: Settings, job: String, lease: i64, opts: PgOptions, 
         let started = Instant::now();
         let res = (|| -> Result<Outcome> {
             if ingest.is_none() {
-                ingest = Some(Ingest::open(&conn, &s, &job, lease, &opts)?);
+                ingest = Some(Ingest::open(&conn, &s, &job, lease, &spec)?);
             }
             ingest.as_mut().unwrap().epoch()
         })();
         match res {
             Ok(outcome) => {
                 backoff = Duration::from_secs(1);
-                // A full read leaves more waiting in the slot: go on at once.
+                // A full read leaves more waiting in the source: go on at once.
                 if outcome != Outcome::Full {
                     wait(interval.saturating_sub(started.elapsed()));
                 }
@@ -162,7 +251,7 @@ enum Outcome {
 
 /// A row's state at the end of the epoch so far.
 #[derive(Debug, Clone, PartialEq)]
-enum Final {
+pub(crate) enum Final {
     Deleted,
     /// `fill`: the key whose stored row holds the values still `Unchanged`.
     Row { values: Vec<Value>, fill: Option<Vec<String>> },
@@ -170,31 +259,31 @@ enum Final {
 
 /// One table's changes in an epoch: each touched key's last state.
 #[derive(Debug, Default)]
-struct TableChanges {
+pub(crate) struct TableChanges {
     truncated: bool,
     keys: HashMap<Vec<String>, Final>,
 }
 
-/// A change of one transaction, kept until its Commit arrives.
-enum Change {
+/// A change of one transaction, kept by a reader until the transaction ends.
+pub(crate) enum Change {
     Upsert { table: usize, old_key: Option<Vec<String>>, values: Vec<Value> },
     Delete { table: usize, key: Vec<String> },
     Truncate { tables: Vec<usize> },
 }
 
 /// Applies changes in commit order to the epoch's per-table states.
-struct Batch<'a> {
-    tables: &'a [PgTable],
+pub(crate) struct Batch<'a> {
+    tables: &'a [MirrorTable],
     keys: Vec<Vec<usize>>,
     changes: Vec<TableChanges>,
 }
 
 impl<'a> Batch<'a> {
-    fn new(tables: &'a [PgTable]) -> Self {
+    pub(crate) fn new(tables: &'a [MirrorTable]) -> Self {
         Batch { tables, keys: tables.iter().map(|t| t.key_positions()).collect(), changes: tables.iter().map(|_| TableChanges::default()).collect() }
     }
 
-    fn key(&self, t: usize, values: &[Value]) -> Result<Vec<String>> {
+    pub(crate) fn key(&self, t: usize, values: &[Value]) -> Result<Vec<String>> {
         self.keys[t]
             .iter()
             .map(|&i| match values.get(i) {
@@ -204,7 +293,7 @@ impl<'a> Batch<'a> {
             .collect()
     }
 
-    fn apply(&mut self, c: Change) -> Result<()> {
+    pub(crate) fn apply(&mut self, c: Change) -> Result<()> {
         match c {
             Change::Upsert { table, old_key, values } => {
                 let key = self.key(table, &values)?;
@@ -249,7 +338,7 @@ impl<'a> Batch<'a> {
         Ok(())
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.changes.iter().all(|c| !c.truncated && c.keys.is_empty())
     }
 }
@@ -259,26 +348,18 @@ struct Ingest<'c> {
     s: Settings,
     job: String,
     lease: i64,
-    opts: PgOptions,
-    alias: String,
+    tables: Vec<MirrorTable>,
+    reader: Box<dyn Reader>,
     epoch: i64,
     /// None until the snapshot is committed.
-    lsn: Option<u64>,
-    /// The copy's snapshot, until every transaction it may have seen has been read (`clear_after`).
-    snapshot: Option<String>,
-    clear_after: Option<u64>,
+    pos: Option<Position>,
     last_commit: Instant,
-    /// Relations the slot described, as the source's tables (None: one the source does not mirror).
-    relations: HashMap<u32, Option<usize>>,
 }
 
-/// An idle source commits its position once it is this far behind, so the slot lets go of the WAL.
-const POSITION_BYTES: u64 = 64 << 20;
-
 impl<'c> Ingest<'c> {
-    fn open(conn: &'c Connection, s: &Settings, job: &str, lease: i64, opts: &PgOptions) -> Result<Self> {
-        let alias = crate::pgsource::attach(conn, job, opts, true)?;
-        for t in &opts.tables {
+    fn open(conn: &'c Connection, s: &Settings, job: &str, lease: i64, spec: &Spec) -> Result<Self> {
+        let reader = spec.reader(conn, job)?;
+        for t in spec.tables() {
             let (_, schema, table) = crate::lake::qualified_table(&t.mirror)?;
             crate::catalog::set_table_inlining(conn, &schema, &table, 10_000)?;
         }
@@ -292,302 +373,114 @@ impl<'c> Ingest<'c> {
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)),
             )
             .ok();
-        let (epoch, lsn, state) = match last {
-            Some((e, l, st)) => (e, l.map(|l| l.parse::<u64>()).transpose()?, st),
-            None => (0, None, None),
+        let (epoch, pos) = match last {
+            Some((e, Some(offset), state)) => {
+                let state = state.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_else(|| serde_json::json!({}));
+                (e, Some(Position { offset: offset.parse()?, state }))
+            }
+            Some((e, None, _)) => (e, None),
+            None => (0, None),
         };
-        let state: serde_json::Value = state.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
-        let snapshot = state.get("snapshot").and_then(|v| v.as_str()).map(String::from);
-        let clear_after = state.get("clear_after").and_then(|v| v.as_str()).map(parse_lsn).transpose()?;
-        match lsn {
-            Some(l) => info!(job, slot = %opts.slot, lsn = %format_lsn(l), "ingesting from the slot"),
-            None => info!(job, slot = %opts.slot, tables = opts.tables.len(), "no position yet: taking a snapshot"),
+        match &pos {
+            Some(p) => info!(job, at = %reader.describe(p), "ingesting changes"),
+            None => info!(job, tables = spec.tables().len(), "no position yet: taking a snapshot"),
         }
-        Ok(Ingest {
-            conn,
-            s: s.clone(),
-            job: job.into(),
-            lease,
-            opts: opts.clone(),
-            alias,
-            epoch,
-            lsn,
-            snapshot,
-            clear_after,
-            last_commit: Instant::now(),
-            relations: HashMap::new(),
-        })
-    }
-
-    fn slot_lit(&self) -> String {
-        lit(&self.opts.slot)
+        Ok(Ingest { conn, s: s.clone(), job: job.into(), lease, tables: spec.tables().to_vec(), reader, epoch, pos, last_commit: Instant::now() })
     }
 
     fn staging(&self, what: &str, i: usize) -> String {
-        format!("memory.main.{}", ident(&format!("ingest_{}_{what}{i}", self.job)))
+        staging_table(&self.job, what, i)
     }
 
-    /// The first epoch: every table copied under one snapshot taken after the slot was created.
+    /// The first epoch: every table copied under one snapshot, and what the reader puts over it.
     fn snapshot_epoch(&mut self) -> Result<Outcome> {
         let started = Instant::now();
-        let slot = crate::pgsource::rows(self.conn, &self.alias, &format!("SELECT wal_status FROM pg_replication_slots WHERE slot_name = {}", self.slot_lit()))?;
-        match slot.first().map(|r| r[0].as_deref()) {
-            Some(Some("lost")) => {
-                warn!(job = %self.job, slot = %self.opts.slot, "slot was invalidated; creating it again for the snapshot");
-                crate::pgsource::execute(self.conn, &self.alias, &format!("SELECT pg_drop_replication_slot({})", self.slot_lit()))?;
-                crate::pgsource::create_slot(self.conn, &self.alias, &self.opts.slot)?;
-            }
-            Some(_) => {}
-            None => crate::pgsource::create_slot(self.conn, &self.alias, &self.opts.slot)?,
-        }
-        // One DuckDB transaction is one PostgreSQL REPEATABLE READ transaction: every postgres_query in it reads
-        // the same snapshot. The rows land in memory first, so the lake transaction stays short.
-        self.conn.execute_batch("BEGIN")?;
-        let copied = (|| -> Result<(String, u64)> {
-            let r = crate::pgsource::row(
-                self.conn,
-                &self.alias,
-                &format!("SELECT pg_current_snapshot()::text, confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = {}", self.slot_lit()),
-            )?;
-            let snap = r[0].clone().context("snapshot")?;
-            let lsn = parse_lsn(r[1].as_deref().context("the slot has no confirmed position")?)?;
-            for (i, t) in self.opts.tables.iter().enumerate() {
-                let cols: Vec<String> = t.columns.iter().map(|c| format!("{} AS {}", crate::pgsource::cast_sql(c, &ident(&c.name)), ident(&c.name))).collect();
-                self.conn
-                    .execute(
-                        &format!(
-                            "CREATE OR REPLACE TABLE {} AS SELECT {} FROM postgres_query({}, {})",
-                            self.staging("snap", i),
-                            cols.join(", "),
-                            lit(self.alias.trim_matches('"')),
-                            lit(&crate::pgsource::copy_sql(t))
-                        ),
-                        [],
-                    )
-                    .map_err(|e| cast_error(e, t))?;
-            }
-            Ok((snap, lsn))
-        })();
-        let (snap, lsn) = match copied {
-            Ok(c) => {
-                self.conn.execute_batch("COMMIT")?;
-                c
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-        };
-        let state = serde_json::json!({ "snapshot": snap });
-        let rows = self.commit(lsn, &state, 0, 0, None, |me| {
+        let tables = self.tables.clone();
+        let mut batch = Batch::new(&tables);
+        let job = self.job.clone();
+        let snap = move |i: usize| staging_table(&job, "snap", i);
+        let (pos, changes) = self.reader.snapshot(self.conn, &snap, &mut batch)?;
+        let (staged, _) = self.stage(&batch)?;
+        let rows = self.commit(&pos, changes, 0, None, |me| {
             let mut n = 0;
-            for (i, t) in me.opts.tables.iter().enumerate() {
+            for (i, t) in me.tables.iter().enumerate() {
                 let m = quote_table(&t.mirror)?;
                 me.conn.execute(&format!("DELETE FROM {m}"), [])?;
                 n += me.conn.execute(&format!("INSERT INTO {m} SELECT * FROM {}", me.staging("snap", i)), [])? as i64;
             }
-            Ok(n)
+            // Changes the reader read past the snapshot, over it.
+            Ok(n + me.write(&batch, &staged)?)
         })?;
-        for i in 0..self.opts.tables.len() {
-            let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", self.staging("snap", i)));
-        }
-        self.lsn = Some(lsn);
-        self.snapshot = Some(snap);
-        info!(job = %self.job, rows, lsn = %format_lsn(lsn), secs = started.elapsed().as_secs_f64(), "snapshot committed");
+        self.drop_staging(&staged, true);
+        self.reader.committed(self.conn, &pos);
+        info!(job = %self.job, rows, changes, at = %self.reader.describe(&pos), secs = started.elapsed().as_secs_f64(), "snapshot committed");
+        self.pos = Some(pos);
         Ok(Outcome::Committed)
     }
 
     fn epoch(&mut self) -> Result<Outcome> {
-        let Some(lsn) = self.lsn else { return self.snapshot_epoch() };
+        let Some(pos) = self.pos.clone() else { return self.snapshot_epoch() };
         let started = Instant::now();
-        // Before the read: the flush position (everything before it the read below decodes), and with a
-        // snapshot, the oldest transaction still running.
-        let r = crate::pgsource::row(
-            self.conn,
-            &self.alias,
-            &format!(
-                "SELECT pg_current_wal_flush_lsn()::text, pg_current_wal_insert_lsn()::text,
-                        pg_snapshot_xmin(pg_current_snapshot())::text, s.confirmed_flush_lsn::text, s.wal_status
-                 FROM (SELECT 1) x LEFT JOIN pg_replication_slots s ON s.slot_name = {}",
-                self.slot_lit()
-            ),
-        )?;
-        let flush = parse_lsn(r[0].as_deref().context("flush lsn")?)?;
-        let insert = parse_lsn(r[1].as_deref().context("insert lsn")?)?;
-        let xmin_now: u64 = r[2].as_deref().context("xmin")?.parse()?;
-        let reset = format!("reset it to take a new snapshot: duckwake reset {} --to-epoch 0", self.job);
-        let Some(confirmed) = r[3].as_deref() else {
-            return Err(stop(format!("replication slot {} is gone, so the changes since the last epoch are lost; {reset}", self.opts.slot)));
-        };
-        if r[4].as_deref() == Some("lost") {
-            return Err(stop(format!(
-                "replication slot {} was invalidated (max_slot_wal_keep_size), so the changes since the last epoch are lost; {reset}",
-                self.opts.slot
-            )));
-        }
-        let confirmed = parse_lsn(confirmed)?;
-        if confirmed > lsn {
-            return Err(stop(format!(
-                "replication slot {} has confirmed {}, past the lake's position {}: something else advanced it, and those changes are lost; {reset}",
-                self.opts.slot,
-                format_lsn(confirmed),
-                format_lsn(lsn)
-            )));
-        }
-
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT data FROM postgres_query({}, {})",
-            lit(self.alias.trim_matches('"')),
-            lit(&format!(
-                "SELECT data FROM pg_logical_slot_peek_binary_changes({}, NULL, {}, 'proto_version', '1', 'publication_names', {})",
-                self.slot_lit(),
-                self.opts.max_changes,
-                lit(&self.opts.publication)
-            ))
-        ))?;
-        let messages = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?.collect::<duckdb::Result<Vec<_>>>()?;
-        let full = messages.len() >= self.opts.max_changes;
-        let tables = self.opts.tables.clone();
+        let tables = self.tables.clone();
         let mut batch = Batch::new(&tables);
-        let snapshot = self.snapshot.as_deref().map(Snapshot::parse).transpose()?;
-        let (mut pos, mut txns, mut skipped, mut rows_in, mut newest_us) = (lsn, 0u64, 0u64, 0i64, None);
-        // The transaction being read: whether it applies, and its changes.
-        let mut txn: Option<(bool, i64, Vec<Change>)> = None;
-        for data in &messages {
-            match pgoutput::decode(data)? {
-                Message::Begin { final_lsn, commit_us, xid } => {
-                    // Applied before a crash (its commit is before the position), or already in the copy.
-                    let applies = final_lsn >= lsn && !snapshot.as_ref().is_some_and(|s| s.sees(xid));
-                    txn = Some((applies, commit_us, Vec::new()));
-                }
-                Message::Commit { end_lsn, .. } => {
-                    let (applies, commit_us, changes) = txn.take().context("a Commit without its Begin")?;
-                    txns += 1;
-                    if applies {
-                        for c in changes {
-                            batch.apply(c)?;
-                        }
-                        newest_us = Some(commit_us);
-                    } else {
-                        skipped += 1;
-                    }
-                    pos = pos.max(end_lsn);
-                }
-                Message::Relation { id, schema, name, columns, .. } => {
-                    let table = tables.iter().position(|t| t.schema == schema && t.name == name);
-                    if let Some(i) = table {
-                        check_columns(&tables[i], &columns)?;
-                    }
-                    self.relations.insert(id, table);
-                }
-                Message::Insert { rel, new } => {
-                    if let Some(t) = self.table(rel, &mut txn)? {
-                        rows_in += 1;
-                        txn.as_mut().unwrap().2.push(Change::Upsert { table: t, old_key: None, values: new });
-                    }
-                }
-                Message::Update { rel, old, new } => {
-                    if let Some(t) = self.table(rel, &mut txn)? {
-                        rows_in += 1;
-                        let old_key = old.map(|o| batch.key(t, &o)).transpose()?;
-                        txn.as_mut().unwrap().2.push(Change::Upsert { table: t, old_key, values: new });
-                    }
-                }
-                Message::Delete { rel, old } => {
-                    if let Some(t) = self.table(rel, &mut txn)? {
-                        rows_in += 1;
-                        let key = batch.key(t, &old)?;
-                        txn.as_mut().unwrap().2.push(Change::Delete { table: t, key });
-                    }
-                }
-                Message::Truncate { rels } => {
-                    let mut ts = Vec::new();
-                    for rel in rels {
-                        if let Some(t) = self.table(rel, &mut txn)? {
-                            ts.push(t);
-                        }
-                    }
-                    if let Some(x) = txn.as_mut() {
-                        x.2.push(Change::Truncate { tables: ts });
-                    }
-                }
-                Message::Other(_) => {}
-            }
-        }
-        // Nothing before the flush position was left out: the slot can move there.
-        if !full {
-            pos = pos.max(flush);
-        }
-        // The snapshot is needed until every transaction that was running when it was taken has ended and been
-        // read: once the oldest running one is newer than its xmax, every one ends before `insert`.
-        let mut clear_after = self.clear_after;
-        if let Some(s) = &snapshot {
-            if clear_after.is_none() && xmin_now >= s.xmax {
-                clear_after = Some(insert);
-            }
-        }
-        let forget = clear_after.is_some_and(|c| pos >= c);
-        let state = match (forget, &self.snapshot) {
-            (false, Some(snap)) => serde_json::json!({ "snapshot": snap, "clear_after": clear_after.map(format_lsn) }),
-            _ => serde_json::json!({}),
-        };
+        let read = self.reader.read(self.conn, &pos, &mut batch)?;
         if batch.is_empty() {
-            let refresh = txns > 0 || self.last_commit.elapsed() >= self.s.position_refresh || pos.saturating_sub(lsn) >= POSITION_BYTES;
-            if pos <= lsn || !refresh {
+            let refresh = read.txns > 0 || read.due || self.last_commit.elapsed() >= self.s.position_refresh;
+            if read.pos == pos || !refresh {
                 return Ok(Outcome::Idle);
             }
         }
         let (staged, filled) = self.stage(&batch)?;
-        let lag = flush.saturating_sub(pos) as i64;
-        let rows_out = self.commit(pos, &state, rows_in, lag, newest_us, |me| me.write(&batch, &staged))?;
+        let rows_out = self.commit(&read.pos, read.changes, read.lag, read.newest_us, |me| me.write(&batch, &staged))?;
         crate::engine::crash_point("ingest_after_commit");
-        self.lsn = Some(pos);
-        if forget {
-            info!(job = %self.job, "every transaction the snapshot saw has been read; forgetting it");
-            self.snapshot = None;
-            clear_after = None;
-        }
-        self.clear_after = clear_after;
-        self.advance(pos);
-        for (i, _) in staged.iter().enumerate().filter(|(_, s)| **s) {
-            let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}", self.staging("chg", i), self.staging("row", i)));
-        }
+        self.reader.committed(self.conn, &read.pos);
+        self.drop_staging(&staged, false);
         if let Some(m) = &self.s.metrics {
             m.record_job(
                 &self.job,
                 crate::metrics::EpochStats {
                     epoch: self.epoch,
-                    lag,
+                    lag: read.lag,
                     watermark_us: None,
-                    max_event_time_us: newest_us,
-                    rows_in: rows_in as u64,
+                    max_event_time_us: read.newest_us,
+                    rows_in: read.changes as u64,
                     rows_out: rows_out as u64,
                     rows_late: 0,
                     rows_dead: 0,
                     stage_ms: started.elapsed().as_millis(),
-                    commit_freshness_s: newest_us.map(|u| (chrono::Utc::now().timestamp_micros() - u) as f64 / 1e6),
+                    commit_freshness_s: read.newest_us.map(|u| (chrono::Utc::now().timestamp_micros() - u) as f64 / 1e6),
                 },
             );
         }
         info!(
             job = %self.job,
             epoch = self.epoch,
-            transactions = txns,
-            skipped,
-            changes = rows_in,
+            transactions = read.txns,
+            skipped = read.skipped,
+            changes = read.changes,
             rows_out,
             filled_from_mirror = filled,
-            lsn = %format_lsn(pos),
+            at = %self.reader.describe(&read.pos),
             "ingest epoch committed"
         );
+        let full = read.full;
+        self.pos = Some(read.pos);
         Ok(if full { Outcome::Full } else { Outcome::Committed })
     }
 
-    /// The source table a change belongs to; None for a table the source does not mirror.
-    fn table(&self, rel: u32, txn: &mut Option<(bool, i64, Vec<Change>)>) -> Result<Option<usize>> {
-        let r = self.relations.get(&rel).context("a change for a relation the slot did not describe")?;
-        let Some((applies, _, _)) = txn.as_ref() else { bail!("a change outside a transaction") };
-        Ok(r.filter(|_| *applies))
+    fn drop_staging(&self, staged: &[bool], snapshot: bool) {
+        for (i, s) in staged.iter().enumerate() {
+            let mut names = Vec::new();
+            if *s {
+                names.extend([self.staging("chg", i), self.staging("row", i)]);
+            }
+            if snapshot {
+                names.push(self.staging("snap", i));
+            }
+            for n in names {
+                let _ = self.conn.execute_batch(&format!("DROP TABLE IF EXISTS {n}"));
+            }
+        }
     }
 
     /// Stages each changed table's rows in memory, its new rows already cast and their unchanged values filled
@@ -595,7 +488,7 @@ impl<'c> Ingest<'c> {
     fn stage(&self, batch: &Batch) -> Result<(Vec<bool>, usize)> {
         let mut out = Vec::new();
         let filled = batch.changes.iter().flat_map(|c| c.keys.values()).filter(|f| matches!(f, Final::Row { fill: Some(_), .. })).count();
-        for (i, (t, tc)) in self.opts.tables.iter().zip(&batch.changes).enumerate() {
+        for (i, (t, tc)) in self.tables.iter().zip(&batch.changes).enumerate() {
             if tc.keys.is_empty() {
                 out.push(false);
                 continue;
@@ -642,7 +535,7 @@ impl<'c> Ingest<'c> {
             let key_match = |a: &str, col: &str| -> String {
                 kp.iter()
                     .enumerate()
-                    .map(|(k, &p)| format!("m.{} = {}", ident(&t.columns[p].name), crate::pgsource::cast_sql(&t.columns[p], &format!("{a}.{col}{k}"))))
+                    .map(|(k, &p)| format!("m.{} = {}", ident(&t.columns[p].name), cast_sql(&t.columns[p], &format!("{a}.{col}{k}"))))
                     .collect::<Vec<_>>()
                     .join(" AND ")
             };
@@ -653,7 +546,7 @@ impl<'c> Ingest<'c> {
                 .map(|(c, col)| {
                     format!(
                         "CASE WHEN contains(s._unch, ',{c},') THEN m.{q} ELSE {} END AS {q}",
-                        crate::pgsource::cast_sql(col, &format!("s.c{c}")),
+                        cast_sql(col, &format!("s.c{c}")),
                         q = ident(&col.name)
                     )
                 })
@@ -688,7 +581,7 @@ impl<'c> Ingest<'c> {
     /// The mirror writes of an epoch, inside its lake transaction. Returns the rows written.
     fn write(&self, batch: &Batch, staged: &[bool]) -> Result<i64> {
         let mut n = 0;
-        for (i, (t, tc)) in self.opts.tables.iter().zip(&batch.changes).enumerate() {
+        for (i, (t, tc)) in self.tables.iter().zip(&batch.changes).enumerate() {
             let m = quote_table(&t.mirror)?;
             if tc.truncated {
                 n += self.conn.execute(&format!("DELETE FROM {m}"), [])? as i64;
@@ -700,7 +593,7 @@ impl<'c> Ingest<'c> {
             let on: Vec<String> = kp
                 .iter()
                 .enumerate()
-                .map(|(k, &p)| format!("m.{} = {}", ident(&t.columns[p].name), crate::pgsource::cast_sql(&t.columns[p], &format!("c.k{k}"))))
+                .map(|(k, &p)| format!("m.{} = {}", ident(&t.columns[p].name), cast_sql(&t.columns[p], &format!("c.k{k}"))))
                 .collect();
             if !tc.truncated {
                 n += self.conn.execute(&format!("DELETE FROM {m} m WHERE EXISTS (SELECT 1 FROM {} c WHERE {})", self.staging("chg", i), on.join(" AND ")), [])? as i64;
@@ -712,15 +605,7 @@ impl<'c> Ingest<'c> {
     }
 
     /// One lake transaction: fencing, the writes, the checkpoint. Returns what `writes` returned.
-    fn commit(
-        &mut self,
-        pos: u64,
-        state: &serde_json::Value,
-        rows_in: i64,
-        lag: i64,
-        newest_us: Option<i64>,
-        writes: impl FnOnce(&Self) -> Result<i64>,
-    ) -> Result<i64> {
+    fn commit(&mut self, pos: &Position, rows_in: i64, lag: i64, newest_us: Option<i64>, writes: impl FnOnce(&Self) -> Result<i64>) -> Result<i64> {
         let epoch = self.epoch + 1;
         let c = self.conn;
         c.execute_batch("BEGIN")?;
@@ -741,15 +626,25 @@ impl<'c> Ingest<'c> {
                 return Err(anyhow::Error::new(Fenced));
             }
             let written = writes(self)?;
-            let offsets = serde_json::json!({ &self.job: { "0": pos } });
+            let offsets = serde_json::json!({ &self.job: { "0": pos.offset } });
             let ts = newest_us.map(|u| format!("make_timestamp({u})")).unwrap_or("NULL".into());
             c.execute(
                 &format!(
                     "INSERT INTO {CTL}.checkpoints (job_id, epoch, source_offsets, watermark, state_backend, state_ref,
                        rows_in, rows_out, rows_late, rows_dead, max_event_time, lag, worker, committed_at, rows_sql)
-                     VALUES (?, ?, ?, NULL, 'pgoutput', ?, ?, ?, 0, 0, {ts}, ?, ?, now(), 0)"
+                     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 0, 0, {ts}, ?, ?, now(), 0)"
                 ),
-                duckdb::params![self.job, epoch, offsets.to_string(), state.to_string(), if rows_in > 0 { rows_in } else { written }, written, lag, self.s.worker],
+                duckdb::params![
+                    self.job,
+                    epoch,
+                    offsets.to_string(),
+                    self.reader.backend(),
+                    pos.state.to_string(),
+                    if rows_in > 0 { rows_in } else { written },
+                    written,
+                    lag,
+                    self.s.worker
+                ],
             )?;
             crate::engine::crash_point("ingest_before_commit");
             Ok(written)
@@ -777,36 +672,15 @@ impl<'c> Ingest<'c> {
             }
         }
     }
-
-    /// Lets the slot release what the lake now holds. A failure only delays it: the next epoch skips what
-    /// the slot sends again, and advances it then.
-    fn advance(&self, pos: u64) {
-        let sql = format!("SELECT end_lsn::text FROM pg_replication_slot_advance({}, {})", self.slot_lit(), lit(&format_lsn(pos)));
-        if let Err(e) = crate::pgsource::row(self.conn, &self.alias, &sql) {
-            warn!(job = %self.job, error = %format!("{e:#}"), "advancing the slot failed; the next epoch retries");
-        }
-    }
 }
 
-/// The columns a `Relation` message describes must be the ones the mirror was created with.
-fn check_columns(t: &PgTable, cols: &[pgoutput::Column]) -> Result<()> {
-    let same = cols.len() == t.columns.len() && cols.iter().zip(&t.columns).all(|(a, b)| a.name == b.name && a.type_oid == b.oid);
-    if !same {
-        let now: Vec<String> = cols.iter().map(|c| format!("{} (type {})", c.name, c.type_oid)).collect();
-        let was: Vec<String> = t.columns.iter().map(|c| format!("{} {}", c.name, c.pg_type)).collect();
-        return Err(stop(format!(
-            "the columns of {} changed in PostgreSQL: now {}, the mirror has {}. Schema changes are not applied yet: \
-             drop the source and create it again",
-            t.source_name(),
-            now.join(", "),
-            was.join(", ")
-        )));
-    }
-    Ok(())
+/// A memory table an ingest job of `job` stages in.
+pub(crate) fn staging_table(job: &str, what: &str, i: usize) -> String {
+    format!("memory.main.{}", ident(&format!("ingest_{job}_{what}{i}")))
 }
 
 /// A value that does not fit its mirror column stops the job, naming the table: the type mapping needs a look.
-fn cast_error(e: duckdb::Error, t: &PgTable) -> anyhow::Error {
+pub(crate) fn cast_error(e: duckdb::Error, t: &MirrorTable) -> anyhow::Error {
     let m = e.to_string();
     if m.contains("Conversion Error") || m.contains("Could not convert") {
         return stop(format!("a value of {} does not fit its mirror column: {m}", t.source_name()));
@@ -817,11 +691,11 @@ fn cast_error(e: duckdb::Error, t: &PgTable) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pgsource::PgColumn;
+    use crate::mirror::MirrorColumn;
 
-    fn table() -> Vec<PgTable> {
-        let col = |n: &str| PgColumn { name: n.into(), pg_type: "text".into(), oid: 25, typmod: -1, duck_type: "VARCHAR".into() };
-        vec![PgTable { schema: "public".into(), name: "t".into(), mirror: "lake.s.t".into(), columns: vec![col("id"), col("a"), col("big")], key: vec!["id".into()] }]
+    fn table() -> Vec<MirrorTable> {
+        let col = |n: &str| MirrorColumn { name: n.into(), source_type: "text".into(), oid: 25, typmod: -1, duck_type: "VARCHAR".into() };
+        vec![MirrorTable { schema: "public".into(), name: "t".into(), mirror: "lake.s.t".into(), columns: vec![col("id"), col("a"), col("big")], key: vec!["id".into()] }]
     }
 
     fn t(s: &str) -> Value {

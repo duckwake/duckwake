@@ -140,8 +140,9 @@ default.
 - Database sources without Kafka ([database CDC sources](design/database-cdc-sources.md)). Built 2026-11-21:
   PostgreSQL sources (D1, [#44](https://github.com/duckwake/duckwake/issues/44)): `create_source(name, 'postgres',
   ...)` mirrors tables into the lake from a logical replication slot, exactly once, with the snapshot, TOAST
-  values, key changes and truncates (`scripts/pg_ingest_test.sh`). Next: MySQL (D3,
-  [#45](https://github.com/duckwake/duckwake/issues/45)), then large tables, added tables and schema changes (D4).
+  values, key changes and truncates (`scripts/pg_ingest_test.sh`). Built 2026-11-22: MySQL sources (D3,
+  [#45](https://github.com/duckwake/duckwake/issues/45)): the binlog by GTID, a lock-free consistent snapshot
+  (`scripts/mysql_ingest_test.sh`). Next: large tables, added tables and schema changes (D4).
 - Avro and Protobuf with a schema registry; Kafka headers
 - Splitting one topic's partitions across workers
 - A Windows build

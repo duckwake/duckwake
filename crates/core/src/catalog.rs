@@ -270,8 +270,12 @@ fn jobs_reading(conn: &Connection, source: &str) -> Result<Vec<(String, JobDef)>
 }
 
 pub fn load_sources(conn: &Connection) -> Result<HashMap<String, SourceDef>> {
-    // PostgreSQL sources are not read in FROM: their mirror tables are (`pgsource`).
-    let mut stmt = conn.prepare(&format!("SELECT name, kind, options::VARCHAR FROM {CTL}.sources WHERE kind <> {}", lit(crate::pgsource::KIND)))?;
+    // Database sources are not read in FROM: their mirror tables are (`mirror`).
+    let mut stmt = conn.prepare(&format!(
+        "SELECT name, kind, options::VARCHAR FROM {CTL}.sources WHERE kind NOT IN ({}, {})",
+        lit(crate::pgsource::KIND),
+        lit(crate::mysqlsource::KIND)
+    ))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
     let mut out = HashMap::new();
     for row in rows {
@@ -874,7 +878,7 @@ pub fn load_job(conn: &Connection, job: &str) -> Result<(JobDef, JobStatus)> {
         })
         .map_err(|_| anyhow!("no such view {job:?}"))?;
     let def = view_def(&def)?.ok_or_else(|| {
-        anyhow!("{job} is the ingest job of PostgreSQL source {job}, not a view: start, stop, pause and reset it, or drop-source it")
+        anyhow!("{job} is the ingest job of database source {job}, not a view: start, stop, pause and reset it, or drop-source it")
     })?;
     Ok((def, JobStatus::parse(&status)?))
 }
@@ -907,27 +911,43 @@ pub fn source_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
 }
 
 pub fn load_postgres_source(conn: &Connection, name: &str) -> Result<crate::pgsource::PgOptions> {
-    let opts = crate::lake::query_opt_string(
-        conn,
-        &format!("SELECT (SELECT options::VARCHAR FROM {CTL}.sources WHERE name = {} AND kind = {} LIMIT 1)", lit(name), lit(crate::pgsource::KIND)),
-    )?
-    .ok_or_else(|| anyhow!("no postgres source {name:?}"))?;
-    Ok(serde_json::from_str(&opts)?)
+    Ok(serde_json::from_str(&load_source_options(conn, name, crate::pgsource::KIND)?)?)
 }
 
-/// Registers a PostgreSQL source in one transaction: its mirror tables, the source and its ingest job, created
+/// The stored options of source `name` of `kind`, as JSON text.
+pub fn load_source_options(conn: &Connection, name: &str, kind: &str) -> Result<String> {
+    crate::lake::query_opt_string(
+        conn,
+        &format!("SELECT (SELECT options::VARCHAR FROM {CTL}.sources WHERE name = {} AND kind = {} LIMIT 1)", lit(name), lit(kind)),
+    )?
+    .ok_or_else(|| anyhow!("no {kind} source {name:?}"))
+}
+
+/// The mirror tables of a database source (PostgreSQL or MySQL), from whichever it is.
+pub fn mirror_tables(conn: &Connection, name: &str) -> Result<Vec<crate::mirror::MirrorTable>> {
+    Ok(crate::ingest::Spec::load(conn, name)?.tables().to_vec())
+}
+
+/// Registers a database source (PostgreSQL or MySQL) in one transaction: its mirror tables, the source and its ingest job, created
 /// stopped like a view.
-pub fn create_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions) -> Result<()> {
+pub fn create_ingest_source(
+    conn: &Connection,
+    name: &str,
+    kind: &str,
+    options: &serde_json::Value,
+    schema: &str,
+    tables: &[crate::mirror::MirrorTable],
+) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     let res = (|| -> Result<()> {
-        conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(&opts.schema)))?;
-        for t in &opts.tables {
+        conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {LAKE}.{}", ident(schema)))?;
+        for t in tables {
             let cols: Vec<String> = t.columns.iter().map(|c| format!("{} {}", ident(&c.name), c.duck_type)).collect();
             conn.execute_batch(&format!("CREATE TABLE {} ({})", quote_table(&t.mirror)?, cols.join(", ")))?;
         }
         conn.execute(
             &format!("INSERT INTO {CTL}.sources VALUES (?, ?, ?, now())"),
-            [name, crate::pgsource::KIND, &serde_json::to_string(opts)?],
+            [name, kind, &options.to_string()],
         )?;
         conn.execute_batch(&format!(
             "CREATE TABLE {lt} (owner_worker VARCHAR, lease_epoch BIGINT, last_epoch BIGINT);
@@ -946,8 +966,8 @@ pub fn create_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsou
     finish(conn, res)
 }
 
-/// Removes a PostgreSQL source, its ingest job and its mirror tables in one transaction.
-pub fn drop_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions) -> Result<()> {
+/// Removes a database source, its ingest job and its mirror tables in one transaction.
+pub fn drop_ingest_source(conn: &Connection, name: &str, tables: &[crate::mirror::MirrorTable]) -> Result<()> {
     retry_conflicts(|| {
         conn.execute_batch("BEGIN")?;
         let res = (|| -> Result<()> {
@@ -956,7 +976,7 @@ pub fn drop_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsourc
             }
             conn.execute(&format!("DELETE FROM {CTL}.sources WHERE name = ?"), [name])?;
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", lease_table(name)))?;
-            for t in &opts.tables {
+            for t in tables {
                 conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_table(&t.mirror)?))?;
             }
             Ok(())
@@ -965,21 +985,21 @@ pub fn drop_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsourc
     })
 }
 
-/// Starts a stopped PostgreSQL source over: its checkpoints and its mirror tables' rows go, in one transaction,
+/// Starts a stopped database source over: its checkpoints and its mirror tables' rows go, in one transaction,
 /// and its next start takes a new snapshot. The views that read the mirrors take the deletes and then the new
 /// rows through the change feed.
-pub fn reset_postgres_source(conn: &Connection, name: &str, opts: &crate::pgsource::PgOptions, to_epoch: i64) -> Result<()> {
+pub fn reset_ingest_source(conn: &Connection, name: &str, tables: &[crate::mirror::MirrorTable], to_epoch: i64) -> Result<()> {
     if job_status(conn, name)? == Some(JobStatus::Running) {
         bail!("pause or stop {name:?} before reset");
     }
     if to_epoch != 0 {
-        bail!("a postgres source resets to epoch 0 only: its mirror tables start over from a new snapshot");
+        bail!("a database source resets to epoch 0 only: its mirror tables start over from a new snapshot");
     }
     retry_conflicts(|| {
         conn.execute_batch("BEGIN")?;
         let res = (|| -> Result<()> {
             conn.execute(&format!("DELETE FROM {CTL}.checkpoints WHERE job_id = ?"), [name])?;
-            for t in &opts.tables {
+            for t in tables {
                 conn.execute_batch(&format!("DELETE FROM {}", quote_table(&t.mirror)?))?;
             }
             Ok(())
@@ -1497,8 +1517,8 @@ fn drop_view_once(conn: &Connection, job: &str, def: &JobDef, keep_table: bool) 
 
 /// Removes a source no view reads from. A PostgreSQL source goes through `pgsource::drop` (`api::drop_source`).
 pub fn drop_source(conn: &Connection, name: &str) -> Result<()> {
-    if source_kind(conn, name)?.as_deref() == Some(crate::pgsource::KIND) {
-        bail!("{name:?} is a postgres source: drop it with drop-source (duckwake_drop_source), which also drops its slot");
+    if let Some(k) = source_kind(conn, name)?.filter(|k| k == crate::pgsource::KIND || k == crate::mysqlsource::KIND) {
+        bail!("{name:?} is a {k} source: drop it with drop-source (duckwake_drop_source), which also drops its mirror tables");
     }
     let mut stmt = conn.prepare(&format!("SELECT job_id, definition::VARCHAR FROM {CTL}.jobs"))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
