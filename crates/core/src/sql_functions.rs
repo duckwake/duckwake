@@ -105,6 +105,7 @@ pub fn register(conn: &Connection, api: &Api) -> Result<()> {
     action::<Stop>(conn, api)?;
     action::<Reset>(conn, api)?;
     action::<DropView>(conn, api)?;
+    action::<DropSource>(conn, api)?;
     action::<Verify>(conn, api)?;
     action::<Wait>(conn, api)?;
     query::<Explain>(conn, api)?;
@@ -445,6 +446,18 @@ impl Spec for Stop {
     }
 }
 
+/// `duckwake_drop_source(name)`: a PostgreSQL source goes with its ingest job, mirror tables and slot.
+struct DropSource;
+impl Spec for DropSource {
+    const NAME: &'static str = "duckwake_drop_source";
+    fn params() -> Vec<LogicalTypeId> {
+        vec![Varchar]
+    }
+    fn run(api: &Api, a: &Args) -> Result<Out> {
+        one(a.arg(0), api.with(|c| api::drop_source(c, a.arg(0)))?)
+    }
+}
+
 /// `duckwake_reset(view, to_epoch)`.
 struct Reset;
 impl Spec for Reset {
@@ -482,10 +495,11 @@ impl Spec for Verify {
         vec![Varchar]
     }
     fn run(api: &Api, a: &Args) -> Result<Out> {
-        let r = api.with(|c| {
-            let job = crate::catalog::resolve_view(c, a.arg(0))?;
-            crate::verify::verify(c, &api.rt, &job)
-        })?;
+        let job = api.with(|c| crate::catalog::resolve_view(c, a.arg(0)))?;
+        if let Some((_, msg)) = api.with(|c| api::verify_ingest(c, &job))? {
+            return one(&job, msg);
+        }
+        let r = api.with(|c| crate::verify::verify(c, &api.rt, &job))?;
         let msg = if r.ok() {
             format!("VERIFY OK: output matches batch recomputation over {} (epoch {})", r.inputs(), r.epoch)
         } else {

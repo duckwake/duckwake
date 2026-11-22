@@ -79,11 +79,51 @@ The snapshot and the stream meet at one exact position, and the snapshot is read
 
 The mirror path needs two things from other plans first: operators that handle −1 ([CDC sources](cdc-sources.md), C1) and lake tables as sources (spike S6).
 
-1. **D1. PostgreSQL ingest job.** Slot and publication handling, the six rules above, snapshot under an exported snapshot, mirror tables with versions and tombstones, and a test database with `wal_level = logical` in docker compose. Gate: while a generator inserts, updates (including key changes and large TOAST values) and deletes rows and the worker is killed repeatedly, the mirror tables equal the source tables exactly once writes stop and the job drains; the slot never runs ahead of the lake.
+1. **D1. PostgreSQL ingest job.** Slot and publication handling, the six rules above, snapshot under an exported snapshot, mirror tables with versions and tombstones, and a test database with `wal_level = logical` in docker compose. Gate: while a generator inserts, updates (including key changes and large TOAST values) and deletes rows and the worker is killed repeatedly, the mirror tables equal the source tables exactly once writes stop and the job drains; the slot never runs ahead of the lake. **Built 2026-11-21** (branch `d1-postgres-ingest`), as described in [D1 as built](#d1-as-built); gate `scripts/pg_ingest_test.sh`, in order and pipelined.
 2. **D2. Views over mirror tables.** Lake tables as sources through DuckLake's change feed, with snapshot ids as positions and maintenance that keeps what the slowest view needs. Gate: every view kind over a mirror table matches the batch query over the mirror after every epoch, in the crash suite.
 3. **D3. MySQL ingest job.** Binlog by GTID, the consistent snapshot, DDL tracking. Gate: D1's gate against MySQL.
 4. **D4. Large tables and operations.** DBLog-style chunked backfill, adding tables to a running source, schema changes, lag and WAL metrics, secrets. Gate: a 100M-row table snapshots while streaming continues, and a forced restart mid-backfill resumes without a full restart.
 5. **D5 (optional).** MongoDB change streams with resume tokens, if asked for.
+
+## D1 as built
+
+Built 2026-11-21 (`crates/core/src/pgoutput.rs`, `pgsource.rs`, `ingest.rs`). It keeps the six rules and the
+architecture above, and departs from the plan in how it talks to PostgreSQL:
+
+- **SQL logical decoding, not the replication protocol.** The job reads the slot with
+  `pg_logical_slot_peek_binary_changes(slot, NULL, max_changes, 'proto_version', '1', 'publication_names', ...)`
+  through DuckDB's postgres extension (`postgres_query`), which DuckWake already loads for its catalog: no forked
+  driver, no new dependency. Peeking consumes nothing; `pg_replication_slot_advance` after the lake commit takes
+  the place of the standby status update, and with no long-lived replication connection there is no keepalive
+  to answer (rule 3's timer). The slot returns whole transactions (its limit is checked only after a commit), so
+  rule 1 holds. The cost: each peek decodes again from the slot's restart point, which in steady state is about
+  one epoch of WAL, and more while a long transaction runs on the server.
+- **The snapshot without `EXPORT_SNAPSHOT`,** which only a replication connection has. The slot is created first
+  (at `create_source`); the first epoch then opens one REPEATABLE READ transaction (a DuckDB transaction is one
+  PostgreSQL transaction), records `pg_current_snapshot()` and the slot's confirmed position, and copies every
+  table in it. That position is where streaming starts, and a transaction the slot sends that the snapshot
+  already saw (by transaction id) is skipped. The snapshot is kept, in the checkpoint's `state_ref`, until every
+  transaction running when it was taken has ended and been read, then forgotten. The copy goes through memory in
+  one session: parallel, chunked copies are D4.
+- **No version column.** Rule 5's versions keep redelivery from applying twice; here the position does that
+  (rule 4), and an epoch applies each key's changes in commit order and writes its last state, so a mirror
+  table has exactly the source's columns.
+- **One text path.** The copy reads each column through its output function (`format('%s', col)`, so a
+  `char(n)` keeps its padding, as `pgoutput` sends it), and the stream sends text: both go through the same cast
+  to the mirror column's type, fixed at `create_source`. `interval` and `timetz` stay text, since Parquet refuses
+  negative intervals and drops a time's offset. A value the cast refuses stops the job, naming the table and the
+  value, instead of a dead letter: a mirror missing a row would be wrong without a sign.
+- **Schema changes stop the job.** Applying an added column moves to D4 with the other schema changes.
+- **Verify.** `verify` on the ingest job compares every mirror with its table read now under one snapshot,
+  through the same text path; exact once writes stop.
+- **Not built yet:** lag in seconds and the slot's `wal_status`/`safe_wal_size` as metrics (lag in bytes is in
+  the checkpoints and `duckwake_lag_events`), secrets beyond `env:`/`file:` references, partitioned tables.
+
+The gate (`scripts/pg_ingest_test.sh`, CI jobs `pg ingest` and `pg ingest pipelined`) runs a PL/pgSQL workload of
+72,192 statements in 40 s over three tables while the worker is killed 8 times; the slot is never ahead of the
+lake after a crash, the mirrors equal the tables once the job catches up, one snapshot serves every restart,
+and a view over a mirror verifies. It also covers a slot advanced past the lake, `reset`, a changed table and
+`drop-source`. With the TOAST fill planted to write NULL, it fails.
 
 ## Risks and open questions
 

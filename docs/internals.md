@@ -14,6 +14,7 @@
 | Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
+| PostgreSQL sources: decoding, definition, ingest job | `pgoutput.rs` (pgoutput messages, LSNs, `pg_snapshot` visibility), `pgsource.rs` (options, checks, publication and slot, type mapping, `verify`), `ingest.rs` (the job; see below) |
 
 The epoch transaction (`engine.rs::commit`), one per worker per epoch, covers all of its jobs:
 
@@ -27,6 +28,24 @@ DELETE FROM lake.__duckwake.state_clicks_per_min WHERE __we <= <watermark>;
 INSERT INTO lake.analytics.clicks_late ...; INSERT INTO lake.__duckwake.dead_letter ...;
 INSERT INTO lake.__duckwake.checkpoints VALUES ('clicks_per_min', 42, '{"clicks":{"0":1832,...}}', <watermark>, ...);
 COMMIT;
+```
+
+A PostgreSQL source's ingest job (`ingest.rs`) runs on a thread of its own with its own connection, so a long
+snapshot never holds up the views' epochs; the worker starts and stops it like a view (lease, claims, failover,
+handoffs) and marks it failed when it reports a broken rule. Its epoch, with no transaction of the views':
+
+```sql
+-- before: the slot's state, then the changes (DuckDB's postgres extension; nothing consumed)
+SELECT * FROM postgres_query('__duckwake_pg_shop', 'SELECT pg_current_wal_flush_lsn(), ... FROM pg_replication_slots ...');
+SELECT data FROM postgres_query('__duckwake_pg_shop', 'SELECT data FROM pg_logical_slot_peek_binary_changes(''duckwake_shop'', NULL, 100000, ...)');
+-- decoded in Rust into each touched key's last state; staged in memory, cast, unchanged TOAST values filled from the mirror
+BEGIN;
+UPDATE lake.__duckwake.lease_shop SET last_epoch = 9 WHERE owner_worker = 'w1' AND lease_epoch = 3;  -- 0 rows = fenced
+DELETE FROM lake.shop.orders m WHERE EXISTS (SELECT 1 FROM memory.main.ingest_shop_chg0 c WHERE m.id = CAST(c.k0 AS BIGINT));
+INSERT INTO lake.shop.orders SELECT ... FROM memory.main.ingest_shop_row0;
+INSERT INTO lake.__duckwake.checkpoints VALUES ('shop', 9, '{"shop":{"0":1620405840}}', NULL, 'pgoutput', <snapshot state>, ...);
+COMMIT;
+SELECT * FROM postgres_query('__duckwake_pg_shop', 'SELECT pg_replication_slot_advance(''duckwake_shop'', ''0/6094C350'')');
 ```
 
 ## Views as DBSP circuits
@@ -401,7 +420,8 @@ records the ones it took up.
 ```
 crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
                  operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
-crates/core      duckwake_core: engine, catalog, failover, Kafka, secrets, decode, maintenance, verify
+crates/core      duckwake_core: engine, catalog, failover, Kafka, PostgreSQL sources (pgoutput, pgsource,
+                 ingest), secrets, decode, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
@@ -409,5 +429,5 @@ crates/extension  the loadable extension (built on its own: scripts/build_extens
 Dockerfile       the duckwaked image (docker compose --profile server)
 docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
 deploy/          Prometheus alerting rules and their tests, scrape config, Grafana dashboard and provisioning
-scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, schema, limits, reset, retention, decode, shared-reader, server and extension tests; benchmark
+scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, schema, limits, reset, retention, decode, shared-reader, PostgreSQL ingest, server and extension tests; benchmark
 ```

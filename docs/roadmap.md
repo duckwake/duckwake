@@ -139,6 +139,11 @@ default.
   read as upsert views, `event_time` optional (`FORMAT=debezium scripts/upsert_test.sh`, and end to end with
   PostgreSQL and Debezium's connector: `scripts/debezium_e2e_test.sh`). Built 2026-11-21: windows over updates and
   deletes (C4, [#38](https://github.com/duckwake/duckwake/issues/38)), with late corrections in the late-data table.
+- Database sources without Kafka ([database CDC sources](design/database-cdc-sources.md)). Built 2026-11-21:
+  PostgreSQL sources (D1, [#44](https://github.com/duckwake/duckwake/issues/44)): `create_source(name, 'postgres',
+  ...)` mirrors tables into the lake from a logical replication slot, exactly once, with the snapshot, TOAST
+  values, key changes and truncates (`scripts/pg_ingest_test.sh`). Next: MySQL (D3,
+  [#45](https://github.com/duckwake/duckwake/issues/45)), then large tables, added tables and schema changes (D4).
 - Avro and Protobuf with a schema registry; Kafka headers
 - Splitting one topic's partitions across workers
 - A Windows build

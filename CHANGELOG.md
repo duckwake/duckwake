@@ -7,6 +7,19 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- PostgreSQL sources ([#44](https://github.com/duckwake/duckwake/issues/44)): `duckwake_create_source('shop',
+  'postgres', '{"dsn": ..., "tables": [...]}')` (`create-source --kind postgres`) keeps a mirror table of each
+  table in the lake, `lake.<source>.<table>`, with one row per primary key, read from a logical replication
+  slot with no Kafka or Debezium. Its ingest job copies every table under one snapshot, then applies whole
+  transactions (inserts, updates, deletes, primary key changes, `TRUNCATE`, and updates that leave a TOASTed
+  value out) and commits the mirror rows with the slot position in one DuckLake transaction; the slot is
+  advanced only after that, so it is never ahead of the lake. A slot that is gone, invalidated or ahead of the
+  lake, a changed table, or a value its mirror column cannot hold stops the job with the reason; `reset
+  --to-epoch 0` takes a new snapshot. `verify` compares the mirrors with the tables; views read the mirrors
+  through their change feeds. Reads through DuckDB's postgres extension, with no new dependency. Gate:
+  `scripts/pg_ingest_test.sh`, in order and pipelined.
+- `duckwake_drop_source(name)` (`drop-source NAME`); for a PostgreSQL source it also drops the mirror tables,
+  the slot, and the publication DuckWake created.
 - Windowed views take the updates and deletes of their lake inputs ([#38](https://github.com/duckwake/duckwake/issues/38)), of a
   table or of a view whose rows change (an upsert view's, say), where they used to read them insert-only and
   stop. A change to a window still open revises it: `min`, `max`, `bool_and`/`bool_or`, `count(DISTINCT)`,

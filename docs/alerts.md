@@ -46,7 +46,7 @@ The series, per view (`worker` and `view` labels) unless marked per worker:
 | Series | |
 | --- | --- |
 | `duckwake_freshness_seconds` | now minus the newest event time committed; grows on an idle topic too |
-| `duckwake_lag_events` | events behind the end of the topic after the last commit |
+| `duckwake_lag_events` | events behind the end of the topic after the last commit; for a PostgreSQL source, bytes of WAL the server had flushed past its position |
 | `duckwake_watermark_delay_seconds` | now minus the watermark |
 | `duckwake_epoch`, `duckwake_stage_seconds`, `duckwake_commit_freshness_seconds` | last epoch, its staging time, event to visible |
 | `duckwake_rows_in_total`, `_rows_out_total`, `_late_rows_total`, `_dead_letters_total` | counters |
@@ -116,6 +116,11 @@ and the worker log says why (`view stopped: marking it failed`, `cannot start jo
   deleted. Replace the view (`create-view --if-exists replace`, with `--late-data`) to have it take updates and
   deletes as late corrections.
 - *cannot start*: the view's definition no longer compiles against its inputs (a dropped table, a source gone).
+- A PostgreSQL source's ingest job (named like the source): *replication slot ... is gone*, *was invalidated* or
+  *has confirmed ..., past the lake's position*: changes were lost, so `duckwake reset <source> --to-epoch 0` and
+  start it to take a new snapshot. *the columns of ... changed*: drop the source and create it again. *does not
+  fit its mirror column*: a value the type mapping cannot hold ([PostgreSQL sources](sql.md#postgresql-sources)).
+  While it is failed or stopped, the database keeps WAL for its slot.
 
 ## DuckWakeViewStuck
 

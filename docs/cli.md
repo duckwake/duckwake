@@ -54,6 +54,17 @@ $B create-source clicks --options '{"brokers":"kafka-1:9094","topic":"clicks","e
   "sasl_password":"env:KAFKA_PASSWORD","columns":{"ts":"TIMESTAMP","game_id":"VARCHAR"}}'
 ```
 
+A PostgreSQL source (`--kind postgres`) mirrors tables of a database into the lake through a replication slot;
+its ingest job takes the source's name, so `start shop`, `stop shop`, `checkpoints shop`, `verify shop` and
+`reset shop --to-epoch 0` work on it, and `drop-source shop` drops it with its mirror tables and slot. Options and
+behaviour: [PostgreSQL sources](sql.md#postgresql-sources).
+
+```sh
+SHOP_PG_PASSWORD=... $B create-source shop --kind postgres --options '{"dsn": "host=db dbname=shop user=duckwake",
+  "password": "env:SHOP_PG_PASSWORD", "tables": ["public.orders", "public.customers"]}'
+$B start shop
+```
+
 `run`, `serve` and `playground` take the worker flags described in [performance.md](performance.md).
 
 ## Changing views and sources
