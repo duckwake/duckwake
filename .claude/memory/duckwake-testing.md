@@ -34,7 +34,8 @@ metadata:
   on 127.0.0.1:13306 (`apt-get install mysql-server-8.0`, then `mysqld --initialize-insecure` into
   `/var/lib/mysql-dw` and start it with `--port=13306 --server-id=1 --log-bin=binlog --gtid-mode=ON
   --enforce-gtid-consistency=ON --binlog-row-metadata=FULL`). Kill workers left from an earlier run first
-  (`pkill -f target/release/duckwake`): one holding the test catalog makes `reset_lake` fail.
+  (`pkill -f target/release/duckwake`): one holding the test catalog makes `reset_lake` fail. Both servers stop
+  when the container restarts; start them again before a run.
 - The cloud session has no Docker: Kafka suites (upsert, Debezium, chain) and `debezium_e2e_test.sh` run only in
   CI. Check the PostgreSQL side of a new suite against the local server and its DuckDB queries with
   `duckwake sql` before pushing.

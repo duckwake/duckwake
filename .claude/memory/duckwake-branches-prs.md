@@ -49,10 +49,13 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
     needing an absolute floor below 1), #65 (D1, #44: PostgreSQL sources) and #66 (D3, #45: MySQL sources, plus a
     CI step dropping an unpacked DuckDB tree the rust-cache restored without its `.complete` marker: a new
     dependency reruns libduckdb-sys's build script, whose unpack then failed). D1 and D3 read through
-    `ingest::Reader` (`PgReader` over DuckDB's postgres extension and SQL logical decoding, no new driver;
-    `MyReader` over `mysql_async` 0.37 binlog by GTID). Proposed and waiting for the user's go-ahead: a pure-move
-    `crates/core/src/sources/` module (kafka/, database/{postgres,mysql}/). Next on the roadmap: D4 (large tables,
-    schema changes).
+    a `Reader` per database (`PgReader` over DuckDB's postgres extension and SQL logical decoding, no new driver;
+    `MyReader` over `mysql_async` 0.37 binlog by GTID). #67 (merged 2026-11-22) moved all source code, with no
+    change in behaviour, under `crates/core/src/sources/`: `mod.rs` (the one place that dispatches on a source's
+    kind: create, drop, reset, verify), `kafka/` (reader, `decode.rs`), `database/` (the ingest job and `Reader`,
+    `mirror.rs`, `catalog.rs`, `postgres/`, `mysql/` with `gtid.rs` and `values.rs`). Its CI also found a race in
+    `pg_ingest_test.sh`'s slot-ahead step (insert, then stop the worker), now stop-then-insert with an assertion.
+    Next on the roadmap: D4 (large tables, schema changes).
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository
