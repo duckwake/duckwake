@@ -107,15 +107,16 @@ default.
   `scripts/backfill_test.sh`). Next, in order: stream–stream joins
   ([#31](https://github.com/duckwake/duckwake/issues/31)); top-k and `ROW_NUMBER`
   ([#35](https://github.com/duckwake/duckwake/issues/35)); `list`/`string_agg`/`mode` and grouping sets
-  ([#30](https://github.com/duckwake/duckwake/issues/30)); `DISTINCT` over windows and aggregates; `MIN`/`MAX`
-  in windows over deletes ([#38](https://github.com/duckwake/duckwake/issues/38)). `arg_min`/`arg_max` wait
+  ([#30](https://github.com/duckwake/duckwake/issues/30)); `DISTINCT` over windows and aggregates. (`MIN`/`MAX`
+  in windows over deletes: built with C4, [#38](https://github.com/duckwake/duckwake/issues/38).) `arg_min`/`arg_max` wait
   until a tie can be checked against the batch query
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
-  retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain. Windows over tables
-  whose rows change need an upsert window sink that keeps state for `lateness`, as Flink and Feldera do;
-  what arrives later goes to the late-data table (C4), and bulk reruns are the partition-overwrite refresh
-  below.
+  retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain.
+  Windows over tables whose rows change are built (C4, 2026-11-21, `scripts/retract_test.sh`): changes to open
+  windows revise them, changes to closed ones are late corrections. An upsert window sink that keeps closed
+  windows revisable for a `lateness`, as Flink and Feldera do, is the next step if users need it; bulk reruns
+  are the partition-overwrite refresh below.
 - **Partition-overwrite refresh**, right after F2's weights, for lake tables whose recent partitions are
   rerun to correct data (for example, the last 3 days rewritten with delete + insert or `INSERT OVERWRITE`).
   A view whose table is partitioned like its input (its output carries the input's partition column, such as
@@ -136,7 +137,8 @@ default.
   row per key that other views read through the change feed (`scripts/upsert_test.sh`). Built 2026-11-21:
   Debezium topics (C3, [#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` sources
   read as upsert views, `event_time` optional (`FORMAT=debezium scripts/upsert_test.sh`, and end to end with
-  PostgreSQL and Debezium's connector: `scripts/debezium_e2e_test.sh`). Next: late changes to closed windows (C4).
+  PostgreSQL and Debezium's connector: `scripts/debezium_e2e_test.sh`). Built 2026-11-21: windows over updates and
+  deletes (C4, [#38](https://github.com/duckwake/duckwake/issues/38)), with late corrections in the late-data table.
 - Avro and Protobuf with a schema registry; Kafka headers
 - Splitting one topic's partitions across workers
 - A Windows build

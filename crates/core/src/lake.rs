@@ -379,10 +379,13 @@ pub fn table_by_id(conn: &Connection, id: i64) -> Result<Option<(String, String)
     Ok(rows.next()?.map(|r| Ok::<_, duckdb::Error>((r.get(0)?, r.get(1)?))).transpose()?)
 }
 
-/// True when a DuckLake commit failed because another transaction touched the same table.
+/// True when a DuckLake commit failed because another transaction touched the same table, or because other
+/// commits kept landing while it retried (DuckLake retries a commit `ducklake_max_retry_count` times, 10 by
+/// default, then gives up: a slow commit while the lake takes many others, CI's backfill suite on 2026-11-22).
+/// Either way the transaction was rolled back and can run again.
 pub fn is_conflict(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("Transaction conflict") || msg.contains("conflict")
+    msg.contains("Transaction conflict") || msg.contains("conflict") || msg.contains("Exceeded the maximum retry count")
 }
 
 #[cfg(test)]
@@ -402,6 +405,16 @@ mod tests {
         assert!(chain.contains("PROVIDER credential_chain") && chain.contains("REGION 'eu-west-1'") && !chain.contains("ENDPOINT"), "{chain}");
         assert!(s3_secret_sql("s3://b", &env(&[("AWS_ACCESS_KEY_ID", "k")])).is_err());
         assert!(s3_secret_sql("s3:///x", &env(&[])).is_err());
+    }
+
+    #[test]
+    fn exhausted_commit_retries_are_conflicts() {
+        let e = anyhow::anyhow!(
+            "TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.\nExceeded the maximum retry \
+             count of 10 set by the ducklake_max_retry_count setting."
+        );
+        assert!(is_conflict(&e));
+        assert!(!is_conflict(&anyhow::anyhow!("Catalog Error: Table with name x does not exist")));
     }
 
     #[test]

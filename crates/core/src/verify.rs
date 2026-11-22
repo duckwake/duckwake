@@ -76,7 +76,9 @@ fn count(conn: &Connection, sql: &str) -> Result<i64> {
 pub const FLOAT_TOLERANCE: f64 = 1e-9;
 
 /// Compares the rows of `expected` and `sink` as multisets over `columns`: every column exactly, except DOUBLE
-/// and FLOAT ones, which match within `FLOAT_TOLERANCE`. Returns how many expected rows the sink lacks, how
+/// and FLOAT ones, which match within `FLOAT_TOLERANCE` of the larger value, or of 1 below it. The floor is for
+/// results that are exactly 0: a view that retracts reaches them by adding and subtracting sums, which leaves a
+/// residue (`covar_samp` of 5e-15 against 0 in `backfill_test.sh`'s `bf_quiet`, CI 2026-11-22). Returns how many expected rows the sink lacks, how
 /// many sink rows were not expected, and up to five of each.
 ///
 /// Rounding both sides to 10 digits instead, as this did before, fails whenever two values a hair apart fall on
@@ -98,7 +100,7 @@ fn compare(conn: &Connection, expected: &str, sink: &str, columns: &[(String, St
         let by = if exact.is_empty() { String::new() } else { format!("PARTITION BY {}", exact.join(", ")) };
         let order = floats.join(", ");
         let close = |c: &String| {
-            format!("(a.{c} IS NOT DISTINCT FROM b.{c} OR abs(a.{c} - b.{c}) <= {FLOAT_TOLERANCE:e} * greatest(abs(a.{c}), abs(b.{c})))")
+            format!("(a.{c} IS NOT DISTINCT FROM b.{c} OR abs(a.{c} - b.{c}) <= {FLOAT_TOLERANCE:e} * greatest(abs(a.{c}), abs(b.{c}), 1))")
         };
         let on: Vec<String> = exact
             .iter()
@@ -161,6 +163,22 @@ impl Drop for Txn<'_> {
     }
 }
 
+/// The columns of a view's first input as its staged rows carry them (a window's columns left out of a windowed
+/// view's), quoted: the columns its late-data table holds.
+fn plan_stream_columns(plan: &crate::plan::Plan, def: &crate::model::JobDef, sources: &std::collections::HashMap<String, SourceDef>) -> Result<Vec<String>> {
+    let name = plan.sources().into_iter().next().context("a view without an input")?;
+    let columns = match (sources.get(&name), def.lake_inputs.iter().find(|l| l.name == name)) {
+        (Some(s), _) => s.options.columns.clone(),
+        (None, Some(l)) => l.columns.clone(),
+        (None, None) => bail!("input {name} is gone"),
+    };
+    Ok(columns
+        .iter()
+        .filter(|(c, _)| !(plan.is_windowed() && crate::circuit::codegen::is_window_column(c)))
+        .map(|(c, _)| ident(c))
+        .collect())
+}
+
 pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (def, _) = catalog::load_job(conn, job)?;
     let sources = catalog::view_sources(&def, catalog::load_sources(conn)?);
@@ -173,9 +191,23 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
         .zip(&lakes)
         .map(|(n, l)| if l.is_some() { Ok(None) } else { sources.get(n).map(Some).with_context(|| format!("source {n} is gone")) })
         .collect::<Result<_>>()?;
-    // A windowed view over a lake input has an exact watermark, so it has no late rows to reconstruct.
-    if plan.is_windowed() && def.late_data.is_none() && lakes[0].is_none() {
-        bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
+    // A windowed view over a lake input has an exact watermark, so it has no late rows to reconstruct, unless
+    // its input updates or deletes: a retraction for a window already closed is a late correction.
+    if plan.is_windowed() && def.late_data.is_none() {
+        if lakes[0].is_none() {
+            bail!("verify needs a late-data table for windowed views (dropped late rows cannot be reconstructed)");
+        }
+        let dropped: i64 = conn.query_row(
+            &format!("SELECT coalesce(sum(rows_late), 0) FROM {CTL}.checkpoints WHERE job_id = ?"),
+            [job],
+            |r| r.get(0),
+        )?;
+        if dropped > 0 {
+            bail!(
+                "{dropped} late corrections (changes to windows already closed) were counted and dropped, and the windows still \
+                 hold what they changed; verify needs a late-data table to reconstruct them (replace the view with --late-data)"
+            );
+        }
     }
 
     let earliest = srcs
@@ -224,10 +256,19 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
          CREATE OR REPLACE TABLE memory.main.v_dead AS SELECT source, source_partition AS _partition, source_offset AS _offset
            FROM {CTL}.dead_letter WHERE job_id = '{job}';"
     ))?;
+    // Late rows: those added to a closed window (+1) are left out of the batch input; over an input that
+    // retracts, those taken out of one (-1, a late correction) are added back, as the closed window still counts
+    // them (`v_late_back`).
+    let late_stream_cols: Vec<String> = plan_stream_columns(&plan, &def, &sources)?;
     if let Some(late) = &def.late_data {
+        let weight = if plan.retracts() { ident(crate::circuit::ops::LATE_WEIGHT) } else { "1".to_string() };
         conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE memory.main.v_late AS SELECT _source_partition AS _partition, _source_offset AS _offset, window_start FROM {}",
-            quote_table(late)?
+            "CREATE OR REPLACE TABLE memory.main.v_late AS
+               SELECT _source_partition AS _partition, _source_offset AS _offset, window_start FROM {t} WHERE {weight} > 0;
+             CREATE OR REPLACE TABLE memory.main.v_late_back AS
+               SELECT {cols}, window_start, window_end FROM {t} WHERE {weight} < 0;",
+            t = quote_table(late)?,
+            cols = if late_stream_cols.is_empty() { "NULL AS __none".to_string() } else { late_stream_cols.join(", ") },
         ))?;
     } else {
         conn.execute_batch("CREATE OR REPLACE TABLE memory.main.v_late (_partition INTEGER, _offset BIGINT, window_start TIMESTAMP)")?;
@@ -339,12 +380,17 @@ pub fn verify(conn: &Connection, rt: &Handle, job: &str) -> Result<Report> {
     let (mut late_rows, mut late_duplicates, mut left_in_state) = (0, 0, 0);
     if plan.is_windowed() {
         let wm = ckpt.watermark_us.map(|w| format!("make_timestamp({w})")).unwrap_or("NULL".into());
+        let back = if def.late_data.is_some() && plan.retracts() {
+            format!(" UNION ALL SELECT {stream_cols}, window_start, window_end FROM memory.main.v_late_back WHERE window_end <= {wm} AND {sink_filter}")
+        } else {
+            String::new()
+        };
         conn.execute_batch(&format!(
             "CREATE OR REPLACE TABLE {input} AS
                SELECT {stream_cols}, window_start, window_end FROM ({w}) x
                WHERE window_end <= {wm} AND {sink_filter}
                  AND NOT EXISTS (SELECT 1 FROM memory.main.v_late l
-                                 WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start)",
+                                 WHERE l._partition = x._partition AND l._offset = x._offset AND l.window_start = x.window_start){back}",
             input = plan.input_table,
             w = plan.window_sql(valid)
         ))?;
@@ -415,6 +461,14 @@ mod tests {
         let (m, u, rows) = run("('a', 1, 0.123456789500001), ('b', 2, -0.0016807972449711778)",
                                "('a', 1, 0.123456789499999), ('b', 2, -0.0016807972449720)");
         assert_eq!((m, u), (0, 0), "{rows:?}");
+    }
+
+    #[test]
+    fn a_residue_next_to_zero_matches() {
+        let (m, u, rows) = run("('a', 1, 0.0)", "('a', 1, 5.329070518200751e-15)");
+        assert_eq!((m, u), (0, 0), "{rows:?}");
+        let (m, u, _) = run("('a', 1, 0.0)", "('a', 1, 0.000001)");
+        assert_eq!((m, u), (1, 1), "a real difference near zero still shows");
     }
 
     #[test]
