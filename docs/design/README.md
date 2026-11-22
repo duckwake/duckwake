@@ -18,6 +18,7 @@ does today; when the two disagree, the code and those docs win.
 | [Architecture review](architecture-review.md) | Nov 11, 2026 | Where the architecture stands against other engines, its weaknesses, and proposals |
 | [Worker rebalancing](worker-rebalancing.md) | Nov 12, 2026 | Sticky, incremental rebalancing of views across workers |
 | [dbt-duckwake](dbt-duckwake.md) | Nov 13, 2026 | SQL authoring through a dbt package instead of new DDL |
+| [View names](view-names.md) | Nov 22, 2026 | A view's id is `schema.table`, so two schemas can each have a view of one table name |
 
 Comparisons with other engines come from their documentation and source as read on the dates given; check the
 originals before relying on a detail.
