@@ -21,9 +21,9 @@ something return `(view, result)` rows.
 
 ## Sources
 
-A source is a Kafka topic with a schema. It holds no data; it tells views how to read the topic. A
-[PostgreSQL source](#postgresql-sources) is different: it names tables of a database, and DuckWake keeps a
-copy of each in the lake.
+A source is a Kafka topic with a schema. It holds no data; it tells views how to read the topic. A database
+source ([PostgreSQL](#postgresql-sources) or [MySQL](#mysql-sources)) is different: it names tables of a
+database, and DuckWake keeps a copy of each in the lake.
 
 ```sql
 CALL duckwake_create_source('clicks', 'kafka', '{
@@ -34,9 +34,9 @@ CALL duckwake_create_source('clicks', 'kafka', '{
 
 | Function | Does |
 | --- | --- |
-| `duckwake_create_source(name, kind, options_json)` | Register a source. `kind` is `'kafka'`, or `'postgres'` ([PostgreSQL sources](#postgresql-sources)). |
+| `duckwake_create_source(name, kind, options_json)` | Register a source. `kind` is `'kafka'`, `'postgres'` ([PostgreSQL sources](#postgresql-sources)) or `'mysql'` ([MySQL sources](#mysql-sources)). |
 | `duckwake_add_source_column(source, column, type)` | Add a column to a source while views read it. Views that already read the source keep their columns. |
-| `duckwake_drop_source(name)` | Drop a source no view reads. A PostgreSQL source goes with its mirror tables and its replication slot. |
+| `duckwake_drop_source(name)` | Drop a source no view reads. A database source goes with its mirror tables, and a PostgreSQL one with its replication slot. |
 | `duckwake_sources()` | Every source with its options. |
 
 The options:
@@ -374,11 +374,72 @@ CALL duckwake_create_view('analytics.orders_by_status',
   [D4](design/database-cdc-sources.md#milestones). Each epoch scans the mirror tables it deletes from, as an
   upsert view scans its table.
 
+## MySQL sources
+
+A source of kind `mysql` keeps a copy of tables of a MySQL server in the lake, read from its binlog by GTID, with
+no Kafka or Debezium in between. It works like a [PostgreSQL source](#postgresql-sources): one mirror table per
+table, one row per primary key, an ingest job named like the source, and views that read the mirrors through
+their change feeds.
+
+```sql
+CALL duckwake_create_source('shop', 'mysql', '{
+  "url": "mysql://duckwake@db.internal:3306", "password": "env:SHOP_MYSQL_PASSWORD",
+  "tables": ["shop.orders", "shop.customers"]}');
+CALL duckwake_start('shop');
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `url` | required | `mysql://user@host:port`, without the password; parameters such as `?require_ssl=true` pass through. |
+| `tables` | required | The tables to mirror, each with its database: `shop.orders`. |
+| `password` | none | `env:NAME` or `file:/path`, resolved by each process that connects. |
+| `schema` | the source's name | The lake schema of the mirror tables. |
+| `server_id` | derived from the name | The replica id the job reads the binlog as; it must differ from every other replica of the server. |
+| `epoch_interval` | `"2s"` | How often the job reads the binlog. |
+| `max_changes` | `100000` | Most row changes one epoch reads; a transaction is always read whole. |
+
+- **What the server needs.** MySQL 8.0 or later with `log_bin` on, `binlog_format = ROW`,
+  `binlog_row_image = FULL`, `gtid_mode = ON`, `binlog_row_value_options` empty and
+  `binlog_transaction_compression` off; `binlog_row_metadata = FULL` lets the job check column names too. A user
+  with `SELECT`, `REPLICATION SLAVE` and `REPLICATION CLIENT`. Each table needs a primary key, InnoDB, utf8mb4
+  (or ascii) text columns and no generated columns. `create_source` checks all this.
+- **Exactly once.** Each epoch reads the binlog after the GTID set the lake holds and writes the mirror rows and
+  the new set in one DuckLake transaction. The server sends no transaction twice and keeps nothing for the
+  reader. The first epoch reads `gtid_executed`, copies every table in one `WITH CONSISTENT SNAPSHOT` transaction,
+  reads `gtid_executed` again, and applies the binlog between the two sets over the copy in the same commit;
+  full row images make that right whichever of those transactions the copy already held.
+- **Types.** Values become text and are cast to the mirror column's type, from the binlog and the snapshot alike:
+
+  | MySQL | Mirror |
+  | --- | --- |
+  | `tinyint` to `bigint`, signed or `unsigned` | `TINYINT` to `BIGINT`, or `UTINYINT` to `UBIGINT` |
+  | `float`, `double` | `FLOAT`, `DOUBLE` |
+  | `decimal(p,s)` with p up to 38; wider | `DECIMAL(p,s)`; `DOUBLE` |
+  | `date`, `datetime`, `timestamp` | `DATE`, `TIMESTAMP`, `TIMESTAMPTZ` (in UTC) |
+  | `year`, `bit(n)` | `SMALLINT`, `UBIGINT` |
+  | `char`, `varchar`, text types, `enum`, `set` | `VARCHAR` (an `enum`'s label; a `set`'s labels joined by commas) |
+  | `time` | `VARCHAR` (`-838:59:59` to `838:59:59`) |
+  | `json` | `JSON`, object keys sorted |
+  | `binary`, `varbinary`, blob types, spatial types | `BLOB` |
+
+  MySQL's zero date (`0000-00-00`) becomes NULL.
+- **When the job stops** (status `failed`): the server purged binlog the lake had not read
+  (`binlog_expire_logs_seconds`, 30 days by default: a source stopped longer loses its position), so
+  `duckwake_reset('shop', 0)` empties the mirrors and the next start takes a new snapshot; or a table changed
+  (`ALTER`, `DROP` or `RENAME TABLE`): drop the source and create it again. `TRUNCATE` empties the mirror.
+- **Checking it.** `duckwake_verify('shop')` compares every mirror with its table read now, in one consistent
+  snapshot. `duckwake_checkpoints('shop')` shows the GTID set each epoch reached (its `source_offsets` is how many
+  transactions it holds) and `lag`, the transactions the server had executed past it; `duckwake_lag_events` is the
+  same for a MySQL source.
+- **Dropping it.** `duckwake_drop_source('shop')` is refused while views read a mirror; stop the source first. It
+  drops the mirror tables; nothing is left on the server.
+- **Size.** The first copy goes through memory and commits in one DuckLake transaction, as for PostgreSQL.
+
 ## The same in the CLI
 
 | SQL function (server, extension) | CLI |
 | --- | --- |
-| `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka\|postgres --options JSON` |
+| `duckwake_create_source(name, kind, options)` | `create-source NAME --kind kafka\|postgres\|mysql --options JSON` |
 | `duckwake_drop_source(name)` | `drop-source NAME` |
 | `duckwake_create_view(name, sql, options)`, where `name` is the view's DuckLake table | `create-view SCHEMA.TABLE --sql [--late-data] [--checkpoint ducklake] [--epoch-interval] [--max-rows] [--max-state-rows] [--max-late-rows] [--upsert-key] [--upsert-version] [--if-exists fail\|update\|replace] [--replace]` |
 | `duckwake_add_source_column(source, column, type)` | `add-source-column SOURCE COLUMN TYPE` |

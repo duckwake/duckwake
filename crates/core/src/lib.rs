@@ -11,6 +11,8 @@ pub mod kafka;
 pub mod lake;
 pub mod maintenance;
 pub mod metrics;
+pub mod mirror;
+pub mod mysqlsource;
 pub mod model;
 pub mod pgoutput;
 pub mod pgsource;

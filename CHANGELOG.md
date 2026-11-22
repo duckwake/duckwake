@@ -7,6 +7,18 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Added
 
+- MySQL sources ([#45](https://github.com/duckwake/duckwake/issues/45)): `duckwake_create_source('shop', 'mysql',
+  '{"url": "mysql://user@host:3306", "tables": ["shop.orders"]}')` (`create-source --kind mysql`) keeps a mirror
+  table of each table in the lake, read from the binlog by GTID (`mysql_async`). Each epoch writes the mirror
+  rows with the GTID set in one DuckLake transaction, and the server sends nothing twice. The first epoch copies
+  every table in one consistent snapshot, without locks, and applies the binlog between the GTID sets read before
+  and after the copy in the same commit. Binlog the lake has not read being purged, a table changed by `ALTER`,
+  `DROP` or `RENAME`, or a value that cannot be read stops the job; `TRUNCATE` empties the mirror; `reset
+  --to-epoch 0` takes a new snapshot. Gate: `scripts/mysql_ingest_test.sh`, in order and pipelined, against the
+  compose service `mysql-source` (profile `mysql`).
+- The ingest job reads every database source through one core (batching, staging, commit, fencing, `verify`),
+  and the PostgreSQL gate's reset now runs while its workload does.
+
 - PostgreSQL sources ([#44](https://github.com/duckwake/duckwake/issues/44)): `duckwake_create_source('shop',
   'postgres', '{"dsn": ..., "tables": [...]}')` (`create-source --kind postgres`) keeps a mirror table of each
   table in the lake, `lake.<source>.<table>`, with one row per primary key, read from a logical replication

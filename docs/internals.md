@@ -14,7 +14,9 @@
 | Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
-| PostgreSQL sources: decoding, definition, ingest job | `pgoutput.rs` (pgoutput messages, LSNs, `pg_snapshot` visibility), `pgsource.rs` (options, checks, publication and slot, type mapping, `verify`), `ingest.rs` (the job; see below) |
+| Database sources: the ingest job and mirror tables | `ingest.rs` (the job, through a `Reader` per kind; see below), `mirror.rs` (mirror tables, casts, `verify`'s comparison) |
+| PostgreSQL sources | `pgoutput.rs` (pgoutput messages, LSNs, `pg_snapshot` visibility), `pgsource.rs` (options, checks, publication and slot, type mapping, `PgReader`) |
+| MySQL sources | `mysqlsource.rs` (options, checks, type mapping, GTID sets, binlog and snapshot values as text, `MyReader`) |
 
 The epoch transaction (`engine.rs::commit`), one per worker per epoch, covers all of its jobs:
 
@@ -30,7 +32,7 @@ INSERT INTO lake.__duckwake.checkpoints VALUES ('clicks_per_min', 42, '{"clicks"
 COMMIT;
 ```
 
-A PostgreSQL source's ingest job (`ingest.rs`) runs on a thread of its own with its own connection, so a long
+A database source's ingest job (`ingest.rs`) runs on a thread of its own with its own connection, so a long
 snapshot never holds up the views' epochs; the worker starts and stops it like a view (lease, claims, failover,
 handoffs) and marks it failed when it reports a broken rule. Its epoch, with no transaction of the views':
 
@@ -47,6 +49,9 @@ INSERT INTO lake.__duckwake.checkpoints VALUES ('shop', 9, '{"shop":{"0":1620405
 COMMIT;
 SELECT * FROM postgres_query('__duckwake_pg_shop', 'SELECT pg_replication_slot_advance(''duckwake_shop'', ''0/6094C350'')');
 ```
+
+A MySQL source's epoch is the same transaction; its read is a non-blocking binlog dump from the GTID set in the
+last checkpoint (`mysql_async`), and nothing follows the commit.
 
 ## Views as DBSP circuits
 
@@ -420,8 +425,8 @@ records the ones it took up.
 ```
 crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
                  operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
-crates/core      duckwake_core: engine, catalog, failover, Kafka, PostgreSQL sources (pgoutput, pgsource,
-                 ingest), secrets, decode, maintenance, verify
+crates/core      duckwake_core: engine, catalog, failover, Kafka, database sources (ingest, mirror, pgoutput,
+                 pgsource, mysqlsource), secrets, decode, maintenance, verify
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)
@@ -429,5 +434,5 @@ crates/extension  the loadable extension (built on its own: scripts/build_extens
 Dockerfile       the duckwaked image (docker compose --profile server)
 docker/kafka     the local Redpanda's listeners (open, SASL, SASL over TLS, mTLS) and test-only certificates
 deploy/          Prometheus alerting rules and their tests, scrape config, Grafana dashboard and provisioning
-scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, schema, limits, reset, retention, decode, shared-reader, PostgreSQL ingest, server and extension tests; benchmark
+scripts/         crash, chain, retract, fencing, failover, rebalance, kafka auth, schema, limits, reset, retention, decode, shared-reader, PostgreSQL and MySQL ingest, server and extension tests; benchmark
 ```
