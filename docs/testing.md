@@ -64,7 +64,7 @@ dbt-duckdb into `.venv-dbt` (or set `DBT` to a `dbt` that has it) and keeps its 
 `DECODE=sql|arrow|auto` picks the source's decode for every script that uses the `clicks` source
 (default `auto`).
 `cargo run --release -p duckwake_core --example phase_a_arrow_decode` is Phase A of the Arrow ingest plan.
-It decodes the same messages with today's SQL decode and with `decode.rs` (Arrow, falling back to SQL for
+It decodes the same messages with today's SQL decode and with `sources/kafka/decode.rs` (Arrow, falling back to SQL for
 any form it can't match exactly), checks the outcomes are identical on a hostile corpus, and times both
 on 50k soak-shaped events.
 `scripts/decode_test.sh` is the same differential in the engine: one topic of hostile messages read by a

@@ -549,7 +549,7 @@ impl Spec for Wait {
                     ends.push((n.clone(), std::collections::BTreeMap::from([(0, snapshot)])));
                 } else {
                     let s = all.remove(&n).ok_or_else(|| anyhow!("source {n} of {job} is gone"))?;
-                    ends.push((n.clone(), api.rt.block_on(crate::kafka::latest_offsets(&s.options))?));
+                    ends.push((n.clone(), api.rt.block_on(crate::sources::kafka::latest_offsets(&s.options))?));
                 }
             }
             Ok((job, def, ends))

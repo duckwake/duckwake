@@ -2,10 +2,10 @@
 //! bounded snapshot: the newest events of the topic, decoded with the source's columns, as a temporary
 //! table of the same name. It is read fresh for every query and never written to the lake; continuous
 //! results are what views are for.
-use crate::kafka;
+use crate::sources::kafka;
 use crate::lake::ident;
 use crate::model::SourceDef;
-use crate::decode::{decode_sql, IS_JSON_OBJECT};
+use crate::sources::kafka::decode::{decode_sql, IS_JSON_OBJECT};
 use anyhow::Result;
 use duckdb::Connection;
 use std::collections::HashMap;
@@ -66,7 +66,7 @@ pub fn load_snapshot(conn: &Connection, rt: &Handle, src: &SourceDef, limit: usi
         cols = cols.join(", "),
         nulls = nulls.join(", "),
         decode = decode_sql(src, &ok),
-        key = crate::decode::key_sql(src),
+        key = crate::sources::kafka::decode::key_sql(src),
     ))?;
     Ok(msgs.len())
 }

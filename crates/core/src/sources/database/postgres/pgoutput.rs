@@ -1,18 +1,9 @@
 //! PostgreSQL's logical replication messages (`pgoutput`, protocol version 1), as
 //! `pg_logical_slot_peek_binary_changes` returns them: one message per row. Also the LSN and `pg_snapshot`
 //! text forms the ingest job stores. See "Logical Replication Message Formats" in the PostgreSQL docs.
+use crate::sources::database::Value;
 use anyhow::{bail, Context, Result};
 
-/// One column value of a tuple.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    /// A large (TOASTed) value the change did not touch: PostgreSQL leaves it out, and its value is the one
-    /// the row had before.
-    Unchanged,
-    /// The value's text form.
-    Text(String),
-}
 
 /// A column of a relation as the `Relation` message describes it.
 #[derive(Debug, Clone, PartialEq)]

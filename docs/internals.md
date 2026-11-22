@@ -6,17 +6,18 @@
 | --- | --- |
 | Worker with an embedded DuckDB 2.0 and the lake attached | `lake.rs` (embedded instance via the `duckdb` crate, DuckLake on PostgreSQL) |
 | View compiler: SQL rewrite to delta + MERGE, rejection at create time | `crates/circuit/src/frontend/plan.rs`. DuckDB parses the view (`json_serialize_sql`). The AST is checked against the operator matrix, the stream reference is swapped for the epoch's staging table, and aggregates are split into mergeable partials (`avg` → `sum` + `count`). `json_deserialize_sql` turns it back into SQL. Global aggregates compile into three operators over weighted rows (`__w`): pre-aggregate, aggregate with a DuckLake state table, and post (`HAVING` + select list) into an upsert sink; `GlobalPlan::stage_sql` / `commit_sql` are the per-epoch statements, shared with the unit tests. |
-| Source readers, offsets owned by the lake | `kafka.rs` (`rskafka`, one prefetch task per partition, bounded channel for backpressure). Each fetch is cut into chunks; with Arrow decode a chunk is decoded on a blocking thread before it is queued. |
-| JSON decode | `decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode.rs::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
+| Source readers, offsets owned by the lake | `sources/kafka/mod.rs` (`rskafka`, one prefetch task per partition, bounded channel for backpressure). Each fetch is cut into chunks; with Arrow decode a chunk is decoded on a blocking thread before it is queued. |
+| JSON decode | `sources/kafka/decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
 | Views as DBSP circuits: operator graph, incrementalization, SQL per operator | the `duckwake_circuit` crate (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
 | Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>`; `failover.rs`: `worker_<id>` |
 | Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
-| Database sources: the ingest job and mirror tables | `ingest.rs` (the job, through a `Reader` per kind; see below), `mirror.rs` (mirror tables, casts, `verify`'s comparison) |
-| PostgreSQL sources | `pgoutput.rs` (pgoutput messages, LSNs, `pg_snapshot` visibility), `pgsource.rs` (options, checks, publication and slot, type mapping, `PgReader`) |
-| MySQL sources | `mysqlsource.rs` (options, checks, type mapping, GTID sets, binlog and snapshot values as text, `MyReader`) |
+| Sources: where each kind is created, dropped, reset and verified | `sources/mod.rs` |
+| Database sources: the ingest job and mirror tables | `sources/database/mod.rs` (the job, through a `Reader` per kind; see below), `mirror.rs` (mirror tables, casts, `verify`'s comparison), `catalog.rs` (their control data: create, reset, drop) |
+| PostgreSQL sources | `sources/database/postgres/`: `mod.rs` (options, checks, publication and slot, type mapping, `PgReader`), `pgoutput.rs` (pgoutput messages, LSNs, `pg_snapshot` visibility) |
+| MySQL sources | `sources/database/mysql/`: `mod.rs` (options, checks, DDL, `MyReader`), `gtid.rs` (GTID sets), `values.rs` (column kinds and types, binlog and snapshot values as text) |
 
 The epoch transaction (`engine.rs::commit`), one per worker per epoch, covers all of its jobs:
 
@@ -32,7 +33,7 @@ INSERT INTO lake.__duckwake.checkpoints VALUES ('clicks_per_min', 42, '{"clicks"
 COMMIT;
 ```
 
-A database source's ingest job (`ingest.rs`) runs on a thread of its own with its own connection, so a long
+A database source's ingest job (`sources/database/mod.rs`) runs on a thread of its own with its own connection, so a long
 snapshot never holds up the views' epochs; the worker starts and stops it like a view (lease, claims, failover,
 handoffs) and marks it failed when it reports a broken rule. Its epoch, with no transaction of the views':
 
@@ -425,8 +426,8 @@ records the ones it took up.
 ```
 crates/circuit   duckwake_circuit: views as DBSP circuits. frontend/ (SQL -> plan -> Q), ops/ (one file per
                  operator), passes/ (analyze, incrementalize), codegen/ (SQL steps per epoch), ir/ (the graph)
-crates/core      duckwake_core: engine, catalog, failover, Kafka, database sources (ingest, mirror, pgoutput,
-                 pgsource, mysqlsource), secrets, decode, maintenance, verify
+crates/core      duckwake_core: engine, catalog, failover, maintenance, verify, secrets; sources/ (kafka/ with
+                 its decode; database/ with the ingest job, mirror tables, postgres/ and mysql/)
 crates/core/examples/phase0_*.rs   the Phase 0 spikes (DuckLake commit and conflict semantics)
 crates/core/src/sql_functions.rs   the duckwake_* SQL functions (server and extension); api.rs the shared calls
 crates/duckwake   duckwake CLI, duckwaked server (src/serve.rs), playground (src/playground.rs, playground.html)

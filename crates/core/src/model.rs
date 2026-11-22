@@ -122,11 +122,11 @@ impl SourceOptions {
 
 impl SourceOptions {
     /// The Arrow decoder this source's readers use, or None to decode everything in SQL.
-    pub fn arrow_decoder(&self) -> Result<Option<crate::decode::ArrowDecoder>> {
+    pub fn arrow_decoder(&self) -> Result<Option<crate::sources::kafka::decode::ArrowDecoder>> {
         if self.decode == "sql" {
             return Ok(None);
         }
-        crate::decode::ArrowDecoder::new(self)
+        crate::sources::kafka::decode::ArrowDecoder::new(self)
     }
 
     /// Accepts `columns` either as an ordered list of pairs or as a JSON object (key order is kept).
@@ -163,7 +163,7 @@ impl SourceOptions {
         }
         match o.decode.as_str() {
             "auto" | "sql" => {}
-            "arrow" if crate::decode::ArrowDecoder::new(&o)?.is_none() => {
+            "arrow" if crate::sources::kafka::decode::ArrowDecoder::new(&o)?.is_none() => {
                 bail!("decode 'arrow' supports TIMESTAMP, VARCHAR, BOOLEAN, integer, DOUBLE and DECIMAL columns only")
             }
             "arrow" => {}

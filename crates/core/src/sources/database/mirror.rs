@@ -1,5 +1,5 @@
-//! Mirror tables: the lake copies of a database source's tables (PostgreSQL, `pgsource`; MySQL, `mysqlsource`),
-//! which the source's ingest job (`ingest`) keeps up to date. Every value reaches a mirror as a text form and is
+//! Mirror tables: the lake copies of a database source's tables (PostgreSQL, `postgres`; MySQL, `mysql`),
+//! which the source's ingest job (`super`) keeps up to date. Every value reaches a mirror as a text form and is
 //! cast to its column's DuckDB type here, from a source's snapshot and from its change stream alike, so the two
 //! paths agree.
 use crate::lake::ident;

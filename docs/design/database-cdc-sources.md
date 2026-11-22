@@ -87,7 +87,7 @@ The mirror path needs two things from other plans first: operators that handle â
 
 ## D1 as built
 
-Built 2026-11-21 (`crates/core/src/pgoutput.rs`, `pgsource.rs`, `ingest.rs`). It keeps the six rules and the
+Built 2026-11-21 (now `crates/core/src/sources/database/postgres/` and `sources/database/mod.rs`). It keeps the six rules and the
 architecture above, and departs from the plan in how it talks to PostgreSQL:
 
 - **SQL logical decoding, not the replication protocol.** The job reads the slot with
@@ -127,10 +127,10 @@ and a view over a mirror verifies. It also covers a slot advanced past the lake,
 
 ## D3 as built
 
-Built 2026-11-22 (`crates/core/src/mysqlsource.rs`), on the ingest job D1 built, which now reads through a
-`Reader` (`ingest.rs`): the batching of each key's last state, the staging, the commit with fencing and the
+Built 2026-11-22 (now `crates/core/src/sources/database/mysql/`), on the ingest job D1 built, which now reads
+through a `Reader` (`sources/database/mod.rs`): the batching of each key's last state, the staging, the commit with fencing and the
 checkpoint are shared, and each kind reads its own way (`PgReader`, `MyReader`). The mirror tables, the type
-casts and `verify`'s comparison are shared too (`mirror.rs`). It keeps the plan above, with these choices:
+casts and `verify`'s comparison are shared too (`sources/database/mirror.rs`). It keeps the plan above, with these choices:
 
 - **The client.** `mysql_async` 0.37 (MIT or Apache-2.0) with its `binlog` feature, rustls on ring as for Kafka.
   Each epoch opens a non-blocking `COM_BINLOG_DUMP_GTID` from the lake's GTID set and reads to the end of the
