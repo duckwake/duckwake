@@ -41,7 +41,7 @@ target/release/duckwake playground --metrics 127.0.0.1:9464
 The Host row stays empty there unless node_exporter runs on the Mac itself (`brew install node_exporter`) and
 `prometheus.mac.yml` gets a `node` job for `host.docker.internal:9100`; the worker rows do not need it.
 
-The series, per view (`worker` and `view` labels) unless marked per worker:
+The series, per view (`worker` and `view` labels; `view` is the view's `schema.table`) unless marked per worker:
 
 | Series | |
 | --- | --- |
@@ -158,7 +158,7 @@ until `idle_timeout`. Look at the view's checkpoints (`watermark`) and the topic
 
 **warning.** More than 1% of a view's events cannot be decoded. They are in `lake.__duckwake.dead_letter` with
 their payload and the error:
-`SELECT error, count(*) FROM lake.__duckwake.dead_letter WHERE job_id = '<view>' GROUP BY ALL`. A producer
+`SELECT error, count(*) FROM lake.__duckwake.dead_letter WHERE job_id = '<schema.table>' GROUP BY ALL`. A producer
 changed its format, or a source column has the wrong type (add one with `duckwake add-source-column`).
 
 ## DuckWakeLateRows

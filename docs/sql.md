@@ -3,9 +3,12 @@
 Every `duckwake_*` function works the same in the server (`duckwaked`, also over Quack) and in the extension
 (`LOAD duckwake`). The [CLI](cli.md) has a command for each one; see [the same in the CLI](#the-same-in-the-cli).
 
-A view is named by the DuckLake table it keeps up to date, such as `analytics.clicks_per_min`. Functions take
-that name or the bare table name (`clicks_per_min`), which is also the view's job id. Functions that change
-something return `(view, result)` rows.
+A view is named by the DuckLake table it keeps up to date, `schema.table` such as `analytics.clicks_per_min`,
+which is also its job id: two schemas can each have a view of the same table name. Functions take that name
+(with or without `lake.` in front), or the bare table name (`clicks_per_min`) when only one schema has a view
+of that name; when several do, the call fails and lists them. Names in a view's own SQL mean what they mean to
+DuckDB: a bare name is a table of the `main` schema, so a view in another schema is read by its full name.
+Functions that change something return `(view, result)` rows.
 
 ## At a glance
 

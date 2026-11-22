@@ -68,6 +68,8 @@ default.
       the soak's numbers (P3).
 - [x] **Schema changes.** `OR REPLACE` for views; adding source columns without recreating; `alter-view` for
       settings (`scripts/schema_test.sh`).
+- [x] **View names.** A view's id is its `schema.table`, so two schemas can each have a view of one table name;
+      a lake from 0.2 is refused, not migrated ([design](design/view-names.md), `scripts/names_test.sh`).
 - [x] **Limits.** Per-view caps on state size and late-data growth; worker memory limits enforced and tested
       (`scripts/limits_test.sh`).
 - [x] **Distribution.** Versioning and a changelog ([releasing.md](releasing.md)); release binaries with
