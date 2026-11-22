@@ -185,6 +185,9 @@ held=$(position bf_rich)
 generate $((ROWS + 500000))
 sleep 20
 stop_generating
+# Maintenance runs its tasks in turn, and a flush that conflicts with the generator's inserts retries for up to
+# about 12 s before expiry gets its turn: wait for the first expiry rather than assume it fell in the window.
+for _ in $(seq 1 60); do (( $(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')") > 1 )) && break; sleep 1; done
 oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
 echo "bf_rich paused at snapshot $held; the lake's oldest snapshot is $oldest of $(snapshot); commit times recorded for $(sql "SELECT count(*) FROM lake.__duckwake.snapshot_times") of the $((oldest - 1)) expired (those that wrote rows)"
 (( oldest <= held )) || { echo "maintenance expired snapshots bf_rich still needs"; failed=1; }
@@ -221,7 +224,7 @@ verify_views bf_windows bf_windows_10s bf_by_game bf_busy || failed=1
 log "reset to epoch 0 after the start snapshot expired, and a rerun of a latest view's create"
 stop_view() {
   "$BIN" stop "$1" >/dev/null
-  for _ in $(seq 1 30); do grep -q "job released.*job=$1" "$OUT/worker.log" && break; sleep 1; done
+  for _ in $(seq 1 30); do grep -q "job released.*job=analytics.$1 " "$OUT/worker.log" && break; sleep 1; done
 }
 s0=$(sql "SELECT json_extract(definition, '\$.start_snapshot') FROM lake.__duckwake.jobs WHERE job_id = 'analytics.bf_rich'")
 oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
