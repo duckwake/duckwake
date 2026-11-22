@@ -25,7 +25,8 @@ groups:
           runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakenoworkers
 
       - alert: DuckWakeWorkerRestarting
-        expr: increase(duckwake_worker_restarts_total[15m]) >= 3 or duckwake_worker_up == 0
+        # A worker waiting out a catalog outage is not failing: DuckWakeCatalogUnreachable covers it.
+        expr: increase(duckwake_worker_restarts_total[15m]) >= 3 or (duckwake_worker_up == 0 unless duckwake_catalog_reachable == 0)
         for: 2m
         labels:
           severity: critical
@@ -33,6 +34,26 @@ groups:
           summary: "DuckWake worker {{ $labels.worker }} keeps failing"
           description: "The supervised worker failed and restarted at least 3 times in 15 minutes, or is waiting to restart. duckwake_worker_status() shows the last error."
           runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeworkerrestarting
+
+      - alert: DuckWakeCatalogUnreachable
+        expr: duckwake_catalog_reachable == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker {{ $labels.worker }} cannot reach the catalog"
+          description: "The worker cannot reach PostgreSQL, the DuckLake catalog, and waits for it: no view on it commits. It resumes from its checkpoints on its own once the catalog answers."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakecatalogunreachable
+
+      - alert: DuckWakeViewsWaiting
+        expr: duckwake_views_waiting > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} views on worker {{ $labels.worker }} cannot start"
+          description: "Their topic does not exist or no Kafka broker answers; duckwake jobs shows what each waits for (waiting_for). They start on their own once it is there."
+          runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewswaiting
 
       - alert: DuckWakeOutOfMemory
         expr: increase(duckwake_out_of_memory_total[30m]) > 0

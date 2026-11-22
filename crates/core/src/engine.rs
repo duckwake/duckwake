@@ -394,8 +394,24 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
     // An epoch that does not fit in the memory limit fails; the worker then starts again from its checkpoints
     // with half as many rows per epoch, in a fresh instance, instead of failing on the same epoch for ever.
     let mut rows_cap: Option<usize> = None;
+    // A catalog that cannot be reached is waited out, then the worker starts again from its checkpoints in a
+    // fresh instance (#27): what it staged or was committing when the catalog went is redone or found
+    // committed, as after a crash.
+    let mut outage = Outage::default();
     loop {
-        let mut w = start_worker(cfg.clone(), rt.clone(), rows_cap)?;
+        let mut w = match start_worker(cfg.clone(), rt.clone(), rows_cap) {
+            Ok(w) => w,
+            Err(e) if crate::lake::is_catalog_unavailable(&e) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    warn!(error = %format!("{e:#}"), "stopping while the catalog cannot be reached");
+                    return Ok(());
+                }
+                outage.wait(&e, &cfg, &shutdown);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        outage.end(&cfg);
         match w.run(&shutdown) {
             Err(e) if is_out_of_memory(&e) && !shutdown.load(Ordering::Relaxed) => {
                 let largest = w.jobs.values().map(|j| j.def.max_rows).max().unwrap_or(100_000);
@@ -413,14 +429,88 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
                 clear_spill_dir(&temp)?;
                 rows_cap = Some(cap);
             }
+            Err(e) if crate::lake::is_catalog_unavailable(&e) => {
+                // The instance goes with its connections; its ingest threads stop and its commit thread
+                // finishes or fails first (their Drop).
+                drop(w);
+                if shutdown.load(Ordering::Relaxed) {
+                    warn!(error = %format!("{e:#}"), "stopping while the catalog cannot be reached; the views move after the lease timeout");
+                    return Ok(());
+                }
+                clear_spill_dir(&temp)?;
+                outage.wait(&e, &cfg, &shutdown);
+            }
             res => {
                 res?;
                 // The others take this worker's views over at once instead of after the lease timeout.
-                failover::deregister(&w.conns[0], &w.cfg.worker_id)?;
+                match failover::deregister(&w.conns[0], &w.cfg.worker_id) {
+                    Err(e) if crate::lake::is_catalog_unavailable(&e) => {
+                        warn!(error = %format!("{e:#}"), "could not mark the worker stopped: the catalog cannot be reached; its views move after the lease timeout")
+                    }
+                    r => r?,
+                }
                 info!(worker = %w.cfg.worker_id, "worker stopped");
                 return Ok(());
             }
         }
+    }
+}
+
+/// A view this worker should run but cannot start yet, and when it tries again.
+struct Waiting {
+    /// What it waits for: `the topic` or `the Kafka brokers`.
+    reason: &'static str,
+    since: Instant,
+    backoff: Duration,
+    next_try: Instant,
+}
+
+impl Waiting {
+    const FIRST_BACKOFF: Duration = Duration::from_secs(5);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+}
+
+/// A catalog outage the worker is waiting out (#27): when it began, and how long the next wait is.
+#[derive(Default)]
+struct Outage {
+    since: Option<Instant>,
+    backoff: Duration,
+}
+
+impl Outage {
+    /// The longest wait between two tries.
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    /// Waits before the next try: 1 s, doubling up to 30 s, or until `shutdown`. The outage's start is logged
+    /// as a warning and recorded in the metrics; each later try is logged.
+    fn wait(&mut self, e: &anyhow::Error, cfg: &WorkerConfig, shutdown: &AtomicBool) {
+        let error = format!("{e:#}");
+        match self.since {
+            None => {
+                warn!(worker = %cfg.worker_id, error = %error, "the catalog cannot be reached; waiting for it, then resuming from the last checkpoints");
+                if let Some(m) = &cfg.metrics {
+                    m.set_catalog_reachable(false);
+                }
+                self.since = Some(Instant::now());
+            }
+            Some(since) => info!(worker = %cfg.worker_id, down_s = since.elapsed().as_secs(), error = %error, "the catalog is still unreachable"),
+        }
+        self.backoff = if self.backoff.is_zero() { Duration::from_secs(1) } else { (self.backoff * 2).min(Self::MAX_BACKOFF) };
+        let until = Instant::now() + self.backoff;
+        while Instant::now() < until && !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The worker started again: the outage, if there was one, is over.
+    fn end(&mut self, cfg: &WorkerConfig) {
+        if let Some(since) = self.since.take() {
+            info!(worker = %cfg.worker_id, down_s = since.elapsed().as_secs(), "the catalog answers again; resumed from the last checkpoints");
+            if let Some(m) = &cfg.metrics {
+                m.set_catalog_reachable(true);
+            }
+        }
+        self.backoff = Duration::ZERO;
     }
 }
 
@@ -499,7 +589,7 @@ fn start_worker(cfg: WorkerConfig, rt: Handle, rows_cap: Option<usize>) -> Resul
         rounds: 0,
         committed: 0,
         drops: Vec::new(),
-        waiting: HashSet::new(),
+        waiting: BTreeMap::new(),
         load_rounds: 0,
     })
 }
@@ -553,8 +643,8 @@ struct Worker {
     liveness: failover::Liveness,
     last_heartbeat: Instant,
     last_rebalance: Instant,
-    /// Jobs whose topic does not exist yet: retried every refresh, logged once.
-    waiting: HashSet<String>,
+    /// Views this worker should run but cannot start yet: their topic does not exist, or no broker answers.
+    waiting: BTreeMap<String, Waiting>,
     /// Rebalance rounds in a row that found this worker carrying too much load.
     load_rounds: u32,
     /// Most rows per epoch for any view, after an epoch ran out of memory; None: each view's `max_rows`.
@@ -595,7 +685,11 @@ impl Worker {
                 let cooldown = self.cfg.rebalance.map_or(Duration::ZERO, |r| r.cooldown);
                 let cooling: Vec<String> =
                     self.jobs.iter().filter(|(_, j)| j.started.elapsed() < cooldown).map(|(id, _)| id.clone()).collect();
-                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len() + self.ingests.len(), &costs, &cooling)?;
+                let waiting: BTreeMap<&str, &str> = self.waiting.iter().map(|(id, w)| (id.as_str(), w.reason)).collect();
+                failover::heartbeat(&self.conns[0], &self.cfg.worker_id, self.jobs.len() + self.ingests.len(), &costs, &cooling, &waiting)?;
+                if let Some(m) = &self.cfg.metrics {
+                    m.set_views_waiting(self.waiting.len());
+                }
                 self.liveness.beat();
                 self.last_heartbeat = Instant::now();
             }
@@ -831,26 +925,34 @@ impl Worker {
                 self.apply(c);
             }
         }
-        self.waiting.retain(|id| mine.contains_key(id));
+        self.waiting.retain(|id, _| mine.contains_key(id));
         for id in new {
+            if self.waiting.get(&id).is_some_and(|w| w.next_try > Instant::now()) {
+                continue;
+            }
             let started = match catalog::ingest_source(&self.conns[0], &id)? {
                 Some(_) => self.start_ingest(&id),
                 None => self.start_job(&id),
             };
             match started {
                 Ok(_) => {
-                    if self.waiting.remove(&id) {
-                        info!(job = %id, "topic is there now; job started");
+                    if let Some(w) = self.waiting.remove(&id) {
+                        info!(job = %id, waited_s = w.since.elapsed().as_secs(), "done waiting for {}; job started", w.reason);
                     }
                 }
+                // Not the view's fault: the worker waits the outage out and starts it again (#27).
+                Err(e) if crate::lake::is_catalog_unavailable(&e) => return Err(e),
                 Err(e) if crate::lake::is_conflict(&e) => {
                     warn!(job = %id, error = %format!("{e:#}"), "lease race; retrying on next refresh");
                 }
-                // A topic created after the view started: wait for it, as Kafka consumers do.
-                Err(e) if crate::sources::kafka::is_topic_missing(&e) => {
-                    if self.waiting.insert(id.clone()) {
-                        warn!(job = %id, error = %format!("{e:#}"), "waiting for the topic; retrying every refresh");
-                    }
+                // A topic created after the view started: wait for it, as Kafka consumers do. Checked every
+                // refresh: the check is one metadata request.
+                Err(e) if crate::sources::kafka::is_topic_missing(&e) => self.wait_for(&id, "the topic", Duration::ZERO, &e),
+                // Brokers that cannot be reached at all: wait for them too (#26), with backoff, since each try
+                // waits for a connection.
+                Err(e) if crate::sources::kafka::is_brokers_unreachable(&e) => {
+                    let next = self.waiting.get(&id).filter(|w| w.reason == "the Kafka brokers").map_or(Waiting::FIRST_BACKOFF, |w| (w.backoff * 2).min(Waiting::MAX_BACKOFF));
+                    self.wait_for(&id, "the Kafka brokers", next, &e);
                 }
                 // Also when the view was stopped or dropped while it started (a dbt --full-refresh drops and
                 // creates views while workers run them): then there is nothing to mark, and this worker carries
@@ -859,6 +961,22 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Records that view `id` waits for `reason`, to try again after `backoff`; logged when the wait begins
+    /// or its reason changes.
+    fn wait_for(&mut self, id: &str, reason: &'static str, backoff: Duration, e: &anyhow::Error) {
+        let now = Instant::now();
+        match self.waiting.get_mut(id) {
+            Some(w) if w.reason == reason => {
+                w.backoff = backoff;
+                w.next_try = now + backoff;
+            }
+            _ => {
+                warn!(job = %id, error = %format!("{e:#}"), retry_in_s = backoff.as_secs(), "waiting for {reason}");
+                self.waiting.insert(id.to_string(), Waiting { reason, since: now, backoff, next_try: now + backoff });
+            }
+        }
     }
 
     /// One placement round: claims, or else handoffs (never both, so a handoff never works from ownership a
@@ -1295,6 +1413,7 @@ impl Worker {
                 )),
                 Ok(s) => staged.push((id.clone(), s)),
                 Err(e) if e.downcast_ref::<StopJob>().is_some() => stopped.push((id.clone(), format!("{e:#}"))),
+                Err(e) if crate::lake::is_catalog_unavailable(&e) => return Err(e),
                 Err(e) if !catalog::holds_lease(&conns[0], id, &cfg.worker_id, jobs[id].lease)? => {
                     stopped.push((id.clone(), format!("{e:#}")))
                 }

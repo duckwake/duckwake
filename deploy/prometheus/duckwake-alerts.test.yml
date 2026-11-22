@@ -3,6 +3,53 @@ rule_files:
   - duckwake-alerts.yml
 evaluation_interval: 1m
 tests:
+  # A worker waiting out a catalog outage fires DuckWakeCatalogUnreachable, not DuckWakeWorkerRestarting; one that
+  # is down for another reason fires DuckWakeWorkerRestarting.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_worker_up{job="duckwake",instance="w1:9464",worker="w1"}'
+        values: '0x10'
+      - series: 'duckwake_catalog_reachable{job="duckwake",instance="w1:9464",worker="w1"}'
+        values: '0x10'
+      - series: 'duckwake_worker_up{job="duckwake",instance="w2:9464",worker="w2"}'
+        values: '0x10'
+      - series: 'duckwake_catalog_reachable{job="duckwake",instance="w2:9464",worker="w2"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DuckWakeCatalogUnreachable
+        exp_alerts:
+          - exp_labels: {severity: critical, job: duckwake, instance: "w1:9464", worker: w1}
+            exp_annotations:
+              summary: "Worker w1 cannot reach the catalog"
+              description: "The worker cannot reach PostgreSQL, the DuckLake catalog, and waits for it: no view on it commits. It resumes from its checkpoints on its own once the catalog answers."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakecatalogunreachable
+      - eval_time: 5m
+        alertname: DuckWakeWorkerRestarting
+        exp_alerts:
+          - exp_labels: {severity: critical, job: duckwake, instance: "w2:9464", worker: w2}
+            exp_annotations:
+              summary: "DuckWake worker w2 keeps failing"
+              description: "The supervised worker failed and restarted at least 3 times in 15 minutes, or is waiting to restart. duckwake_worker_status() shows the last error."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeworkerrestarting
+
+  # Views that cannot start for 5 minutes; none waiting never fires.
+  - interval: 1m
+    input_series:
+      - series: 'duckwake_views_waiting{job="duckwake",instance="w1:9464",worker="w1"}'
+        values: '3x10'
+      - series: 'duckwake_views_waiting{job="duckwake",instance="w2:9464",worker="w2"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: DuckWakeViewsWaiting
+        exp_alerts:
+          - exp_labels: {severity: warning, job: duckwake, instance: "w1:9464", worker: w1}
+            exp_annotations:
+              summary: "3 views on worker w1 cannot start"
+              description: "Their topic does not exist or no Kafka broker answers; duckwake jobs shows what each waits for (waiting_for). They start on their own once it is there."
+              runbook_url: https://github.com/duckwake/duckwake/blob/main/docs/alerts.md#duckwakeviewswaiting
+
   # A view with events waiting and no new epoch is stuck; an idle one (no lag) is not, however old its events.
   - interval: 1m
     input_series:
