@@ -21,7 +21,7 @@ CREATE TEMP TABLE ep AS
          regexp_extract(line, ' commit_ms=(\\d+)', 1)::INT AS commit_ms,
          regexp_extract(line, 'poll_stage_ms=(\\d+)', 1)::INT AS stage_ms,
          regexp_extract(line, 'attempts=(\\d+)', 1)::INT AS attempts
-  FROM log WHERE line LIKE '%epoch committed%job=soak_windows %';
+  FROM log WHERE line LIKE '%epoch committed%job=analytics.soak_windows %';
 CREATE TEMP TABLE lg AS
   WITH log AS (SELECT unnest(string_split(content, chr(10))) AS line FROM read_text('$OUT/worker.log'))
   SELECT regexp_extract(line, '^(\\S+)', 1)::TIMESTAMPTZ::TIMESTAMP AS ts, line FROM log WHERE line LIKE '20%';

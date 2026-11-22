@@ -71,8 +71,8 @@
   {% set jobs = duckwake._jobs() %}
   {% for r in readers %}
     {% set rel = api.Relation.create(database=r.database, schema=r.schema, identifier=r.alias) %}
-    {% if rel.identifier in jobs %}
-      {% set name = duckwake._view_name(rel) %}
+    {% set name = duckwake._view_name(rel) %}
+    {% if name in jobs %}
       {{ log(name ~ ': dropped, to be created again after ' ~ model.name, info=True) }}
       {% do duckwake._call('stop', 'CALL duckwake_stop(' ~ duckwake._lit(name) ~ ')') %}
       {% do duckwake._call('drop', 'CALL duckwake_drop(' ~ duckwake._lit(name) ~ ')') %}

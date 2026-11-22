@@ -45,7 +45,7 @@ diff_count() {
   "$BIN" sql "SELECT count(*) AS n FROM (($1) EXCEPT ALL ($2))" 2>/dev/null | awk -F'|' 'NR==4 {gsub(/ /,"",$2); print $2}'
 }
 sink() { echo "SELECT ts, game_id, user_id, amount FROM lake.analytics.all_$1"; }
-dead() { echo "SELECT source_partition, source_offset, payload, error FROM lake.__duckwake.dead_letter WHERE job_id = 'all_$1'"; }
+dead() { echo "SELECT source_partition, source_offset, payload, error FROM lake.__duckwake.dead_letter WHERE job_id = 'analytics.all_$1'"; }
 rc=0
 for what in sink dead; do
   a=$(diff_count "$($what sql)" "$($what arrow)"); b=$(diff_count "$($what arrow)" "$($what sql)")

@@ -20,8 +20,8 @@ failed=0
 
 trap '[[ -n ${W:-} ]] && kill -9 "$W" 2>/dev/null || true' EXIT
 q() { "$BIN" sql --csv "$1" 2>/dev/null | sed -n 1p; }
-status() { q "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
-epoch() { q "SELECT coalesce(max(epoch), 0) FROM lake.__duckwake.checkpoints WHERE job_id = '$1'"; }
+status() { q "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
+epoch() { q "SELECT coalesce(max(epoch), 0) FROM lake.__duckwake.checkpoints WHERE job_id IN ('$1', 'analytics.$1')"; }
 metric() { curl -s "http://$METRICS/metrics" | awk -v m="$1" '$1 ~ "^"m"[{]" {print $2; exit}'; }
 check() {
   local what=$1 bound=$2 cond=$3 t0=$SECONDS

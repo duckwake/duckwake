@@ -93,15 +93,15 @@ fn retracting_sources_pick_their_sinks_and_refuse_what_is_not_supported_yet() {
     // MIN in a window over a source that can retract keeps each value's count.
     let (conn, sources) = super::setup();
     let window_min = "SELECT window_start, min(amount) AS lo FROM TUMBLE(changes, ts, INTERVAL 1 MINUTE) GROUP BY ALL";
-    let p = crate::plan::compile(&conn, "v", window_min, &sources).unwrap();
+    let p = crate::plan::compile(&conn, super::JOB, window_min, &sources).unwrap();
     assert!(p.merge_ops.iter().any(|(_, op)| *op == crate::plan::MergeOp::Counts), "{:?}", p.merge_ops);
 }
 
 #[test]
 fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
     let (conn, sources) = super::setup();
-    let compile = |sql: &str| crate::plan::compile(&conn, "v", sql, &sources);
-    let first_op = |p: &crate::plan::Plan| ops(&Circuit::compile(&crate::View { id: "v", sink: super::SINK, late_data: None, plan: p }).unwrap()).remove(0);
+    let compile = |sql: &str| crate::plan::compile(&conn, super::JOB, sql, &sources);
+    let first_op = |p: &crate::plan::Plan| ops(&Circuit::compile(&crate::View { id: super::JOB, sink: super::SINK, late_data: None, plan: p }).unwrap()).remove(0);
 
     // Alone, a lake table is the view's stream, read through its change feed.
     let p = compile("SELECT id, amount FROM shop.orders WHERE amount > 5").unwrap();
@@ -124,7 +124,7 @@ fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
     assert_eq!(p.query.columns.iter().filter(|c| c.as_str() == "window_start").count(), 1);
 
     // A lake table read with its updates and deletes retracts: keyless rows are counted, the rest upserted.
-    let last_op = |sql: &str| ops(&Circuit::compile(&crate::View { id: "v", sink: super::SINK, late_data: None, plan: &compile(sql).unwrap() }).unwrap()).pop().unwrap();
+    let last_op = |sql: &str| ops(&Circuit::compile(&crate::View { id: super::JOB, sink: super::SINK, late_data: None, plan: &compile(sql).unwrap() }).unwrap()).pop().unwrap();
     let p = compile("SELECT id, amount, _commit_ts FROM shop.accounts WHERE amount > 5").unwrap();
     assert_eq!(p.retracting, ["shop.accounts"]);
     assert_eq!(first_op(&p), "ChangeFeed(shop.accounts)");
@@ -148,7 +148,7 @@ fn lake_inputs_are_change_feeds_alone_and_lookups_next_to_kafka() {
 #[test]
 fn aggregates_not_supported_yet_are_refused_with_what_is() {
     let (conn, sources) = super::setup();
-    let err = |sql: &str| crate::plan::compile(&conn, "v", sql, &sources).unwrap_err().to_string();
+    let err = |sql: &str| crate::plan::compile(&conn, super::JOB, sql, &sources).unwrap_err().to_string();
     let e = err("SELECT game_id, sum(DISTINCT amount) AS s FROM clicks GROUP BY ALL");
     assert!(e.contains("count(DISTINCT ...) is"), "{e}");
     // An aggregate outside the list names the ones that are supported.

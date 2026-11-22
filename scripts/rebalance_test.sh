@@ -27,7 +27,7 @@ trap 'for w in w1 w2 w3; do [[ -f $OUT/$w.pid ]] && kill -9 "$(pid $w)" 2>/dev/n
 # "view owner" per view; "-" when unassigned.
 owners() {
   local q="" v
-  for v in "${VIEWS[@]}"; do q+="${q:+ UNION ALL }SELECT '$v', coalesce(owner_worker, '-') FROM lake.__duckwake.lease_$v"; done
+  for v in "${VIEWS[@]}"; do q+="${q:+ UNION ALL }SELECT '$v', coalesce(owner_worker, '-') FROM lake.__duckwake.\"lease_analytics.$v\""; done
   "$BIN" sql --csv "$q" 2>/dev/null | tr ',' ' '
 }
 owner() { owners | awk -v v="$1" '$1 == v {print $2}'; }
@@ -88,7 +88,7 @@ if (( settled )); then echo "settled: no handoffs in ${quiet}s ($extra load move
 else echo "FAIL: still moving views after $((3 * quiet))s"; failed=1; fi
 (( extra < ${#VIEWS[@]} )) || { echo "FAIL: $extra handoffs after the counts evened out"; failed=1; }
 # No view handed off twice within its cooldown (handoff times per view, in seconds).
-cat "$OUT"/w*.log | grep 'handed off view' | sed -E 's/^([^ ]+).*job=([a-z_]+).*/\1 \2/' | sort | python3 -c '
+cat "$OUT"/w*.log | grep 'handed off view' | sed -E 's/^([^ ]+).*job=([a-z_.]+).*/\1 \2/' | sort | python3 -c '
 import sys, datetime
 last, bad = {}, 0
 for line in sys.stdin:

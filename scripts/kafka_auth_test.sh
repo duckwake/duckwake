@@ -52,7 +52,7 @@ pid=$!
 for _ in $(seq 1 60); do [[ $(grep -c 'cannot start job' "$OUT/refused.log") -ge 3 ]] && break; sleep 0.5; done
 kill -TERM "$pid"; wait "$pid" || true
 for s in wrong unset plain; do
-  line=$(grep "cannot start job" "$OUT/refused.log" | grep "job=v_$s" | sed -n 1p)
+  line=$(grep "cannot start job" "$OUT/refused.log" | grep "job=analytics.v_$s" | sed -n 1p)
   if [[ -n $line ]]; then
     echo "$s: refused: $(echo "$line" | grep -oE 'error=.*' | cut -c1-200)"
   else

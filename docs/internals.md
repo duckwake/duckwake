@@ -10,7 +10,7 @@
 | JSON decode | `sources/kafka/decode.rs` (Arrow, per chunk, in the readers) for the forms it can match exactly; `decode::decode_sql` in staging for the rest, and for every message of a source with `"decode": "sql"`. |
 | Views as DBSP circuits: operator graph, incrementalization, SQL per operator | the `duckwake_circuit` crate (see below) |
 | Epoch loop: poll, watermark, compute, late routing, commit | `engine.rs` |
-| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>`; `failover.rs`: `worker_<id>` |
+| Control data in `lake.__duckwake` | `catalog.rs`: `sources`, `jobs`, `checkpoints`, `dead_letter`, `lease_<job>`, `state_<job>` (a view's job id is its `schema.table`, so these names are quoted: `"lease_analytics.clicks_per_min"`; an ingest job's is its source's name); `failover.rs`: `worker_<id>` |
 | Worker heartbeats and failover | `failover.rs` (finding 12) |
 | Maintenance between epochs | `maintenance.rs`: flush inlined data, merge files, expire snapshots, delete old files, prune checkpoints |
 | Differential tests | `verify.rs` |
@@ -23,11 +23,11 @@ The epoch transaction (`engine.rs::commit`), one per worker per epoch, covers al
 
 ```sql
 BEGIN;
-CALL lake.set_commit_message('duckwake', ..., extra_info => '{"worker":"w1","jobs":{"clicks_per_min":42}}');
-UPDATE lake.__duckwake.lease_clicks_per_min SET last_epoch = 42 WHERE owner_worker = 'w1' AND lease_epoch = 7;  -- 0 rows = fenced
-MERGE INTO lake.__duckwake.state_clicks_per_min s USING memory.main.out_clicks_per_min p ON ...;                -- partials
+CALL lake.set_commit_message('duckwake', ..., extra_info => '{"worker":"w1","jobs":{"analytics.clicks_per_min":42}}');
+UPDATE lake.__duckwake."lease_analytics.clicks_per_min" SET last_epoch = 42 WHERE owner_worker = 'w1' AND lease_epoch = 7;  -- 0 rows = fenced
+MERGE INTO lake.__duckwake."state_analytics.clicks_per_min" s USING memory.main."out_analytics.clicks_per_min" p ON ...;                -- partials
 INSERT INTO lake.analytics.clicks_per_min SELECT <final projection>, 42 FROM state WHERE __we <= <watermark>;  -- closed windows
-DELETE FROM lake.__duckwake.state_clicks_per_min WHERE __we <= <watermark>;
+DELETE FROM lake.__duckwake."state_analytics.clicks_per_min" WHERE __we <= <watermark>;
 INSERT INTO lake.analytics.clicks_late ...; INSERT INTO lake.__duckwake.dead_letter ...;
 INSERT INTO lake.__duckwake.checkpoints VALUES ('clicks_per_min', 42, '{"clicks":{"0":1832,...}}', <watermark>, ...);
 COMMIT;

@@ -34,7 +34,7 @@ fi
 psql_src() { psql_src_admin -d "$SRC_DB" "$@"; }
 DSN="host=localhost port=$SRC_PORT dbname=$SRC_DB user=$SRC_USER"
 sql() { "$BIN" sql --csv "$1" 2>>"$OUT/sql.log" | tail -1; }
-status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'"; }
+status() { sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')"; }
 lake_lsn() { sql "SELECT coalesce(max_by((source_offsets->'shop'->>'0')::UBIGINT, epoch), 0) FROM lake.__duckwake.checkpoints WHERE job_id = 'shop'"; }
 slot_lsn() { psql_src -c "SELECT coalesce((SELECT (confirmed_flush_lsn - '0/0')::bigint FROM pg_replication_slots WHERE slot_name = 'duckwake_shop'), 0)"; }
 WORKER=""
@@ -181,7 +181,7 @@ log "drop-source"
 stop_worker
 "$BIN" stop orders_by_status >/dev/null
 if out=$("$BIN" drop-source shop 2>&1); then echo "drop-source was not refused"; failed=1
-else echo "$out" | grep -o "views orders_by_status read source shop's tables[^;]*" || { echo "$out"; failed=1; }; fi
+else echo "$out" | grep -o "views analytics.orders_by_status read source shop's tables[^;]*" || { echo "$out"; failed=1; }; fi
 "$BIN" drop orders_by_status >/dev/null
 "$BIN" drop-source shop
 left=$(psql_src -c "SELECT (SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'duckwake_shop') + (SELECT count(*) FROM pg_publication WHERE pubname = 'duckwake_shop')")

@@ -68,9 +68,6 @@ enum Cmd {
         name: String,
         #[arg(long)]
         sql: String,
-        /// Deprecated: names the table separately, with NAME as the job id.
-        #[arg(long, hide = true)]
-        sink: Option<String>,
         #[arg(long)]
         late_data: Option<String>,
         #[arg(long, default_value = "ducklake")]
@@ -432,7 +429,6 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::CreateView {
             name,
             sql,
-            sink,
             late_data,
             checkpoint,
             epoch_interval,
@@ -446,9 +442,6 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
             upsert_key,
             upsert_version,
         } => {
-            if sink.is_some() {
-                eprintln!("warning: --sink is deprecated; name the view after its table: create-view analytics.<table>");
-            }
             let o = api::ViewOptions {
                 late_data,
                 checkpoint: Some(checkpoint),
@@ -462,7 +455,7 @@ pub fn main_with(args: Vec<std::ffi::OsString>) -> Result<()> {
                 upsert_key,
                 upsert_version,
             };
-            let (def, outcome, msg) = api::create_view(&open()?, &name, &sql, &o, sink.as_deref())?;
+            let (def, outcome, msg) = api::create_view(&open()?, &name, &sql, &o)?;
             use duckwake_core::catalog::Outcome;
             if matches!(outcome, Outcome::Created | Outcome::Replaced) {
                 println!("{msg} {:?}", def.plan.sink_columns);

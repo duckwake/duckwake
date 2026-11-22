@@ -20,7 +20,7 @@ log "per-epoch numbers (clicks_per_window)"
               round(quantile_cont(epoch(committed_at::TIMESTAMP - max_event_time), 0.5), 1) AS freshness_p50_s,
               round(quantile_cont(epoch(committed_at::TIMESTAMP - max_event_time), 0.95), 1) AS freshness_p95_s,
               max(lag) AS max_lag
-            FROM lake.__duckwake.checkpoints WHERE job_id = 'clicks_per_window' AND rows_in > 0"
+            FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.clicks_per_window' AND rows_in > 0"
 grep "epoch committed" "$OUT/worker.log" | grep clicks_per_window | sed -E 's/.*rows_in=([0-9]+).*stage_ms=([0-9]+) poll_stage_ms=([0-9]+) commit_ms=([0-9]+).*/rows_in=\1 stage_ms=\2 poll_stage_ms=\3 commit_ms=\4/' | tail -8
 log "data files per sink table"
 "$BIN" sql "SELECT 'clicks_per_window' AS t, count(*) AS files FROM ducklake_list_files('lake', 'clicks_per_window', schema => 'analytics')

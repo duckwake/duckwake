@@ -25,11 +25,14 @@ $B explain clicks_per_min              # the view's circuit and one epoch's SQL
 
 ## Views and sources
 
-A view is named by the DuckLake table it maintains (`analytics.clicks_per_min`; a bare name means the
-`main` schema), and `create-view` fails if that table already exists. Its job id is the table name, so the
-other commands take either `clicks_per_min` or `analytics.clicks_per_min`. `drop` removes the view's table
-too (`--keep-table` keeps it); a late-data table is kept. The old `--sink` flag still works but is
-deprecated. Control data lives in `lake.__duckwake`, and output rows carry `_duckwake_epoch`. A lake created
+A view is named by the DuckLake table it maintains, `schema.table` (`analytics.clicks_per_min`; a bare name in
+`create-view` means the `main` schema), and `create-view` fails if that table already exists. That name is its
+job id, so two schemas can each have a view of the same table name. The other commands take
+`analytics.clicks_per_min` (or `lake.analytics.clicks_per_min`), or the bare `clicks_per_min` when only one
+schema has a view of that name; when several do, the command fails and lists them. `drop` removes the view's
+table too (`--keep-table` keeps it); a late-data table is kept. A lake created by DuckWake 0.2, which named a
+view by its table alone, is refused by workers and by `create-view` until those views are dropped
+(`duckwake drop <view>` still works on them) and created again. Control data lives in `lake.__duckwake`, and output rows carry `_duckwake_epoch`. A lake created
 before that rename (`__stream`, `_stream_epoch`) is migrated the first time a new binary opens it.
 
 Sources decode JSON with Arrow (`"decode": "auto"`, the default) when every column is TIMESTAMP, VARCHAR,

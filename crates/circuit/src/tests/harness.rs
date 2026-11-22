@@ -1,6 +1,6 @@
 //! Runs a view epoch by epoch through its circuit's own SQL against an in-memory lake, and checks the view's
 //! table against the view run as one batch query over every row so far: QΔ = D ∘ Q ∘ I, end to end.
-use super::{setup, SINK};
+use super::{setup, JOB, SINK};
 use crate::codegen::{staging, EpochCtx, SourceInput};
 use crate::plan;
 use crate::sql::{ident, quote_table, state_table};
@@ -49,8 +49,8 @@ fn rows(source: &str, epochs: &[(i64, i64)], e: usize) -> String {
 pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
     let (c, sources) = setup();
     c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
-    let p = plan::compile(&c, "v", sql, &sources).unwrap();
-    let circuit = Circuit::compile(&View { id: "v", sink: SINK, late_data: None, plan: &p }).unwrap();
+    let p = plan::compile(&c, JOB, sql, &sources).unwrap();
+    let circuit = Circuit::compile(&View { id: JOB, sink: SINK, late_data: None, plan: &p }).unwrap();
     let names_of = p.sources();
     let cols: Vec<Vec<(String, String)>> = names_of.iter().map(|n| sources[n].columns.clone()).collect();
     let names = |cs: &[(String, String)]| cs.iter().map(|(n, _)| ident(n)).collect::<Vec<_>>().join(", ");
@@ -72,7 +72,7 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
         format!("(SELECT {n} FROM (SELECT {n}, sum(__w)::BIGINT AS __n FROM {} GROUP BY ALL HAVING sum(__w) > 0) t, range(t.__n))", seen(k))
     };
     if !p.state_columns.is_empty() {
-        c.execute_batch(&format!("CREATE TABLE {} ({})", state_table("v"), typed(&p.state_columns))).unwrap();
+        c.execute_batch(&format!("CREATE TABLE {} ({})", state_table(JOB), typed(&p.state_columns))).unwrap();
     }
     let windowed = p.window.is_some();
     // Event time is the row number in seconds and the watermark the newest event time, so no row is late. A
@@ -87,7 +87,7 @@ pub(crate) fn check_view(sql: &str, epochs: &[(i64, i64)], pipelined: bool) {
         }
     };
     let ctx = |e: usize| EpochCtx {
-        job: "v",
+        job: JOB,
         plan: &p,
         sink: quote_table(SINK).unwrap(),
         late_table: None,
@@ -226,8 +226,8 @@ fn order_messages(epochs: &[(i64, i64)], e: usize) -> String {
 pub(crate) fn check_upsert(sql: &str, upsert: &crate::plan::UpsertSpec, epochs: &[(i64, i64)], pipelined: bool) {
     let (c, sources) = setup();
     c.execute_batch("INSERT INTO games SELECT 'g' || i, ['Aurora', 'Basalt'][i % 2 + 1] FROM range(4) t(i)").unwrap();
-    let p = plan::compile_with(&c, "v", sql, &sources, Some(upsert)).unwrap();
-    let circuit = Circuit::compile(&View { id: "v", sink: SINK, late_data: None, plan: &p }).unwrap();
+    let p = plan::compile_with(&c, JOB, sql, &sources, Some(upsert)).unwrap();
+    let circuit = Circuit::compile(&View { id: JOB, sink: SINK, late_data: None, plan: &p }).unwrap();
     let columns = sources["orders"].columns.clone();
     let typed = |cs: &[(String, String)]| cs.iter().map(|(n, t)| format!("{} {t}", ident(n))).collect::<Vec<_>>().join(", ");
     let names = columns.iter().map(|(n, _)| ident(n)).collect::<Vec<_>>().join(", ");
@@ -238,13 +238,13 @@ pub(crate) fn check_upsert(sql: &str, upsert: &crate::plan::UpsertSpec, epochs: 
          CREATE TABLE memory.main.seen (_partition INTEGER, _offset BIGINT, _key VARCHAR, {}, _err VARCHAR);",
         quote_table(SINK).unwrap(),
         typed(&p.sink_columns),
-        state_table("v"),
+        state_table(JOB),
         typed(&p.state_columns),
         typed(&columns),
     ))
     .unwrap();
     let ctx = |e: usize| EpochCtx {
-        job: "v",
+        job: JOB,
         plan: &p,
         sink: quote_table(SINK).unwrap(),
         late_table: None,

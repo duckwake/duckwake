@@ -18,3 +18,7 @@ models:
       +materialized: streaming_view
       +schema: analytics
       +epoch_interval: "{{ var('epoch_interval', '2s') }}"
+    staging:
+      +materialized: streaming_view
+      +schema: staging
+      +epoch_interval: "{{ var('epoch_interval', '2s') }}"

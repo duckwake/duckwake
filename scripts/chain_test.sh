@@ -86,7 +86,7 @@ echo "chain_per_30s: $rows closed 30 s windows verified"
 log "dropping a view another view reads is refused"
 "$BIN" stop chain_per_10s >/dev/null
 if out=$("$BIN" drop chain_per_10s 2>&1); then echo "drop of chain_per_10s was not refused"; failed=1
-elif [[ $out == *"is read by chain_per_30s"* ]]; then echo "$out" | sed -n 1p
+elif [[ $out == *"is read by analytics.chain_per_30s"* ]]; then echo "$out" | sed -n 1p
 else echo "drop of chain_per_10s failed for another reason: $out"; failed=1; fi
 "$BIN" start chain_per_10s --worker w1 >/dev/null
 
@@ -120,7 +120,7 @@ log "an update to a lake table a windowed view reads, after its window closed, i
 "$BIN" start orders_big --worker w1 >/dev/null
 "$BIN" sql "INSERT INTO lake.shop.orders SELECT i, i FROM range(20) t(i)" >/dev/null; sleep 6
 "$BIN" sql "UPDATE lake.shop.orders SET amount = 0 WHERE id = 10" >/dev/null; sleep 6
-status() { "$BIN" sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id = '$1'" --csv 2>/dev/null | tail -1; }
+status() { "$BIN" sql "SELECT status FROM lake.__duckwake.jobs WHERE job_id IN ('$1', 'analytics.$1')" --csv 2>/dev/null | tail -1; }
 [[ $(status orders_big) == running ]] && echo "orders_big: still running" || { echo "orders_big is $(status orders_big), not running"; failed=1; }
 corrections=$("$BIN" sql --csv "SELECT count(*) FROM lake.analytics.orders_big_late WHERE _duckwake_weight = -1 AND id = 10" 2>/dev/null | tail -1)
 [[ $corrections == 1 ]] && echo "orders_big: the update of order 10 is a late correction" || { echo "orders_big: $corrections late corrections for order 10, not 1"; failed=1; }

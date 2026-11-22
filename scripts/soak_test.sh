@@ -85,7 +85,7 @@ SUP_P=$!
 
 echo "ts,elapsed_s,win_epoch,win_lag,win_freshness_s,spend_epoch,spend_lag,spend_freshness_s,snapshots,checkpoint_rows,spend_files,win_files,spend_rows,catalog_mb,inlined_rows,dead_tuples,snapshot_change_rows,data_file_rows,worker_rss_mb,lake_data_mb,topic_mb,worker_restarts" >"$OUT/metrics.csv"
 LAKE_Q="WITH last AS (SELECT * FROM __duckwake.checkpoints QUALIFY row_number() OVER (PARTITION BY job_id ORDER BY epoch DESC) = 1),
-  w AS (SELECT * FROM last WHERE job_id = 'soak_windows'), s AS (SELECT * FROM last WHERE job_id = 'soak_spend')
+  w AS (SELECT * FROM last WHERE job_id = 'analytics.soak_windows'), s AS (SELECT * FROM last WHERE job_id = 'analytics.soak_spend')
   SELECT (SELECT epoch FROM w), (SELECT lag FROM w), (SELECT round(epoch(committed_at::TIMESTAMP - max_event_time), 1) FROM w),
          (SELECT epoch FROM s), (SELECT lag FROM s), (SELECT round(epoch(committed_at::TIMESTAMP - max_event_time), 1) FROM s),
          (SELECT count(*) FROM ducklake_snapshots('lake')), (SELECT count(*) FROM __duckwake.checkpoints),

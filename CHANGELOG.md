@@ -89,6 +89,16 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Changed
 
+- **A view's id is its `schema.table`** ([design](docs/design/view-names.md)), where it was the table name
+  alone, so two schemas can each have a view of the same table name (`a.daily` and `b.daily`). Commands and
+  functions take `schema.table`, or the bare table name when only one schema has a view of that name; when
+  several do, they fail and list them. In a view's SQL a bare name is a table of `main`, as DuckDB reads it.
+  The `view` metrics label, the `job` log field, `duckwake_jobs().job_id` and the control tables
+  (`__duckwake."lease_analytics.daily"`) carry the full name. dbt-duckwake compares views by `schema.table`, and
+  its example adds `staging.game_totals` beside `analytics.game_totals`. Gate: `scripts/names_test.sh`.
+- **Breaking:** a lake created by 0.2 is not migrated. Workers and `create-view` refuse it, naming the views
+  whose ids have no schema; drop those views (`duckwake drop <view>` still works on them) and create them again.
+- The deprecated `--sink` flag of `create-view`, which named a view's job apart from its table, is removed.
 - `verify` lists up to five differing rows on each side when a view's output does not match, not only their counts.
 - A Kafka message without a value (a tombstone) is a dead letter with the error `tombstone` instead of
   `invalid json`, in the views that do not read its source as upserts.

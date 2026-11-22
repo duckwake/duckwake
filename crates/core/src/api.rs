@@ -65,17 +65,15 @@ pub fn create_source(conn: &Connection, name: &str, kind: &str, options: &str) -
     crate::sources::create(conn, name, kind, options)
 }
 
-/// Creates a continuous view: the table `name` (a bare name means the `main` schema) and its job. `sink` is the
-/// deprecated form that names the table separately, with `name` as the job id. The message starts with what
-/// happened (`created`, `unchanged`, `altered` or `replaced`), for scripts and dbt to act on.
+/// Creates a continuous view: the table `name` (a bare name means the `main` schema) and its job, whose id is
+/// `schema.table`. The message starts with what happened (`created`, `unchanged`, `altered` or `replaced`), for scripts and dbt to act on.
 pub fn create_view(
     conn: &Connection,
     name: &str,
     sql: &str,
     o: &ViewOptions,
-    sink: Option<&str>,
 ) -> Result<(JobDef, catalog::Outcome, String)> {
-    let (job_id, table) = catalog::view_names(name, sink)?;
+    let (job_id, table) = catalog::view_names(name)?;
     let (def, outcome) = catalog::create_view(
         conn,
         &catalog::CreateView {

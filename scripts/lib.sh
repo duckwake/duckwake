@@ -107,7 +107,7 @@ start_views() {
 committed() {
   "$BIN" sql "SELECT coalesce(sum(o::BIGINT), 0) AS n FROM (
       SELECT unnest(json_extract(source_offsets, '\$.${2:-clicks}.*')) AS o FROM (
-        SELECT source_offsets FROM lake.__duckwake.checkpoints WHERE job_id = '$1' ORDER BY epoch DESC LIMIT 1))" \
+        SELECT source_offsets FROM lake.__duckwake.checkpoints WHERE job_id IN ('$1', 'analytics.$1') ORDER BY epoch DESC LIMIT 1))" \
     2>/dev/null | awk -F'|' 'NR==4 {gsub(/ /,"",$2); print $2}'
 }
 

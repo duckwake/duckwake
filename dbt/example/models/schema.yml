@@ -22,6 +22,11 @@ models:
         data_tests: [unique, not_null]
   - name: spend_by_game
     data_tests: [duckwake.duckwake_verified]
+  - name: staging_game_totals
+    data_tests: [duckwake.duckwake_verified]
+    columns:
+      - name: game_id
+        data_tests: [unique, not_null]
   - name: account_totals
     data_tests: [duckwake.duckwake_verified]
   - name: last_click

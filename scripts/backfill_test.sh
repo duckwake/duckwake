@@ -25,17 +25,17 @@ snapshot() { sql "SELECT id FROM ducklake_current_snapshot('lake')"; }
 position() {
   sql "SELECT coalesce(min(json_extract(source_offsets, '\$.\"' || k || '\".\"0\"')::BIGINT), 0) FROM (
          SELECT source_offsets, unnest(json_keys(source_offsets)) AS k FROM lake.__duckwake.checkpoints
-         WHERE job_id = '$1' ORDER BY epoch DESC LIMIT 1)"
+         WHERE job_id IN ('$1', 'analytics.$1') ORDER BY epoch DESC LIMIT 1)"
 }
 cursor() {
   sql "SELECT max(json_extract(source_offsets, '\$.\"' || k || '\".\"1\"')::BIGINT) FROM (
          SELECT source_offsets, unnest(json_keys(source_offsets)) AS k FROM lake.__duckwake.checkpoints
-         WHERE job_id = '$1' ORDER BY epoch DESC LIMIT 1)"
+         WHERE job_id IN ('$1', 'analytics.$1') ORDER BY epoch DESC LIMIT 1)"
 }
 # Whether view $1 has backfilled and read its input table $2.$3 up to snapshot $4.
 caught_up() {
   local p; p=$(position "$1")
-  [[ -z $(cursor "$1") && $(sql "SELECT count(*) FROM lake.__duckwake.checkpoints WHERE job_id = '$1'") != 0 ]] || return 1
+  [[ -z $(cursor "$1") && $(sql "SELECT count(*) FROM lake.__duckwake.checkpoints WHERE job_id IN ('$1', 'analytics.$1')") != 0 ]] || return 1
   (( p >= $4 )) || [[ $(sql "SELECT count(*) FROM ducklake_table_changes('lake', '$2', '$3', $((p + 1)), $4)") == 0 ]]
 }
 wait_for() {
@@ -138,7 +138,7 @@ for i in $(seq 1 "$KILLS"); do
     wait "$pid" 2>/dev/null || true
   fi
   if verify_views quiet; then c=$(cursor bf_rich)
-    if [[ $(sql "SELECT count(*) FROM lake.__duckwake.checkpoints WHERE job_id = 'bf_rich'") == 0 ]]; then c="not started"
+    if [[ $(sql "SELECT count(*) FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.bf_rich'") == 0 ]]; then c="not started"
     elif [[ -n $c ]]; then c="at row $c"; else c="done"; fi
     echo "run $i: $how; bf_rich backfill $c; all ${#VIEWS[@]} verify"
   else echo "run $i: $how; VERIFY FAILED"; failed=1; fi
@@ -165,9 +165,9 @@ log "a view stopped and started again ten times in a row while its table changes
 # it left, on the commit thread when epochs are pipelined, and must not take the new run's with them.
 generate $((ROWS + 300000))
 for i in $(seq 1 10); do
-  released=$(grep -c 'job released.*job=bf_bands' "$OUT/worker.log" || true)
+  released=$(grep -c 'job released.*job=analytics.bf_bands' "$OUT/worker.log" || true)
   "$BIN" stop bf_bands >/dev/null
-  for _ in $(seq 1 60); do (( $(grep -c 'job released.*job=bf_bands' "$OUT/worker.log" || true) > released )) && break; sleep 0.5; done
+  for _ in $(seq 1 60); do (( $(grep -c 'job released.*job=analytics.bf_bands' "$OUT/worker.log" || true) > released )) && break; sleep 0.5; done
   "$BIN" start bf_bands --worker w1 >/dev/null
   sleep "0.$((RANDOM % 10))"
 done
@@ -185,6 +185,9 @@ held=$(position bf_rich)
 generate $((ROWS + 500000))
 sleep 20
 stop_generating
+# Maintenance runs its tasks in turn, and a flush that conflicts with the generator's inserts retries for up to
+# about 12 s before expiry gets its turn: wait for the first expiry rather than assume it fell in the window.
+for _ in $(seq 1 60); do (( $(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')") > 1 )) && break; sleep 1; done
 oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
 echo "bf_rich paused at snapshot $held; the lake's oldest snapshot is $oldest of $(snapshot); commit times recorded for $(sql "SELECT count(*) FROM lake.__duckwake.snapshot_times") of the $((oldest - 1)) expired (those that wrote rows)"
 (( oldest <= held )) || { echo "maintenance expired snapshots bf_rich still needs"; failed=1; }
@@ -198,16 +201,16 @@ log "reset past retention, and a reset of a view another view reads insert-only"
 # Maintenance back to its defaults, so the epochs committed from here on keep their snapshots.
 stop_worker; start_worker
 "$BIN" stop bf_by_game >/dev/null
-for _ in $(seq 1 30); do grep -q 'job released.*job=bf_by_game' "$OUT/worker.log" && break; sleep 1; done
+for _ in $(seq 1 30); do grep -q 'job released.*job=analytics.bf_by_game' "$OUT/worker.log" && break; sleep 1; done
 if out=$("$BIN" reset bf_by_game --to-epoch 1 2>&1); then echo "reset to an expired epoch was accepted: $out"; failed=1
 else echo "refused: $(grep -o 'no snapshot.*expired' <<<"$out" | head -1)"; fi
 grep -q "has been expired" <<<"$out" || failed=1
 "$BIN" start bf_by_game --worker w1 >/dev/null
 generate $((ROWS + 800000)); sleep 12; stop_generating
 "$BIN" stop bf_windows >/dev/null
-for _ in $(seq 1 30); do grep -q 'job released.*job=bf_windows' "$OUT/worker.log" && break; sleep 1; done
+for _ in $(seq 1 30); do grep -q 'job released.*job=analytics.bf_windows' "$OUT/worker.log" && break; sleep 1; done
 before=$(sql "SELECT count(*) FROM lake.analytics.bf_windows_10s")
-to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'bf_windows'") - 2 ))
+to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'analytics.bf_windows'") - 2 ))
 "$BIN" reset bf_windows --to-epoch "$to" 2>&1 | tee "$OUT/reset.txt" | sed -n 1p || failed=1
 grep -q "bf_windows_10s" "$OUT/reset.txt" || { echo "the reset did not recompute bf_windows_10s"; failed=1; }
 "$BIN" start bf_windows --worker w1 >/dev/null
@@ -221,9 +224,9 @@ verify_views bf_windows bf_windows_10s bf_by_game bf_busy || failed=1
 log "reset to epoch 0 after the start snapshot expired, and a rerun of a latest view's create"
 stop_view() {
   "$BIN" stop "$1" >/dev/null
-  for _ in $(seq 1 30); do grep -q "job released.*job=$1" "$OUT/worker.log" && break; sleep 1; done
+  for _ in $(seq 1 30); do grep -q "job released.*job=analytics.$1 " "$OUT/worker.log" && break; sleep 1; done
 }
-s0=$(sql "SELECT json_extract(definition, '\$.start_snapshot') FROM lake.__duckwake.jobs WHERE job_id = 'bf_rich'")
+s0=$(sql "SELECT json_extract(definition, '\$.start_snapshot') FROM lake.__duckwake.jobs WHERE job_id = 'analytics.bf_rich'")
 oldest=$(sql "SELECT min(snapshot_id) FROM ducklake_snapshots('lake')")
 (( s0 < oldest )) && echo "bf_rich's start snapshot $s0 has expired (oldest $oldest)" || { echo "bf_rich's start snapshot $s0 is still there: nothing to test"; failed=1; }
 for v in bf_rich bf_latest; do

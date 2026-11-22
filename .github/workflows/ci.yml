@@ -80,6 +80,8 @@ jobs:
           - { name: retract, run: scripts/retract_test.sh }
           # F3: backfill of new views over lake inputs, retention for paused views, reset cascade.
           - { name: backfill, run: scripts/backfill_test.sh }
+          # View names: views of one table name in two schemas, side by side, with crashes; a lake from 0.2 refused.
+          - { name: names, run: scripts/names_test.sh }
           - { name: upsert, run: scripts/upsert_test.sh }
           # C3: the same over Debezium change events, and an event with a value Debezium left out.
           - { name: debezium, run: FORMAT=debezium scripts/upsert_test.sh }
@@ -109,6 +111,7 @@ jobs:
           - { name: chain pipelined, run: scripts/chain_test.sh, flags: true }
           - { name: retract pipelined, run: scripts/retract_test.sh, flags: true }
           - { name: backfill pipelined, run: scripts/backfill_test.sh, flags: true }
+          - { name: names pipelined, run: scripts/names_test.sh, flags: true }
           - { name: upsert pipelined, run: scripts/upsert_test.sh, flags: true }
           - { name: debezium pipelined, run: FORMAT=debezium scripts/upsert_test.sh, flags: true }
           - { name: pg ingest pipelined, run: scripts/pg_ingest_test.sh, flags: true }
