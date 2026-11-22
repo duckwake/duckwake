@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "duckwake"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "duckwake_circuit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "duckdb",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "duckwake_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arrow-json",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "duckwake_extension"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "duckdb",
  "duckwake_core",
