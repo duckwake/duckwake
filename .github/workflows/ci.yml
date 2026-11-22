@@ -27,6 +27,11 @@ jobs:
           components: clippy
       # The bundled DuckDB takes ~15 min to compile cold; the cache keeps it.
       - uses: Swatinem/rust-cache@v2
+      # libduckdb-sys unpacks DuckDB's sources once into target/duckdb-sources/<hash>, marked done by `.complete`.
+      # The cache can come back with that tree but not its marker; a change of dependency features (a new crate)
+      # then reruns the build script, whose unpack fails on the existing directory ("Directory not empty", CI
+      # 2026-11-22). Drop any tree without its marker so it is unpacked again.
+      - run: for d in target/duckdb-sources/*/; do [[ -d $d && ! -f $d.complete ]] && rm -rf "$d"; done; true
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
       - run: cargo build --release --bins --examples
