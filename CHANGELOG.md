@@ -13,7 +13,8 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   `approx_count_distinct` and the quantiles keep each value's count, so a deleted extreme gives way to the next
   value. A change to a window already closed is a late correction: the late-data table gets it with a
   `_duckwake_weight` of -1 (or +1), or `rows_late` counts it, and `verify` adds it back. Views created before
-  keep reading insert-only. Gate: `scripts/retract_test.sh`.
+  keep reading insert-only. A reset of a view empties the windowed views that read it, which backfill again, as
+  before: its rewrite of closed windows would otherwise only be late corrections. Gate: `scripts/retract_test.sh`.
 - Debezium sources ([#42](https://github.com/duckwake/duckwake/issues/42)): `"format": "debezium"` reads a topic of
   Debezium change events, with or without `schemas.enable`. Its views set `upsert_key` to the table's primary
   key: inserts, snapshot reads and updates replace a key's row from `after`, deletes remove it (keyed by the

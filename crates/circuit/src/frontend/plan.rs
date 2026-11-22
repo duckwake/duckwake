@@ -48,11 +48,15 @@ pub enum MergeOp {
 
 /// The `MAP(value, BIGINT)` of a list of `{key: value, value: count}` entries, the counts of each value summed
 /// and the values whose count is 0 left out.
+///
+/// A correlated subquery that unnests the list and sums by key with a hash aggregate: linear in the entries.
+/// The lambda form it replaced (each distinct key filtering the whole list) was quadratic, and a window holding
+/// 200,000 backfilled rows spent minutes per merge (CI, 2026-11-21).
 fn sum_counts(entries: &str) -> String {
     format!(
-        "map_from_entries(list_filter(list_transform(list_distinct(list_transform({entries}, lambda e: e.key)), \
-         lambda k: struct_pack(key := k, value := CAST(list_sum(list_transform(list_filter({entries}, lambda e: e.key = k), \
-         lambda e: e.value)) AS BIGINT))), lambda e: e.value <> 0))"
+        "(SELECT map_from_entries(coalesce(list(struct_pack(key := __k, value := __n)), [])) FROM \
+         (SELECT __e.key AS __k, CAST(sum(__e.value) AS BIGINT) AS __n FROM (SELECT unnest({entries}) AS __e) \
+         GROUP BY ALL HAVING sum(__e.value) <> 0))"
     )
 }
 

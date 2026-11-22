@@ -162,12 +162,14 @@ echo "acc_windows: $((after - before)) late corrections of rows written after it
 (( after > before )) || { echo "no late correction for the changed rows"; failed=1; }
 verify_views || failed=1
 
-log "reset a view another view reads: the reader follows it through the change feed"
+log "reset a view other views read: its readers follow it through the change feed, and its windowed reader is recomputed"
 "$BIN" stop acc_by_game >/dev/null
 # Stopping does not fence: wait for the worker to let the view go before rewinding it.
 for _ in $(seq 1 30); do grep -q 'job released.*job=acc_by_game' "$OUT/worker.log" && break; sleep 1; done
 to=$(( $(sql "SELECT max(epoch) FROM lake.__duckwake.checkpoints WHERE job_id = 'acc_by_game'") / 2 ))
-"$BIN" reset acc_by_game --to-epoch "$to" | sed -n 1p
+out=$("$BIN" reset acc_by_game --to-epoch "$to"); echo "$out" | sed -n 1p
+# A reset rewrites rows of windows acc_game_windows has closed, which it would only take as late corrections.
+[[ $out == *"acc_game_windows read it"* ]] || { echo "the reset did not recompute acc_game_windows"; failed=1; }
 "$BIN" start acc_by_game --worker w1 >/dev/null
 wait_for acc_by_game shop accounts || failed=1
 wait_for acc_busy_games analytics acc_by_game || failed=1

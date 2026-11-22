@@ -1114,8 +1114,8 @@ fn checkpoints(conn: &Connection, job: &str, source: &str, order: &str) -> Resul
 /// The next start replays from that checkpoint's offsets.
 ///
 /// The views that read its table and take its changes (retractions) follow the reset through the change
-/// feed. Those that read a table changed by the reset insert-only, directly or through other views, cannot:
-/// they are recomputed in the same transaction (`recompute_view`) and returned.
+/// feed. Those that read a table changed by the reset insert-only, or window it, directly or through other
+/// views, are recomputed in the same transaction instead (`recompute_view`) and returned.
 pub fn reset(conn: &Connection, job: &str, to_epoch: i64) -> Result<Vec<String>> {
     let (def, status) = load_job(conn, job)?;
     if status == JobStatus::Running {
@@ -1191,9 +1191,10 @@ fn start_over(def: &mut JobDef) {
     def.start_commit_us = None;
 }
 
-/// The views a reset of `job` changes the input of, that read that input insert-only: among `job`'s readers
-/// and their readers in turn (every one of whose tables can lose rows), each with an insert-only input from
-/// `job` or from one of those readers.
+/// The views a reset of `job` changes the input of, that read that input insert-only or window it: among
+/// `job`'s readers and their readers in turn (every one of whose tables can lose rows), each with such an input
+/// from `job` or from one of those readers. A windowed view takes retractions (C4), but a reset rewrites rows of
+/// windows it has closed, which it would only take as late corrections: recomputing it keeps it exact.
 fn insert_only_readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
     let mut changed = vec![job.to_string()];
     let mut i = 0;
@@ -1208,7 +1209,8 @@ fn insert_only_readers(conn: &Connection, job: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for r in changed.iter().skip(1) {
         let (def, _) = load_job(conn, r)?;
-        if def.lake_inputs.iter().any(|l| !l.retracts && l.view.as_ref().is_some_and(|v| changed.contains(v))) {
+        let windowed = def.plan.is_windowed();
+        if def.lake_inputs.iter().any(|l| (!l.retracts || windowed) && l.view.as_ref().is_some_and(|v| changed.contains(v))) {
             out.push(r.clone());
         }
     }

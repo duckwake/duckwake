@@ -89,7 +89,7 @@ view runs without recomputing it. A limit of 0 removes it.
 | --- | --- |
 | `duckwake_start(view, worker :=)` | Start the view. On the server it runs on the server's worker; `worker := 'w2'` pins it to w2, and `worker := 'any'` leaves it to whichever live worker claims it. |
 | `duckwake_pause(view)` / `duckwake_stop(view)` | Stop the view. Its worker is fenced at once, so an epoch in flight does not land and `drop` or `reset` can follow straight away. `start` continues from the last checkpoint. |
-| `duckwake_reset(view, to_epoch)` | Rewind to an epoch and replay from there. Views that read this view's table with retractions follow the reset through its change feed; windowed views that read it insert-only are emptied and backfill again. A reset to an epoch whose snapshot has expired is refused. |
+| `duckwake_reset(view, to_epoch)` | Rewind to an epoch and replay from there. Views that read this view's table with retractions follow the reset through its change feed; windowed views that read it, and views that read it insert-only, are emptied and backfill again (a window already closed would take the reset only as late corrections). A reset to an epoch whose snapshot has expired is refused. |
 | `duckwake_drop(view, keep_table :=)` | Remove the view and its table (`keep_table := true` keeps the table). Dropping a view that another view reads is refused. |
 
 ## Workers
