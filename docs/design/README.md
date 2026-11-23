@@ -19,6 +19,7 @@ does today; when the two disagree, the code and those docs win.
 | [Worker rebalancing](worker-rebalancing.md) | Nov 12, 2026 | Sticky, incremental rebalancing of views across workers |
 | [dbt-duckwake](dbt-duckwake.md) | Nov 13, 2026 | SQL authoring through a dbt package instead of new DDL |
 | [View names](view-names.md) | Nov 22, 2026 | A view's id is `schema.table`, so two schemas can each have a view of one table name |
+| [Database sources as views](database-sources-as-views.md) | Nov 23, 2026 | Proposed: a database source as a definition, and each table's copy a select-only view |
 
 Comparisons with other engines come from their documentation and source as read on the dates given; check the
 originals before relying on a detail.

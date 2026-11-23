@@ -166,7 +166,7 @@ under load as well, and a planted bug that applies the transactions its snapshot
 - **A forked driver.** The replication protocol needs the MaterializeInc fork of rust-postgres (pinned) or pg\_walstream; upstream tokio-postgres has no replication support. The decoding is small enough to own if both stall. Materialize's own repository is BSL-licensed, so its sources are read for design only.
 - **Latency.** Two hops (ingest, then view) put about one extra epoch between a database commit and a view's output. A later step can let views on the same worker read the ingest epoch's changes directly.
 - **Large transactions** are buffered whole before an epoch can close (no protocol v2 streaming in v1). A transaction larger than memory needs spilling to the staging catalog.
-- **Open:** should captured tables be addressed as lake tables (`lake.shop.orders`, the plan) or as source names in `FROM` like Kafka sources? The plan keeps them lake tables, so the same SQL works in a batch query.
+- **Open:** should captured tables be addressed as lake tables (`lake.shop.orders`, the plan) or as source names in `FROM` like Kafka sources? The plan keeps them lake tables, so the same SQL works in a batch query. Nov 23, 2026: [database sources as views](database-sources-as-views.md) proposes that the user declare each copy as a select-only view.
 
 ## Sources
 
