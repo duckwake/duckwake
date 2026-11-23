@@ -767,6 +767,10 @@ async fn produce(
             if late_every > 0 && i.is_multiple_of(late_every) {
                 ts -= chrono::Duration::minutes(5);
             }
+            // A click goes to its user's partition, as a producer keyed by user would send it: a view keyed by
+            // user_id (an upsert view) needs each key's messages in one partition. Malformed events have no user.
+            let user = rng.random_range(0..5000usize);
+            let mut part = (i as usize) % parts.len();
             let payload = if bad_every > 0 && i.is_multiple_of(bad_every) {
                 if (i / bad_every).is_multiple_of(2) {
                     format!("{{\"ts\": \"{}\", \"game_id\": \"g1\", \"amount\": ", fmt(ts))
@@ -774,17 +778,17 @@ async fn produce(
                     format!("{{\"ts\": \"{}\", \"game_id\": \"g1\", \"amount\": \"not-a-number\"}}", fmt(ts))
                 }
             } else {
+                part = user % parts.len();
                 format!(
-                    "{{\"ts\": \"{}\", \"game_id\": \"g{}\", \"user_id\": \"u{}\", \"amount\": {}.{:02}, \"seq\": {i}{}}}",
+                    "{{\"ts\": \"{}\", \"game_id\": \"g{}\", \"user_id\": \"u{user}\", \"amount\": {}.{:02}, \"seq\": {i}{}}}",
                     fmt(ts),
                     rng.random_range(0..20),
-                    rng.random_range(0..5000),
                     rng.random_range(0..100),
                     rng.random_range(0..100),
                     if pad.is_empty() { String::new() } else { format!(", \"pad\": \"{pad}\"") }
                 )
             };
-            by_part[(i as usize) % parts.len()].push(payload.into_bytes());
+            by_part[part].push(payload.into_bytes());
         }
         for (idx, batch) in by_part.into_iter().enumerate() {
             // Keep each request under the broker's default 1 MB batch limit.
@@ -813,8 +817,10 @@ async fn produce(
     }
     if eos {
         let ts = chrono::Utc::now() + chrono::Duration::days(1);
+        // One user per partition: markers of one user in several partitions, all with the same time, would tie in
+        // a view keyed by user_id, and which one wins would depend on the order the partitions are read in.
         for p in &parts {
-            let payload = format!("{{\"ts\": \"{}\", \"game_id\": \"__eos\", \"user_id\": \"eos\", \"amount\": 0}}", fmt(ts));
+            let payload = format!("{{\"ts\": \"{}\", \"game_id\": \"__eos\", \"user_id\": \"eos{p}\", \"amount\": 0}}", fmt(ts));
             kafka::produce(&client, topic, *p, vec![payload.into_bytes()]).await?;
         }
     }

@@ -14,6 +14,13 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
   views, windows and aggregates, views over lake tables and other views, querying results, managing views, and
   changing views and sources.
 
+### Fixed
+
+- `duckwake produce` sends each click to its user's partition, as a producer keyed by user would, and gives each
+  partition's end-of-stream marker its own user. Before, one user's clicks went to several partitions, so a view
+  keyed by `user_id` (the dbt example's `last_click`) could break a tie between equal `ts` values differently
+  from `verify`, which failed the dbt suite now and then.
+
 ## [0.3.0] - 2026-11-22
 
 Change data capture and keyed views: PostgreSQL and MySQL sources with no Kafka in between, Debezium topics,
