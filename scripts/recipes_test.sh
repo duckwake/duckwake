@@ -43,7 +43,7 @@ for _ in $(seq 1 30); do curl -sf "http://$METRICS/healthz" >/dev/null && break;
 
 log "run the recipes"
 # shellcheck disable=SC2086
-if python3 scripts/recipes.py $RECIPES; then
+if python3 -u scripts/recipes.py $RECIPES; then
   log "PASS"
 else
   echo "-- the server's last log lines:"; tail -20 "$OUT/server.log"
