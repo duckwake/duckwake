@@ -16,6 +16,9 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A PostgreSQL source no longer stalls after a crash between an epoch's commit and its slot advance, when more
+  than `max_changes` changes lay between the slot and the lake: every read returned only transactions the lake
+  already held, so the job never moved on. A read now first advances such a slot to the lake's position.
 - `duckwake produce` sends each click to its user's partition, as a producer keyed by user would, and gives each
   partition's end-of-stream marker its own user. Before, one user's clicks went to several partitions, so a view
   keyed by `user_id` (the dbt example's `last_click`) could break a tie between equal `ts` values differently

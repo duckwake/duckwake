@@ -412,8 +412,9 @@ const POSITION_BYTES: u64 = 64 << 20;
 /// keeps every change until DuckWake has committed it:
 ///
 /// - The position is the end LSN of the last transaction read, or a flush LSN the slot had nothing before.
-/// - The slot is advanced to the position only after the commit (`committed`); after a crash in between, the
-///   transactions it sends again end at or before the position and are skipped.
+/// - The slot is advanced to the position only after the commit (`committed`). After a crash in between, the next
+///   read advances it to the position first, so the transactions it would send again are gone however many there
+///   are; any it still sends end at or before the position and are skipped.
 /// - A slot whose confirmed position is past the lake's, gone or invalidated has lost changes: the job stops.
 /// - The snapshot is taken after the slot exists, in one REPEATABLE READ transaction whose `pg_current_snapshot()`
 ///   is kept in the position: transactions it already saw are skipped by id, until every transaction running
@@ -436,6 +437,11 @@ impl PgReader {
 
     fn slot_lit(&self) -> String {
         lit(&self.opts.slot)
+    }
+
+    /// Moves the slot to `lsn`: the database may then drop the WAL before it.
+    fn advance_sql(&self, lsn: u64) -> String {
+        format!("SELECT end_lsn::text FROM pg_replication_slot_advance({}, {})", self.slot_lit(), lit(&format_lsn(lsn)))
     }
 
     /// The source table a change belongs to; None for a table the source does not mirror, or a transaction
@@ -553,6 +559,14 @@ impl Reader for PgReader {
             )));
         }
 
+        if confirmed < lsn {
+            // An epoch committed and the slot was not advanced after it (a crash in between, or a failed
+            // advance): advance it now, to what the lake holds. Otherwise, with more than `max_changes` changes
+            // between the slot and the position, every read would return only transactions the lake already
+            // holds, skip them all, and never get past them.
+            row(conn, &self.alias, &self.advance_sql(lsn))?;
+        }
+
         let mut stmt = conn.prepare(&format!(
             "SELECT data FROM postgres_query({}, {})",
             lit(self.alias.trim_matches('"')),
@@ -666,8 +680,7 @@ impl Reader for PgReader {
     /// Lets the slot release what the lake now holds. A failure only delays it: the next epoch skips what
     /// the slot sends again, and advances it then.
     fn committed(&mut self, conn: &Connection, pos: &Position) {
-        let sql = format!("SELECT end_lsn::text FROM pg_replication_slot_advance({}, {})", self.slot_lit(), lit(&format_lsn(pos.offset)));
-        if let Err(e) = row(conn, &self.alias, &sql) {
+        if let Err(e) = row(conn, &self.alias, &self.advance_sql(pos.offset)) {
             tracing::warn!(job = %self.job, error = %format!("{e:#}"), "advancing the slot failed; the next epoch retries");
         }
     }
