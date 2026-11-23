@@ -101,6 +101,8 @@ jobs:
           - { name: catchup, run: EVENTS=100000 scripts/catchup_test.sh }
           - { name: shared-reader, run: scripts/shared_reader_test.sh }
           - { name: serve, run: scripts/serve_test.sh }
+          # The recipes in docs/recipes/ run as written, and show the tables the server returns.
+          - { name: recipes, run: scripts/recipes_test.sh }
           - { name: extension, run: scripts/extension_test.sh }
           - { name: composed, run: scripts/composed_test.sh, duckdb_cli: true }
           # P4: views and sources changed while they run, and limits that fail one view or shrink epochs.
