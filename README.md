@@ -49,6 +49,15 @@ FROM lake.analytics.clicks_per_min;         -- an ordinary DuckLake table
 
 ## Docs
 
+- Recipes, each run in CI as written: [a live per-minute dashboard from Kafka](docs/recipes/live-dashboard.md),
+  [daily revenue from a PostgreSQL table](docs/recipes/postgres-revenue.md),
+  [the current state of each order from a changelog topic](docs/recipes/changelog-state.md),
+  [a pipeline of views](docs/recipes/layered-pipeline.md)
+- Work with data: [read a Kafka topic](docs/guides/kafka.md), [copy database tables](docs/guides/databases.md),
+  [changelogs and the latest row](docs/guides/changelogs.md), [windows and aggregates](docs/guides/windows.md),
+  [views over lake tables and other views](docs/guides/views-over-views.md),
+  [query a view's results](docs/guides/query-results.md), [manage views](docs/guides/manage-views.md),
+  [change a view or a source](docs/guides/change-views.md)
 - [SQL functions](docs/sql.md): every `duckwake_*` function and its CLI equivalent
 - [dbt-duckwake](dbt/README.md): sources and views as dbt models, on dbt-duckdb
 - [Performance](docs/performance.md): the worker flags and the benchmarks
