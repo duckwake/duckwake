@@ -15,10 +15,10 @@ things:
 | What `create_source` makes | a definition | a definition, a mirror table per table, an ingest job |
 | Where the data is | the views' tables | the mirror tables, then the views' tables |
 | What you start, stop, reset, verify | each view | the source as a whole, then each view |
-| Who picks a copy's name and columns | the view's SQL | nobody: `<source>.<table>`, all columns |
+| Who picks a copy's name and columns | the view's SQL | the source: lake schema from its `schema` option (the source's name by default), the table's own name, every column |
 
-The user's question was why a database source is not a definition too, with views that read it and only
-select, so that "the source is the definition, the view is the data" holds for every kind of source.
+The question this document answers: why is a database source not a definition too, with views that read it
+and only select, so that "the source is the definition, the view is the data" holds for every kind of source?
 
 ## Why views cannot read the database the way they read Kafka
 
@@ -31,7 +31,7 @@ A database's change stream is not a log anyone can read again:
 | Data kept for a slow reader | the topic's retention, shared by all | PostgreSQL: each slot pins WAL until it advances, so one stopped reader fills the primary's disk. MySQL: purged after `binlog_expire_logs_seconds`, whoever has not read it. |
 | Starting a reader | read from offset 0 | a consistent snapshot of the tables, on the production database |
 | Reset, backfill, verify | read the topic again | the WAL cannot be read again: only a new snapshot |
-| Limits | none in practice | `max_replication_slots` and `max_wal_senders`, 10 by default |
+| Limits | none in practice | PostgreSQL: `max_replication_slots`, 10 by default (and `max_wal_senders`, also 10, for readers on the replication protocol; DuckWake reads through SQL functions and uses none). MySQL: one `server_id` per reader. |
 
 So views keep reading a copy in the lake, never the database. The copy plays the part a topic plays for Kafka:
 one durable input that many views read at their own pace through DuckLake's change feed, with reset, backfill,
@@ -72,8 +72,9 @@ What the user gets:
   the database.
 - **Fewer stops on schema changes.** A copy that names its columns does not care about a column added to, or
   dropped from, the others (see [Schema changes](#schema-changes)).
-- **dbt fits as it is.** A copy view is a `streaming_view` model whose SQL selects from a `source()`; nothing new
-  in dbt-duckwake beyond reading a database source's tables in `FROM`.
+- **dbt fits with one change.** A copy view is a `streaming_view` model whose SQL selects from
+  `{{ ref('shop') }}.public.orders` (`ref()` to a source model renders the source's name). The change:
+  `streaming_source` creates only Kafka sources today, and needs a `kind` config for `postgres` and `mysql`.
 
 ### What a copy view's query may contain
 
@@ -101,15 +102,18 @@ may read one table, with different columns.
 Nothing about the database side changes: one slot (PostgreSQL) or one binlog reader (MySQL) per source, one
 snapshot mechanism, one position. The source's ingest job stays, as an internal job named like the source:
 
-- It runs while at least one of the source's copy views runs, on one worker under one lease, as today.
+- It runs on one worker under one lease, as today, from the source's creation until the source is stopped
+  (see [Stopping the whole source](#stopping-the-whole-source)). Copy views have no lease of their own: they
+  are written by the source's job, so they run where it runs and move with it when workers rebalance.
 - Each epoch it reads the source's changes once and applies each table's changes to the copy views that select
   that table, projected to their columns. The copies, each copy view's checkpoint and the source's position go
   into one DuckLake transaction, so every copy of a source shows the same source transactions after every
   epoch, as the mirrors do now.
 - Changes for tables no running copy view selects are read and dropped. For PostgreSQL the publication holds
   only the tables some copy view selects, so the database does not send the others at all.
-- `duckwake_jobs()` lists the job, with its lag and status; a failure there (slot lost, binlog purged) fails the
-  copy views that read it, with the same message.
+- `duckwake_jobs()` lists the job, with its lag and status, and each copy view, with its own status
+  (`running`, `joining`, `stopped`, `failed`). A failure of the job (slot lost, binlog purged) fails the copy
+  views that read it, with the same message.
 
 ### Starting, stopping and resetting a copy view
 
@@ -119,24 +123,31 @@ all the others. That is the failure the one-reader design exists to avoid.
 
 So a copy view never holds the stream back. It is either following the source's position or not reading at all:
 
-- **Stop** leaves the copy as it was at that epoch, and lets go: the job no longer applies that table's changes
-  to it.
+- **Stop** (or pause: for a copy view they are the same) leaves the copy as it was at that epoch, and lets go:
+  the job no longer applies that table's changes to it.
 - **Start** (the first one, or after a stop) **joins** the stream: the job copies that one table under a new
   snapshot while the others keep streaming, and writes it as a **difference** against what the copy holds. The
   rows that changed while it was stopped arrive as updates, inserts and deletes; the views over it read only
   those through the change feed. A first start writes every row, since the copy is empty.
 - **Reset** (to epoch 0, the only reset a copy has) empties the copy, and the next start copies the table again.
   Most of the time a stop and a start is the better tool: the views over the copy see only what changed.
+- **Drop** is refused while views read the copy, as for any view. It drops the copy's table, and when no copy
+  view selects that table any more, removes it from a publication DuckWake owns. `duckwake_drop_source` is
+  refused while the source has copy views.
 
 The join keeps the guarantee that copies of one source agree. The table's snapshot is taken at a point ahead of
 the job's position; its rows are staged and committed in the epoch whose position passes the snapshot's, together
-with that table's changes from the stream after the snapshot. The mechanisms are the ones D1 and D3 use for the
-whole source, applied to one table:
+with that table's changes from the stream after the snapshot. Until then the copy view is `joining`. A job far
+behind its database (catching up after an outage) holds the staged rows that long, in the worker's staging
+catalog, which spills to disk; a crash before the commit loses only the staging, and the join starts again. The
+mechanisms are the ones D1 and D3 use for the whole source, applied to one table:
 
 - **PostgreSQL.** Add the table to the publication if DuckWake owns it (`ALTER PUBLICATION ... ADD TABLE`); with
-  a publication the user made, check the table is in it and refuse otherwise, naming the `ALTER`. Then a
-  REPEATABLE READ transaction records `pg_current_snapshot()` and copies the table; transactions on that table
-  the snapshot already saw are skipped by transaction id, as D1 skips them for the first snapshot.
+  a publication the user made, check the table is in it and refuse otherwise, naming the `ALTER`. The decoder
+  sends a table's changes only for transactions after the `ALTER` committed, so the snapshot is taken after that
+  commit: a REPEATABLE READ transaction records `pg_current_snapshot()` and copies the table. Transactions on
+  that table the snapshot already saw are skipped by transaction id, as D1 skips them for the first snapshot;
+  those it did not see (still running when it was taken) come from the stream.
 - **MySQL.** The G1/G2 snapshot of D3 for one table: read `gtid_executed`, start a consistent snapshot, read it
   again, copy; transactions in G1 are skipped for that table, those between G1 and G2 apply over the copy (full
   row images make that safe).
@@ -154,8 +165,16 @@ it, PostgreSQL keeps WAL from that point, as for a stopped source today. Two opt
 2. Stop the job with the last copy, and keep today's advice to set `max_slot_wal_keep_size`.
 
 Proposal: option 1 by default, since a join makes it safe, with the job's status `idle` in `duckwake_jobs()`.
-`duckwake_stop('shop')` on the source itself stops the job and every copy view, for maintenance of the database.
-A worker that is down still pins WAL in either option; that is the existing risk, and the lag alert covers it.
+For MySQL, which keeps nothing for a reader, the choice changes only whether the binlog is read.
+`duckwake_stop('shop')` on the source itself stops the job and every copy view, for maintenance of the
+database; from then on PostgreSQL keeps WAL for the slot, as for a stopped source today. A worker that is down also pins WAL; that is
+the existing risk, and the lag alert and `max_slot_wal_keep_size` cover it.
+
+**Losing the stream is no longer a full restart.** Today a lost slot or purged binlog fails the job, and
+`duckwake_reset('shop', 0)` empties every mirror, so the views over them take every row deleted and inserted
+again. With joins, a reset of the source creates a new slot (PostgreSQL) or starts from the current GTID set
+(MySQL), and every running copy view joins by difference: the views over the copies see only the rows that really
+changed while the stream was lost.
 
 ### Schema changes
 
@@ -186,21 +205,24 @@ is exact only once writes to the database stop.
   This is the first upgrade that resumes a lake; the gate runs the 0.3.0 binary (built from its tag) to make a
   lake, then this one on it.
 - `duckwake_start('shop')`, `stop`, `reset` and `verify` on the source keep working and act on all its copy
-  views.
+  views; `reset` now rejoins them by difference instead of emptying them (above).
 
 ## What other engines do
 
-Both engines with native database CDC moved to the same shape, as read from their docs on Nov 23, 2026 (check the
+Both engines with native database CDC have the same shape, as read from their docs on Nov 23, 2026 (check the
 originals before relying on a detail):
 
 - **RisingWave**: a shared CDC source per database (`CREATE SOURCE ... WITH (connector = 'postgres-cdc', ...)`),
-  then one table per upstream table created from it (`CREATE TABLE t (...) FROM source TABLE 'public.orders'`).
-  The source holds one slot; the tables hold the data.
-- **Materialize**: a source per database connection, and tables created from it
-  (`CREATE TABLE t FROM SOURCE src (REFERENCE public.orders)`), the newer form of the subsources it used to
-  create with the source.
+  then a table per upstream table created from it (`CREATE TABLE orders (*) FROM pg_source TABLE
+  'public.orders'`), with a primary key that matches the upstream table's. Its docs give the reason for sharing
+  the source: transactions across tables stay atomic. A table's `snapshot` option can skip the initial copy.
+- **Materialize** (the new syntax, v26 and later): `CREATE SOURCE` for the connection, then
+  `CREATE TABLE t FROM SOURCE src (REFERENCE public.orders)`, read-only, with `EXCLUDE COLUMNS` to leave columns
+  out; several tables may read one upstream table. A column added upstream is not picked up: a new table is
+  created to get it, and dropping an ingested column puts the table in an error state.
 
-Neither lets views read the database directly; both keep one reader per database and one stored copy per table.
+Neither lets views read the database directly; both keep one reader per database and one stored copy per table,
+which is what this proposal does.
 
 ## Costs and risks
 
@@ -222,6 +244,9 @@ Neither lets views read the database directly; both keep one reader per database
   once copy views exist.
 - **Casts.** Changing a column's DuckDB type in the copy (a `numeric` to `DOUBLE`) is a projection too. Left out of
   the first step; the views over the copy can cast.
+- **Columns that never leave the database.** A column a copy view leaves out still travels to the worker and is
+  dropped there. PostgreSQL 15 publications take column lists, so the database would not send it at all; that
+  needs every copy view of a table to agree, and PostgreSQL 15 where D1 needs 13.
 - **Name.** "Copy view" here; the docs call the feature "copy database tables". Settle before building.
 
 ## Plan
@@ -236,7 +261,8 @@ Part of D4 ([#46](https://github.com/duckwake/duckwake/issues/46)), before chunk
    Joins with a difference, for PostgreSQL and MySQL. Gate: `pg_ingest_test.sh` and `mysql_ingest_test.sh` gain a
    step that creates a copy view and stops and starts another during the workload while the worker is killed;
    the copies equal their tables' selected columns once writes stop, the slot is never ahead of the lake, and a
-   view over a restarted copy verifies having seen only the rows that changed.
+   view over a restarted copy verifies having seen only the rows that changed. A second step drops the slot
+   during the workload and resets the source: the copies rejoin by difference and equal their tables.
 3. **Migration of 0.3 lakes**, with its gate.
 4. **Docs**: [Copy database tables](../guides/databases.md), the PostgreSQL recipe, the SQL reference, the
    changelog, and the D4 status in [database CDC sources](database-cdc-sources.md).
