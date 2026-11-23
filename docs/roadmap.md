@@ -107,12 +107,35 @@ default.
   `count(DISTINCT)` in `GROUP BY` views and `HAVING` in windowed views. Built 2026-11-17
   ([#29](https://github.com/duckwake/duckwake/issues/29)): `approx_count_distinct`, `median` and the exact
   quantiles, `count(DISTINCT)` in windows, `covar_*`, `corr` and `regr_*` (`crates/circuit/src/tests/views.rs`,
-  `scripts/backfill_test.sh`). Next, in order: stream–stream joins
-  ([#31](https://github.com/duckwake/duckwake/issues/31)); top-k and `ROW_NUMBER`
-  ([#35](https://github.com/duckwake/duckwake/issues/35)); `list`/`string_agg`/`mode` and grouping sets
-  ([#30](https://github.com/duckwake/duckwake/issues/30)); `DISTINCT` over windows and aggregates. (`MIN`/`MAX`
-  in windows over deletes: built with C4, [#38](https://github.com/duckwake/duckwake/issues/38).) `arg_min`/`arg_max` wait
-  until a tie can be checked against the batch query
+  `scripts/backfill_test.sh`). (`MIN`/`MAX` in windows over deletes: built with C4,
+  [#38](https://github.com/duckwake/duckwake/issues/38).) The rest of the SQL work is the SQL coverage plan below.
+- **SQL coverage** ([SQL coverage](design/sql-coverage.md)): accept as much SQL in a view as can be kept exactly,
+  and refuse the rest at create time with the reason and the way out. Each step its own PR, tested by the
+  circuit harness over inserts, updates and deletes (in order and pipelined), and the operator steps also by
+  `verify` in the crash suites. In order:
+  1. **S0. Two holes, first.** Refuse functions whose value is not fixed by the rows (`stability` other than
+     `CONSISTENT`: `now()`, `random()`, `uuid()`), which a replay or `verify` cannot reproduce. An error in a
+     view's SQL caused by its data (a failed cast) fails that view, not the worker and every view on it.
+     **Gate:** a suite runs a view that fails on a row beside a healthy one on one worker; the healthy one keeps
+     committing and verifies, the failing one is `failed` with the error.
+  2. **S1. Rewrites into SQL already accepted.** Subqueries in `FROM` and CTEs that project and filter,
+     flattened into the outer query; `FILTER (WHERE ...)` inside aggregates as `CASE`; `UNION` as `UNION ALL`
+     under `DISTINCT`; `ORDER BY` without `LIMIT` accepted and dropped; expressions over aggregates in windowed
+     views. **Gate:** the harness over each rewritten form, which must equal its batch query.
+  3. **S2. A coverage corpus**: queries that are accepted (with their results over fixed data) or refused (with
+     their messages), run by `cargo test`, from which `docs/sql.md` lists what a view can contain.
+  4. **S3. Joins.** Two lake inputs, through their snapshots (no state of their own); then two Kafka sources
+     ([#31](https://github.com/duckwake/duckwake/issues/31)) and the interval join
+     ([#32](https://github.com/duckwake/duckwake/issues/32)); outer, semi and anti joins, which `IN (SELECT ...)`
+     and `EXISTS` become.
+  5. **S4. Nested stateful queries in one view**: an aggregate over an aggregate, `UNION ALL` of aggregates or
+     windows, `DISTINCT` over them, as stages of one circuit in one epoch and one transaction.
+  6. **S5. Set operations and collecting aggregates.** `EXCEPT` and `INTERSECT`; `GROUPING SETS`, `ROLLUP`,
+     `CUBE`, and `list`, `string_agg`, `mode` ([#30](https://github.com/duckwake/duckwake/issues/30));
+     `arg_min`/`arg_max` once an `ORDER BY` breaks ties.
+  7. **S6. `OVER` functions.** Top-k and `ROW_NUMBER`/`RANK` ([#35](https://github.com/duckwake/duckwake/issues/35)),
+     `LAG`/`LEAD` and rolling aggregates ([#36](https://github.com/duckwake/duckwake/issues/36)), session windows
+     ([#37](https://github.com/duckwake/duckwake/issues/37)).
 - DuckLake tables and other views as sources: views over views and insert-only tables (F1,
   `scripts/chain_test.sh`), over tables whose rows change (F2, `scripts/retract_test.sh`), and backfill,
   retention and reset cascade (F3, `scripts/backfill_test.sh`) are done; shared and fused reads (F4) remain.
@@ -147,8 +170,34 @@ default.
   ...)` mirrors tables into the lake from a logical replication slot, exactly once, with the snapshot, TOAST
   values, key changes and truncates (`scripts/pg_ingest_test.sh`). Built 2026-11-22: MySQL sources (D3,
   [#45](https://github.com/duckwake/duckwake/issues/45)): the binlog by GTID, a lock-free consistent snapshot
-  (`scripts/mysql_ingest_test.sh`). Next: large tables, added tables and schema changes (D4).
-- Avro and Protobuf with a schema registry; Kafka headers
+  (`scripts/mysql_ingest_test.sh`). Next, D4 ([#46](https://github.com/duckwake/duckwake/issues/46)), starting
+  with **database sources as definitions** ([design](design/database-sources-as-views.md)): `create_source` holds
+  only how to reach and read the database, and each table's copy is a view whose query only selects columns of
+  one table (`SELECT order_id, status FROM shop.public.orders`), still read through one slot or binlog reader
+  per source and written in one DuckLake transaction. In order:
+  1. The catalog and compiler: sources without `tables` and `schema`, copy views and their rules.
+  2. The ingest job writing copy views; a start that copies one table under a new snapshot and writes only the
+     difference (which is also D4's "add a table to a running source"); a source reset that rejoins every copy
+     by difference. **Gate:** `pg_ingest_test.sh` and `mysql_ingest_test.sh` create a copy view and stop and
+     start another during the workload with the worker killed, and drop the slot and reset the source; the
+     copies equal their tables' selected columns, and a view over a restarted copy sees only the changed rows.
+  3. Lakes from 0.3 migrated in place, each mirror becoming a copy view, with a gate that upgrades a lake made
+     by the 0.3.0 binary.
+  4. Then the rest of D4: chunked backfill for large tables (which serves first copies and starts alike) and
+     schema changes.
+- **Kafka message formats** ([#49](https://github.com/duckwake/duckwake/issues/49),
+  [design](design/kafka-formats.md)): a source's `format` (the encoding) and `envelope` (`none`, `debezium`)
+  apart, with `"format": "debezium"` kept. In order:
+  1. **K1.** `text`, `bytes` and `csv`; `_timestamp` (usable as event time), `_headers`, `_partition`,
+     `_offset` and `_key` as columns a view can select. **Gate:** the decode suite with text and CSV sources
+     over hostile payloads, and the crash suite with a text source windowed on `_timestamp`.
+  2. **K2.** Avro with a schema registry (Redpanda's, in the compose stack): the registry's wire format, a
+     reader schema fixed at `create_source` (FORWARD or FULL compatibility), schemas cached in the lake, a
+     registry outage waited out; JSON with the registry's header. **Gate:** `FORMAT=avro` crash and upsert
+     suites, a compatible schema change mid-stream, a corrupt message as a dead letter, an unresolvable schema
+     failing the view, the registry stopped and restarted.
+  3. **K3.** Protobuf, the same way.
+  4. **K4.** Avro and Protobuf keys for upsert views, and Debezium with the Avro converter end to end.
 - Splitting one topic's partitions across workers
 - A Windows build
 - A signed community extension (`INSTALL duckwake FROM community`). Built 2026-11-17
