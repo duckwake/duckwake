@@ -5,6 +5,26 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+Change data capture and keyed views: PostgreSQL and MySQL sources with no Kafka in between, Debezium topics,
+upsert views, and windows over inputs that update or delete. Views are named `schema.table`, so two schemas can
+each have a view of one table name. Workers wait out catalog and Kafka outages instead of failing. More
+aggregates, and DuckWake as a DuckDB community extension.
+
+### Upgrading from 0.2.0
+
+- **A 0.2.0 lake's views must be created again.** 0.3.0 names a view `schema.table`, where 0.2.0 used the table
+  name alone, and does not migrate a lake: a 0.3.0 worker, and `create-view`, refuse a lake that holds views
+  named by 0.2.0, naming them. Drop each (`duckwake drop <view>` still works on them) and create it again; a view
+  over Kafka reads its topic from `start` again, one over lake tables backfills from their rows. Or start from a
+  new lake. Stop every 0.2.0 worker before the first 0.3.0 worker starts.
+- Commands still take a view's bare table name when one schema has a view of that name. Scripts that read
+  `__duckwake` tables or match log lines, `job_id` in `duckwake_jobs()`, and dashboards that filter the `view`
+  metrics label see `schema.table` (`analytics.clicks_per_min`).
+- dbt-duckwake: use `revision: v0.3.0`. Its `drop_orphans` `keep` list takes `schema.table`.
+- The workers table gains a `waiting` column the first time a 0.3.0 worker registers.
+
 ### Added
 
 - MySQL sources ([#45](https://github.com/duckwake/duckwake/issues/45)): `duckwake_create_source('shop', 'mysql',
@@ -105,6 +125,13 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ### Fixed
 
+- A command or worker could fail with "Failed to read inlined data from DuckLake ... does not exist" when it read
+  a control table while DuckLake's flush ran (seen once in CI: `duckwake start` in `mysql_ingest_test.sh`). The
+  jobs and workers tables were created and then given more columns, which left each an inlined-data table per
+  column set; the first flush drops the older one, under readers whose snapshot still lists it. New lakes now
+  create those tables whole. The error also counts as a conflict, retried at a new snapshot (`start`, `pause`,
+  `stop` and the other commands, and a worker's commits), and a worker that still meets one starts again from
+  its checkpoints instead of exiting.
 - A worker no longer exits when the catalog cannot be reached ([#27](https://github.com/duckwake/duckwake/issues/27)).
   PostgreSQL down, restarting or failing over made `duckwake run` exit and `duckwaked` restart every 5 s,
   counting failures. The worker now drops what it staged, waits for the catalog (1 s, doubling to 30 s, between
@@ -287,6 +314,7 @@ filters, `DISTINCT` and `UNION ALL` as incremental circuits; late-data tables an
 a view against its batch recomputation; reset and replay. The `duckwake` CLI, the `duckwaked` server over Quack
 with Prometheus metrics, the loadable extension, and the playground.
 
-[Unreleased]: https://github.com/duckwake/duckwake/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/duckwake/duckwake/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/duckwake/duckwake/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/duckwake/duckwake/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/duckwake/duckwake/releases/tag/v0.1.0

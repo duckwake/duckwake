@@ -56,6 +56,12 @@ out of Actions minutes that morning. `main` holds all work, merged with merge co
     `mirror.rs`, `catalog.rs`, `postgres/`, `mysql/` with `gtid.rs` and `values.rs`). Its CI also found a race in
     `pg_ingest_test.sh`'s slot-ahead step (insert, then stop the worker), now stop-then-insert with an assertion.
     Next on the roadmap: D4 (large tables, schema changes).
+11. 2026-11-22, merged: #68 (a view's id is `schema.table`, so two schemas can share a table name; no migration,
+    a 0.2.0 lake is refused, since the user said nobody runs it yet; design `docs/design/view-names.md`; gate
+    `scripts/names_test.sh`; its first run found `reset`'s JSON path `$.jobs.<id>` split by the dot) and #69
+    (#27 workers wait out catalog outages, #26 views wait for unreachable Kafka brokers; gates
+    `scripts/catalog_outage_test.sh` and `scripts/broker_outage_test.sh`; `failover_test.sh` now expects a
+    worker thawed after its catalog session was ended to restart, not exit). The 0.3.0 release PR followed.
 
 Before the move (2026-11-14) the history was rewritten with `git filter-repo` (the author's work email replaced
 by their personal one, claude.ai links replaced) and published fresh; PR numbers of the old repository

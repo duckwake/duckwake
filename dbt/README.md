@@ -15,7 +15,7 @@ out in `dist/extensions`; releases attach one).
 # packages.yml
 packages:
   - git: "https://github.com/duckwake/dbt-duckwake.git"
-    revision: v0.2.0          # the version of DuckWake your workers run
+    revision: v0.3.0          # the version of DuckWake your workers run
 ```
 
 Each DuckWake release tags the package with its own version in

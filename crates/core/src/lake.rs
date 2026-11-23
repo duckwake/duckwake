@@ -144,7 +144,7 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
            name VARCHAR, kind VARCHAR, options JSON, created_at TIMESTAMPTZ);
          CREATE TABLE IF NOT EXISTS {CTL}.jobs (
            job_id VARCHAR, definition JSON, version INTEGER, status VARCHAR,
-           created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);
+           created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, pinned_to VARCHAR);
          CREATE TABLE IF NOT EXISTS {CTL}.checkpoints (
            job_id VARCHAR, epoch BIGINT, source_offsets JSON, watermark TIMESTAMP,
            state_backend VARCHAR, state_ref VARCHAR,
@@ -158,6 +158,9 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS {CTL}.snapshot_times (snapshot_id BIGINT, commit_ts TIMESTAMP);"
     ))
     .context("bootstrapping __duckwake schema")?;
+    // A new lake's tables are created whole: a column added afterwards gives the table a second inlined-data
+    // table in the catalog, which DuckLake's next flush drops while readers that began before it may still
+    // look for it ("Failed to read inlined data ... does not exist"). These are for older lakes.
     // Lakes bootstrapped before the Arrow decode lack `rows_sql` (messages decoded in SQL per epoch).
     add_column(conn, "checkpoints", "rows_sql", "BIGINT")?;
     // Before rebalancing: the worker a view is pinned to (`start --worker W`), NULL when it may move.
@@ -402,7 +405,13 @@ pub fn table_by_id(conn: &Connection, id: i64) -> Result<Option<(String, String)
 /// Either way the transaction was rolled back and can run again.
 pub fn is_conflict(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("Transaction conflict") || msg.contains("conflict") || msg.contains("Exceeded the maximum retry count")
+    msg.contains("Transaction conflict")
+        || msg.contains("conflict")
+        || msg.contains("Exceeded the maximum retry count")
+        // A read whose snapshot began before a concurrent flush dropped an inlined-data table it lists (the
+        // table's columns changed since, and the flush removes the old version's table): at a new snapshot
+        // the read finds the rows in the flushed files. Seen in CI on 2026-11-22 (mysql_ingest_test.sh).
+        || (msg.contains("Failed to read inlined data from DuckLake") && msg.contains("does not exist"))
 }
 
 /// True when the catalog (PostgreSQL) cannot be reached right now: it refuses connections, is shutting down,
@@ -500,6 +509,12 @@ mod tests {
         );
         assert!(is_conflict(&e));
         assert!(!is_conflict(&anyhow::anyhow!("Catalog Error: Table with name x does not exist")));
+        // A concurrent flush dropped an inlined-data table this read's snapshot lists (CI, 2026-11-22).
+        assert!(is_conflict(&anyhow::anyhow!(
+            "Invalid Error: Failed to read inlined data from DuckLake: Failed to prepare COPY \"COPY (SELECT \
+             \"job_id\" FROM \"public\".\"ducklake_inlined_data_3_3\" ...) TO STDOUT\": ERROR:  relation \
+             \"public.ducklake_inlined_data_3_3\" does not exist"
+        )));
     }
 
     #[test]

@@ -429,6 +429,14 @@ pub fn run_worker(cfg: WorkerConfig, rt: Handle, shutdown: Arc<AtomicBool>) -> R
                 clear_spill_dir(&temp)?;
                 rows_cap = Some(cap);
             }
+            // A conflict that its retries did not get past (a read whose snapshot a concurrent flush overtook,
+            // say): the epoch is redone from the checkpoints, as after a crash, instead of the worker exiting.
+            Err(e) if crate::lake::is_conflict(&e) && !shutdown.load(Ordering::Relaxed) => {
+                drop(w);
+                warn!(error = %format!("{e:#}"), "a concurrent commit got in the way; starting again from the last checkpoints");
+                clear_spill_dir(&temp)?;
+                std::thread::sleep(Duration::from_secs(1));
+            }
             Err(e) if crate::lake::is_catalog_unavailable(&e) => {
                 // The instance goes with its connections; its ingest threads stop and its commit thread
                 // finishes or fails first (their Drop).

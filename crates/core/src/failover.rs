@@ -83,11 +83,14 @@ pub fn register(conn: &Connection, worker: &str, metrics: Option<&str>) -> Resul
     retry_conflicts(|| {
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {wt} (worker_id VARCHAR, state VARCHAR, beat BIGINT, jobs INTEGER,
-               started_at TIMESTAMPTZ, heartbeat_at TIMESTAMPTZ, load DOUBLE, costs VARCHAR, cooling VARCHAR)"
+               started_at TIMESTAMPTZ, heartbeat_at TIMESTAMPTZ, load DOUBLE, costs VARCHAR, cooling VARCHAR,
+               version VARCHAR, metrics_addr VARCHAR, waiting VARCHAR)"
         ))?;
         Ok(())
     })?;
-    // Tables of workers from before rebalancing.
+    // Tables of workers from before rebalancing. A new worker's table is created whole: every worker reads
+    // every worker table, and a column added afterwards leaves an inlined-data table that a later flush drops
+    // under readers that began before it (`lake::is_conflict`).
     let table = format!("{PREFIX}{worker}");
     add_column(conn, &table, "load", "DOUBLE")?;
     add_column(conn, &table, "costs", "VARCHAR")?;
