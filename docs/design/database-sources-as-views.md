@@ -80,8 +80,9 @@ What the user gets:
 The query reads exactly one table of one database source and lists columns:
 
 - `FROM <source>.<schema>.<table>`, always in three parts; for MySQL the schema is the database
-  (`FROM shop.shop.orders`). Two parts would be ambiguous: `shop.orders` already names the lake table
-  `lake.shop.orders`, today's mirror, and keeps doing so. Source names `lake` and `memory` become reserved.
+  (`FROM shop.shop.orders`). This is how DuckDB names a table of an attached PostgreSQL database. Two parts
+  would be ambiguous: in a view's `FROM`, `x.y` is the lake table `lake.x.y`, and a lake schema may share a
+  source's name. Source names `lake` and `memory` become reserved.
 - Column names, each optionally renamed with `AS`, or `*`. Every primary key column must be selected.
 - Nothing else: no expressions, casts, `WHERE`, joins, aggregates or `DISTINCT`. `create_view` refuses them with
   the next step in the message: create the copy, then a view over it.
@@ -173,11 +174,15 @@ is exact only once writes to the database stop.
 
 ## Compatibility and migration
 
-- **`tables` stays, as a shortcut.** `create_source` with `tables` creates the source and a copy view per table,
-  named `<schema>.<table>` (the source's name as the schema unless `schema` is set) with `*`: exactly today's
-  mirrors. Without `tables`, it creates the definition only.
+- **No mirror tables any more, and no options for them.** A database source's options are only how to reach
+  the database and how to read it: for PostgreSQL `dsn`, `password`, `slot`, `publication`, `epoch_interval`,
+  `max_changes`; for MySQL the same with `url` and the replica's `server_id`. `tables` (which tables to mirror)
+  and `schema` (the lake schema of the mirrors) go: copy views say which tables are read, and each copy view's
+  own name says where its table is. `create_source` refuses both with the replacement in the message: a
+  `create_view` per table.
 - **0.3 lakes are migrated in place**, not refused: each mirror becomes a copy view of the same name, with `*`,
-  following the source's stored position. No data moves, and views over mirrors keep reading the same tables.
+  following the source's stored position, and the source loses its `tables` and `schema`. No data moves, and
+  views over mirrors keep reading the same tables, now copy views like any other.
   This is the first upgrade that resumes a lake; the gate runs the 0.3.0 binary (built from its tag) to make a
   lake, then this one on it.
 - `duckwake_start('shop')`, `stop`, `reset` and `verify` on the source keep working and act on all its copy
@@ -199,7 +204,8 @@ Neither lets views read the database directly; both keep one reader per database
 
 ## Costs and risks
 
-- **More objects to create.** A copy view per table instead of one list. `tables` keeps the one-call form.
+- **More objects to create.** A copy view per table instead of one list in the source. dbt makes this a model
+  per table, which is how dbt projects declare staging tables anyway.
 - **A join reads the whole table** on the database: a stop and a start is not free. The docs say so, and the
   metrics show the join's rows and time.
 - **The publication changes at run time** (PostgreSQL), which needs the role to own the table, as creating the
@@ -223,9 +229,9 @@ Neither lets views read the database directly; both keep one reader per database
 Part of D4 ([#46](https://github.com/duckwake/duckwake/issues/46)), before chunked backfill, since a join is the
 "add a table to a running source" item of D4 and the backfill then serves joins and first copies alike.
 
-1. **Catalog and compiler.** A database source without `tables`; copy views recognised from `FROM` and checked
-   (one table, columns only, the key selected); `tables` as the shortcut; any other view naming a database table
-   refused. Unit tests for the rules and the messages.
+1. **Catalog and compiler.** A database source as a definition only (`tables` and `schema` refused); copy views
+   recognised from `FROM` and checked (one table, columns only, the key selected); any other view naming a
+   database table refused. Unit tests for the rules and the messages.
 2. **The job over copy views.** Routing and projection per copy view, one commit, `idle` with no copy running.
    Joins with a difference, for PostgreSQL and MySQL. Gate: `pg_ingest_test.sh` and `mysql_ingest_test.sh` gain a
    step that creates a copy view and stops and starts another during the workload while the worker is killed;
