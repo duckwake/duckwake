@@ -36,6 +36,8 @@ metadata:
   --enforce-gtid-consistency=ON --binlog-row-metadata=FULL`). Kill workers left from an earlier run first
   (`pkill -f target/release/duckwake`): one holding the test catalog makes `reset_lake` fail. Both servers stop
   when the container restarts; start them again before a run.
+- `PG_LOCAL=1 scripts/recipes_test.sh` runs only the PostgreSQL recipe, against the local server (needs
+  `wal_level=logical`; it creates the role and database `shop`). The Kafka recipes run only in CI.
 - The cloud session has no Docker: Kafka suites (upsert, Debezium, chain) and `debezium_e2e_test.sh` run only in
   CI. Check the PostgreSQL side of a new suite against the local server and its DuckDB queries with
   `duckwake sql` before pushing.

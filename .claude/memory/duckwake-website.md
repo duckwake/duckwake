@@ -11,6 +11,13 @@ are rewritten, an edit link points back here). `.github/workflows/pages.yml` the
 internal link fails it) and deploys `main` on push, daily and on demand. The release workflow here copies the
 extension repository into its `public/extensions/` (PR #11).
 
+**Recipes and guides (2026-11-23):** at the user's request, task docs in RisingWave's shape: `docs/recipes/*.md`
+(four end-to-end recipes with fixed data and the exact tables shown) and `docs/guides/*.md` (eight "Work with
+data" pages), synced to `/docs/recipes/` and `/docs/data/` (sidebar groups Recipes, and Work with data with
+Ingest, Process, Serve, Manage). `scripts/recipes_test.sh` runs the recipes as written in CI; a new recipe needs
+its blocks runnable or marked `<!-- test: skip -->`, an expected table after `<!-- test: expect -->`, and its
+own topic and view names, dropped at its end. duckwake/duckwake#71 and duckwake.github.io#9.
+
 **Why:** the user wanted the site's code in the Pages repository and the brand on the docs, while docs keep
 being reviewed next to the code they describe.
 

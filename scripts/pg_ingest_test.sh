@@ -16,7 +16,7 @@
 # otherwise the compose service pg-source (profile debezium, localhost:15432). WORKER_FLAGS="--pipeline ..." runs
 # the worker with those flags (the ingest job has its own thread; the view over the mirror uses them).
 source "$(dirname "$0")/lib.sh"
-DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-1s}
+DURATION=${DURATION:-40}; KILLS=${KILLS:-8}; EPOCH=${EPOCH:-1s}; MAX_CHANGES=${MAX_CHANGES:-2000}
 read -r -a POINTS <<< "${POINTS:-external ingest_before_commit ingest_after_commit}"
 SRC_DB=duckwake_src
 if [[ $PG_LOCAL == 1 ]]; then
@@ -102,7 +102,7 @@ SQL
 
 log "create the source and a view over its orders"
 "$BIN" create-source shop --kind postgres --options "{\"dsn\": \"$DSN\", \"tables\": [\"orders\", \"lines\", \"public.flags\"],
-  \"epoch_interval\": \"$EPOCH\"$PASSWORD_OPT}"
+  \"epoch_interval\": \"$EPOCH\", \"max_changes\": $MAX_CHANGES$PASSWORD_OPT}"
 "$BIN" start shop >/dev/null
 start_worker
 wait_status shop running
@@ -145,6 +145,27 @@ snapshots=$(grep -c "snapshot committed" "$OUT/worker.log" || true)
 [[ $snapshots == 1 ]] && echo "one snapshot: every restart continued from the lake's position" || { echo "$snapshots snapshots committed, not 1"; failed=1; }
 for _ in $(seq 1 30); do "$BIN" verify orders_by_status >"$OUT/verify_view.txt" 2>&1 && break; sleep 1; done
 tail -1 "$OUT/verify_view.txt" | grep '^VERIFY OK' || { cat "$OUT/verify_view.txt"; failed=1; }
+
+log "the slot behind the lake by more than one read"
+# A crash between an epoch's commit and the slot's advance leaves the slot behind the lake. When what lies between
+# them is more than one read (max_changes), every read returns only transactions the lake already holds: the job
+# must still get past them. One transaction larger than a read, committed and then aborted before the advance,
+# makes that certain.
+stop_worker
+psql_src -c "INSERT INTO flags SELECT 'bulk' || i, i FROM generate_series(1, $((MAX_CHANGES * 3))) i" >/dev/null
+DUCKWAKE_CRASH_AT=ingest_after_commit DUCKWAKE_CRASH_PROB=1 "$BIN" run $WORKER_FLAGS --worker w1 >>"$OUT/worker.log" 2>&1 & WORKER=$!
+for _ in $(seq 1 300); do kill -0 "$WORKER" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$WORKER" 2>/dev/null && echo "no crash in 30 s" || true
+wait "$WORKER" 2>/dev/null || true; WORKER=""
+behind=$(( $(lake_lsn) - $(slot_lsn) ))
+(( behind > 0 )) && echo "after the abort the slot is $behind bytes behind the lake" || { echo "the slot is not behind the lake"; failed=1; }
+# A change after the big transaction: a job stuck behind it never reads this one.
+psql_src -c "INSERT INTO flags VALUES ('after_bulk', 1)" >/dev/null
+start_worker
+wait_verified 60 && cat "$OUT/verify_shop.txt" || { echo "the job did not get past the transactions the lake already held"; failed=1; }
+caught=0
+for _ in $(seq 1 30); do (( $(slot_lsn) == $(lake_lsn) )) && { caught=1; break; }; sleep 1; done
+[[ $caught == 1 ]] && echo "the slot caught up with the lake" || { echo "slot $(slot_lsn), lake $(lake_lsn)"; failed=1; }
 
 log "a slot advanced past the lake stops the job"
 # The worker stops first, so the lake cannot hold the insert: advancing the slot past it is then always ahead

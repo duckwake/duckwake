@@ -5,6 +5,25 @@ versions follow [Semantic Versioning](https://semver.org/) as described in [docs
 
 ## [Unreleased]
 
+### Added
+
+- Recipes in `docs/recipes/`: a per-minute dashboard from Kafka with a late-data table, daily revenue from a
+  PostgreSQL table, the current state of each order from a changelog topic, and a pipeline of three views. Each
+  uses fixed data and shows the exact tables it produces; `scripts/recipes_test.sh` runs them as written in CI.
+- Work with data guides in `docs/guides/`: reading Kafka topics, copying database tables, changelogs and upsert
+  views, windows and aggregates, views over lake tables and other views, querying results, managing views, and
+  changing views and sources.
+
+### Fixed
+
+- A PostgreSQL source no longer stalls after a crash between an epoch's commit and its slot advance, when more
+  than `max_changes` changes lay between the slot and the lake: every read returned only transactions the lake
+  already held, so the job never moved on. A read now first advances such a slot to the lake's position.
+- `duckwake produce` sends each click to its user's partition, as a producer keyed by user would, and gives each
+  partition's end-of-stream marker its own user. Before, one user's clicks went to several partitions, so a view
+  keyed by `user_id` (the dbt example's `last_click`) could break a tie between equal `ts` values differently
+  from `verify`, which failed the dbt suite now and then.
+
 ## [0.3.0] - 2026-11-22
 
 Change data capture and keyed views: PostgreSQL and MySQL sources with no Kafka in between, Debezium topics,

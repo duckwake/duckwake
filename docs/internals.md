@@ -375,6 +375,14 @@ records the ones it took up.
    now and then rather than 10 s every refresh. Brokers that accept the connection and then stall the
    handshake still fail the view. Waiting views travel in the worker's heartbeat row (`waiting`), which is how
    `duckwake_jobs()` shows `waiting_for`.
+21. **A PostgreSQL source stalled behind a slot it had not advanced** (CI, 2026-11-23). An ingest epoch commits,
+   then advances the slot; a crash in between leaves the slot behind the lake, and the next reads skip what it
+   sends again. But a read peeks at most `max_changes` changes, so when more than that lay between the slot and
+   the lake, every read returned only transactions the lake held, skipped them all, committed nothing and never
+   advanced the slot: the job ran on and fell behind for good (`pg_ingest_test.sh` pipelined: 32 MB of WAL
+   between them after an abort). A read now first advances a slot that is behind the lake to the lake's
+   position. `pg_ingest_test.sh` makes the case certain: `max_changes` 2,000, one transaction of 6,000 rows, an
+   abort after its commit, then a row that must arrive.
 
 ## Simplifications and gaps
 

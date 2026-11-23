@@ -84,6 +84,11 @@ table to make the worker fail and restart, recreates it and verifies everything.
 `scripts/serve_test.sh` drives a `duckwaked` entirely over Quack: create, start, pause, reset and verify the
 three test views, and check `/metrics`. `scripts/extension_test.sh` does the same in one DuckDB session with
 the extension loaded and a worker inside it.
+`scripts/recipes_test.sh` runs the recipes in `docs/recipes/` as written, against a `duckwaked` started as their
+"Before you start" says: `scripts/recipes.py` runs each SQL block over Quack and each `sh` block in bash, and
+compares every table a recipe shows (a block after `<!-- test: expect -->`) with the rows the server returns,
+retrying while the views catch up. `<!-- test: skip -->` marks setup the script does itself. With `PG_LOCAL=1`
+it runs the PostgreSQL recipe alone against a local server.
 `scripts/scale_bench.sh` runs 1, 2, 4, 8 and 16 views (the playground's mix) on one worker at a fixed
 rate, or with `CATCHUP=1` through a backlog, and appends epoch period, freshness, stage and commit time
 (statements vs `COMMIT`), CPU and memory to `.lake/bench/*.csv`; `FLAGS` and `LABEL` name the variant.
