@@ -21,6 +21,7 @@ does today; when the two disagree, the code and those docs win.
 | [View names](view-names.md) | Nov 22, 2026 | A view's id is `schema.table`, so two schemas can each have a view of one table name |
 | [Database sources as views](database-sources-as-views.md) | Nov 23, 2026 | Proposed: a database source as a definition, and each table's copy a select-only view |
 | [Kafka message formats](kafka-formats.md) | Nov 23, 2026 | Proposed: Avro, Protobuf, text, CSV and bytes values, a schema registry, metadata columns |
+| [SQL coverage](sql-coverage.md) | Nov 23, 2026 | Proposed: what a view accepts today, the gaps, and a plan to accept as much SQL as can be kept exactly |
 
 Comparisons with other engines come from their documentation and source as read on the dates given; check the
 originals before relying on a detail.
