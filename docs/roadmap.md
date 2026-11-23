@@ -148,7 +148,8 @@ default.
   values, key changes and truncates (`scripts/pg_ingest_test.sh`). Built 2026-11-22: MySQL sources (D3,
   [#45](https://github.com/duckwake/duckwake/issues/45)): the binlog by GTID, a lock-free consistent snapshot
   (`scripts/mysql_ingest_test.sh`). Next: large tables, added tables and schema changes (D4).
-- Avro and Protobuf with a schema registry; Kafka headers
+- Avro and Protobuf with a schema registry, text, CSV and bytes; Kafka headers and timestamps as columns
+  ([#49](https://github.com/duckwake/duckwake/issues/49), [Kafka message formats](design/kafka-formats.md))
 - Splitting one topic's partitions across workers
 - A Windows build
 - A signed community extension (`INSTALL duckwake FROM community`). Built 2026-11-17
